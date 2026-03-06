@@ -8,18 +8,19 @@ load_dotenv()
 # ── Core ──────────────────────────────────────────────────────────────────────
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+MONGO_URI: str = os.getenv("MONGO_URI", "")
 
 # ── Channel / Role IDs ───────────────────────────────────────────────────────
 MOD_LOG_CHANNEL_ID: int = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
 TICKET_LOG_CHANNEL_ID: int = int(os.getenv("TICKET_LOG_CHANNEL_ID", "0"))
 SUPPORT_ROLE_ID: int = int(os.getenv("SUPPORT_ROLE_ID", "0"))
 
-# ── Developer IDs ─────────────────────────────────────────────────────────────
+# ── Developer IDs ─────────────────────────────────────────────────────────
 DEV_IDS: list[int] = [
     int(i.strip()) for i in os.getenv("DEV_IDS", "").split(",") if i.strip()
 ]
 
-# ── AI Settings ───────────────────────────────────────────────────────────────
+# ── AI Settings ───────────────────────────────────────────────────────────
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/chat/completions"
 AI_MODEL: str = "nvidia/nemotron-nano-9b-v2:free"
 AI_FALLBACK_MODELS: list[str] = [
@@ -34,14 +35,14 @@ AI_MAX_HISTORY: int = 10
 AI_RATE_LIMIT: int = 5          # requests per minute per user
 AI_RATE_WINDOW: float = 60.0    # seconds
 
-# ── Economy ───────────────────────────────────────────────────────────────────
+# ── Economy ───────────────────────────────────────────────────────────────
 DAILY_REWARD: int = 200
 WORK_MIN: int = 50
 WORK_MAX: int = 250
 STARTING_BALANCE: int = 0
-CURRENCY_SYMBOL: str = "\U0001fa99"
+CURRENCY_SYMBOL: str = "🪙"
 
-# ── Leveling ──────────────────────────────────────────────────────────────────
+# ── Leveling ──────────────────────────────────────────────────────────────
 XP_PER_MESSAGE_MIN: int = 15
 XP_PER_MESSAGE_MAX: int = 25
 XP_COOLDOWN: int = 60           # seconds between XP gains
@@ -51,7 +52,7 @@ LEVEL_ROLES: dict[int, int] = {
     # 10: 987654321,
 }
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────
 DATA_DIR: str = "data"
 MEMORY_FILE: str = f"{DATA_DIR}/memory/user_memory.json"
 WALLETS_FILE: str = f"{DATA_DIR}/economy/wallets.json"
@@ -61,7 +62,7 @@ WARNINGS_FILE: str = f"{DATA_DIR}/warnings.json"
 ANALYTICS_FILE: str = f"{DATA_DIR}/analytics.json"
 SHOP_FILE: str = f"{DATA_DIR}/economy/shop.json"
 
-# ── Bot Meta ──────────────────────────────────────────────────────────────────
+# ── Bot Meta ──────────────────────────────────────────────────────────────
 BOT_NAME: str = "ServerBot"
 BOT_VERSION: str = "2.0.0"
 BOT_COLOR: int = 0x5865F2       # blurple

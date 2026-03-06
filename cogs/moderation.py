@@ -21,7 +21,7 @@ from utils.helpers import parse_duration
 
 log = logging.getLogger("cogs.moderation")
 
-# ── Persistent warnings store ─────────────────────────────────────────────
+# ── Persistent warnings store ───────────────────────────────────────────────
 _warnings: dict[str, list[dict[str, Any]]] = {}
 _warnings_loaded: bool = False
 
@@ -41,6 +41,7 @@ async def _load_warnings() -> None:
 
 
 async def _save_warnings() -> None:
+    os.makedirs(os.path.dirname(config.WARNINGS_FILE), exist_ok=True)
     async with aiofiles.open(config.WARNINGS_FILE, "w", encoding="utf-8") as f:
         await f.write(json.dumps(_warnings, indent=2))
 
@@ -245,7 +246,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
         lines: list[str] = []
         for i, w in enumerate(warns, 1):
-            lines.append(f"**{i}.** {w['reason']} — <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>")
+            lines.append(f"**{i}.** {w['reason']} \u2014 <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>")
         em = warning_embed(f"Warnings for {user}", "\n".join(lines))
         await interaction.response.send_message(embed=em)
 

@@ -32,7 +32,8 @@ class ConfigManager:
     """Handles all config persistence for the ticket system using MongoDB Atlas."""
 
     def __init__(self) -> None:
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("MONGO_URI"))
+        import config as _config
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(_config.MONGO_URI)
         self.db = self.client["ticket_bot"]
         self.col = self.db["guild_configs"]
 

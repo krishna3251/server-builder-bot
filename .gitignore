@@ -19,3 +19,6 @@ logs/
 
 # Old local JSON config (now using MongoDB)
 ticket_config.json
+
+# Runtime data files (ephemeral on Render)
+data/

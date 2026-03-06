@@ -40,6 +40,7 @@ async def _ensure_loaded() -> None:
 
 
 async def _save() -> None:
+    os.makedirs(os.path.dirname(config.ANALYTICS_FILE), exist_ok=True)
     async with aiofiles.open(config.ANALYTICS_FILE, "w", encoding="utf-8") as f:
         await f.write(json.dumps(_data, indent=2))
 
@@ -65,9 +66,9 @@ async def _inc(guild_id: int, section: str, key: str, amount: int = 1) -> None:
 
 def _ascii_bar(value: int, max_value: int, width: int = 15) -> str:
     if max_value == 0:
-        return "░" * width
+        return "\u2591" * width
     filled = int((value / max_value) * width)
-    return "█" * filled + "░" * (width - filled)
+    return "\u2588" * filled + "\u2591" * (width - filled)
 
 
 class AnalyticsCog(commands.Cog, name="Analytics"):
@@ -125,7 +126,7 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
             bar = _ascii_bar(v, max_val)
             lines.append(f"`{d[5:]}` {bar} **{v}**")
 
-        em = info_embed("📊 Messages (7 days)", "\n".join(lines) or "No data yet.")
+        em = info_embed("\U0001f4ca Messages (7 days)", "\n".join(lines) or "No data yet.")
         await interaction.response.send_message(embed=em)
 
     @analytics_group.command(name="members", description="Join/leave trend (last 7 days).")
@@ -144,9 +145,9 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
             d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
             j = joins.get(d, 0)
             l = leaves.get(d, 0)
-            lines.append(f"`{d[5:]}` 📥 **{j}** joined | 📤 **{l}** left")
+            lines.append(f"`{d[5:]}` \U0001f4e5 **{j}** joined | \U0001f4e4 **{l}** left")
 
-        em = info_embed("📊 Member Trend (7 days)", "\n".join(lines) or "No data yet.")
+        em = info_embed("\U0001f4ca Member Trend (7 days)", "\n".join(lines) or "No data yet.")
         await interaction.response.send_message(embed=em)
 
     @analytics_group.command(name="commands", description="Most used commands.")
@@ -158,14 +159,14 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         cmds: dict[str, int] = _data.get(gk, {}).get("commands", {})
 
         if not cmds:
-            em = info_embed("📊 Command Usage", "No data yet.")
+            em = info_embed("\U0001f4ca Command Usage", "No data yet.")
             return await interaction.response.send_message(embed=em)
 
         sorted_cmds = sorted(cmds.items(), key=lambda x: x[1], reverse=True)[:10]
         max_val = sorted_cmds[0][1] if sorted_cmds else 1
 
         lines = [f"`/{name:15s}` {_ascii_bar(count, max_val)} **{count}**" for name, count in sorted_cmds]
-        em = info_embed("📊 Command Usage (Top 10)", "\n".join(lines))
+        em = info_embed("\U0001f4ca Command Usage (Top 10)", "\n".join(lines))
         await interaction.response.send_message(embed=em)
 
 

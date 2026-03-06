@@ -5,14 +5,33 @@ import datetime
 import logging
 import os
 import pathlib
+from threading import Thread
 
 import discord
 from discord.ext import commands
+from flask import Flask
 
 import config
 from utils.logger import setup_logging
 
-# ── Ensure data directories exist ────────────────────────────────────────────
+# ── Keep-alive server for Render free tier ────────────────────────────────
+_keep_alive_app = Flask(__name__)
+
+
+@_keep_alive_app.route("/")
+def _health_check():
+    return "Bot is alive!", 200
+
+
+def _run_keep_alive():
+    port = int(os.environ.get("PORT", 8080))
+    _keep_alive_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+Thread(target=_run_keep_alive, daemon=True).start()
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── Ensure data directories exist ────────────────────────────────────────
 _DATA_DIRS = [
     "data/memory",
     "data/economy",
@@ -23,11 +42,11 @@ _DATA_DIRS = [
 for _d in _DATA_DIRS:
     pathlib.Path(_d).mkdir(parents=True, exist_ok=True)
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────
 setup_logging()
 log = logging.getLogger("bot")
 
-# ── Intents ───────────────────────────────────────────────────────────────────
+# ── Intents ───────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True

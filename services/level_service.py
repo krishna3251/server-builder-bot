@@ -34,6 +34,7 @@ async def _ensure_loaded() -> None:
 
 
 async def _save() -> None:
+    os.makedirs(os.path.dirname(config.XP_FILE), exist_ok=True)
     async with aiofiles.open(config.XP_FILE, "w", encoding="utf-8") as f:
         await f.write(json.dumps(_xp_data, indent=2))
 

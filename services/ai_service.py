@@ -15,7 +15,7 @@ import config
 
 log = logging.getLogger("services.ai")
 
-# ── Persona system prompts ────────────────────────────────────────────────────────
+# ── Persona system prompts ────────────────────────────────────────────────────
 PERSONAS: dict[str, str] = {
     "default": (
         "You are ServerBot, an intelligent and versatile Discord assistant. "
@@ -72,6 +72,7 @@ async def _ensure_loaded() -> None:
 
 async def _save_memory() -> None:
     """Persist memory to disk."""
+    os.makedirs(os.path.dirname(config.MEMORY_FILE), exist_ok=True)
     async with aiofiles.open(config.MEMORY_FILE, "w", encoding="utf-8") as f:
         await f.write(json.dumps(_memory, indent=2))
 

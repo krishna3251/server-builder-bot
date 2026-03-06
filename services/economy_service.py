@@ -57,11 +57,13 @@ def _default_shop() -> list[dict[str, Any]]:
 
 
 async def _save_wallets() -> None:
+    os.makedirs(os.path.dirname(config.WALLETS_FILE), exist_ok=True)
     async with aiofiles.open(config.WALLETS_FILE, "w", encoding="utf-8") as f:
         await f.write(json.dumps(_wallets, indent=2))
 
 
 async def _save_shop() -> None:
+    os.makedirs(os.path.dirname(config.SHOP_FILE), exist_ok=True)
     async with aiofiles.open(config.SHOP_FILE, "w", encoding="utf-8") as f:
         await f.write(json.dumps(_shop, indent=2))
 
