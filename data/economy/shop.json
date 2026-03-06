@@ -1,0 +1,5 @@
+[
+  {"name": "VIP Role Badge", "price": 1000, "description": "Cosmetic VIP badge."},
+  {"name": "Custom Colour", "price": 2500, "description": "Pick a custom name colour."},
+  {"name": "XP Boost", "price": 5000, "description": "2\u00d7 XP for 1 hour."}
+]

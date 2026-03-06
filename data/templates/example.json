@@ -1,0 +1,51 @@
+{
+  "server_name": "Example Server",
+  "roles": [
+    {
+      "name": "Admin",
+      "color": "#FF0000",
+      "hoist": true,
+      "mentionable": false,
+      "permissions": ["administrator"]
+    },
+    {
+      "name": "Moderator",
+      "color": "#00FF00",
+      "hoist": true,
+      "mentionable": true,
+      "permissions": ["kick_members", "ban_members", "manage_messages"]
+    },
+    {
+      "name": "Member",
+      "color": "#3498DB",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": ["send_messages", "read_messages"]
+    }
+  ],
+  "categories": [
+    {
+      "name": "General",
+      "channels": [
+        { "type": "text", "name": "welcome", "topic": "Welcome to the server!" },
+        { "type": "text", "name": "general-chat", "topic": "General discussion" },
+        { "type": "text", "name": "rules", "topic": "Server rules", "slowmode": 30 },
+        { "type": "voice", "name": "Lounge", "bitrate": 64000, "user_limit": 10 }
+      ]
+    },
+    {
+      "name": "Staff",
+      "permission_overwrites": [
+        {
+          "role": "Admin",
+          "allow": ["read_messages", "send_messages"],
+          "deny": []
+        }
+      ],
+      "channels": [
+        { "type": "text", "name": "mod-log", "topic": "Moderation logs" },
+        { "type": "text", "name": "staff-chat", "topic": "Staff discussion" }
+      ]
+    }
+  ]
+}

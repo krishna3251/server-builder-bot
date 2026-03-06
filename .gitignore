@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Logs
+logs/
+
+# Data (user-specific runtime data)
+data/memory/
+data/economy/wallets.json
+data/levels/xp_data.json
+data/tickets/ticket_log.json
+data/analytics.json
+data/warnings.json
+ticket_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
