@@ -6,15 +6,18 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import discord
+import motor.motor_asyncio
 from discord import app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 EMBED_COLOR: int = 0x5865F2
@@ -24,40 +27,44 @@ AUTO_DELETE_DELAY: int = 10  # seconds before ticket channel is deleted after cl
 log = logging.getLogger("cogs.ticket_system")
 
 
-# ── Config Manager ────────────────────────────────────────────────────────────
+# ── Config Manager (MongoDB via motor) ────────────────────────────────────────
 class ConfigManager:
-    """Handles all JSON-based config persistence for the ticket system."""
+    """Handles all config persistence for the ticket system using MongoDB Atlas."""
 
-    FILE_PATH: str = "ticket_config.json"
-
-    async def load_all(self) -> dict:
-        try:
-            with open(self.FILE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    async def save_all(self, data: dict) -> None:
-        with open(self.FILE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    def __init__(self) -> None:
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(os.getenv("MONGO_URI"))
+        self.db = self.client["ticket_bot"]
+        self.col = self.db["guild_configs"]
 
     async def get_guild(self, guild_id: int) -> dict:
-        data = await self.load_all()
-        return data.get(str(guild_id), {})
+        doc = await self.col.find_one({"_id": str(guild_id)})
+        return doc or {}
 
-    async def save_guild(self, guild_id: int, guild_data: dict) -> None:
-        data = await self.load_all()
-        data[str(guild_id)] = guild_data
-        await self.save_all(data)
+    async def save_guild(self, guild_id: int, data: dict) -> None:
+        data.pop("_id", None)  # avoid overwriting the document key
+        await self.col.update_one(
+            {"_id": str(guild_id)},
+            {"$set": data},
+            upsert=True,
+        )
 
     async def get_key(self, guild_id: int, key: str, default=None):
-        guild_data = await self.get_guild(guild_id)
-        return guild_data.get(key, default)
+        doc = await self.get_guild(guild_id)
+        return doc.get(key, default)
 
     async def set_key(self, guild_id: int, key: str, value) -> None:
-        guild_data = await self.get_guild(guild_id)
-        guild_data[key] = value
-        await self.save_guild(guild_id, guild_data)
+        await self.col.update_one(
+            {"_id": str(guild_id)},
+            {"$set": {key: value}},
+            upsert=True,
+        )
+
+    async def delete_key(self, guild_id: int, key: str) -> None:
+        await self.col.update_one(
+            {"_id": str(guild_id)},
+            {"$unset": {key: ""}},
+            upsert=False,
+        )
 
 
 # ── Auto-Delete Manager ──────────────────────────────────────────────────────

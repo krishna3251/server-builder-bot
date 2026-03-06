@@ -1,3 +1,6 @@
+# Environment secrets
+.env
+
 # Python
 __pycache__/
 *.py[cod]
@@ -7,26 +10,12 @@ dist/
 build/
 *.egg
 
-# Environment
-.env
-.venv/
-venv/
-env/
+# IDE
+.vscode/
+.idea/
 
 # Logs
 logs/
 
-# Data (user-specific runtime data)
-data/memory/
-data/economy/wallets.json
-data/levels/xp_data.json
-data/tickets/ticket_log.json
-data/analytics.json
-data/warnings.json
+# Old local JSON config (now using MongoDB)
 ticket_config.json
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
