@@ -122,6 +122,7 @@ async def on_app_command_error(
 
 async def main() -> None:
     async with bot:
+         await asyncio.sleep(3)
         await bot.start(config.DISCORD_TOKEN)
 
 
