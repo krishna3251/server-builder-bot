@@ -177,7 +177,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         if log_channel:
             opener_mention = f"<@{opener_id}>" if opener_id else "Unknown"
             log_embed = warning_embed(f"Ticket closed • #{ticket_counter_str}", "")
-                        log_embed.add_field(name="Ticket", value=channel.name, inline=True)
+            log_embed.add_field(name="Ticket", value=channel.name, inline=True)
             log_embed.add_field(name="Opened by", value=opener_mention, inline=True)
             log_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
             log_embed.add_field(name="Reason", value=reason, inline=False)
@@ -846,13 +846,11 @@ class TicketSystem(commands.Cog):
         )
 
         # Respond to the user
-        created_embed = discord.Embed(
-            title="✅ Ticket created",
-            description=f"Your **{ticket_type}** ticket is ready: {ticket_channel.mention}",
-            color=0x57F287,
-            timestamp=discord.utils.utcnow(),
+        created_embed = success_embed(
+            "Ticket created",
+            f"Your **{ticket_type}** ticket is ready: {ticket_channel.mention}",
         )
-        created_embed.set_footer(text=f"{interaction.guild.name} • Support")
+        add_usage_footer(created_embed, f"{interaction.guild.name} • Support")
         await interaction.followup.send(embed=created_embed, ephemeral=True)
 
         # Notify staff (non-blocking)
