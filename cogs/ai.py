@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from services import ai_service
-from services.embed_service import error_embed, info_embed, success_embed
+from services.embed_service import add_usage_footer, error_embed, info_embed, success_embed
 from utils.helpers import chunk_text
 
 import config
@@ -54,9 +54,18 @@ class AICog(commands.Cog, name="AI"):
         reply = await ai_service.get_ai_response(prompt, interaction.user.id)
 
         chunks = chunk_text(reply)
-        await interaction.followup.send(content=chunks[0])
+        if not chunks or not any(chunk.strip() for chunk in chunks):
+            return await interaction.followup.send(
+                embed=info_embed("✨ AI Assistant", "I didn't receive a usable response. Please try again."),
+                ephemeral=True,
+            )
+
+        first = info_embed("✨ AI Assistant", chunks[0] or " ")
+        add_usage_footer(first, "AI response")
+        await interaction.followup.send(embed=first)
         for chunk in chunks[1:]:
-            await interaction.followup.send(content=chunk)
+            if chunk.strip():
+                await interaction.followup.send(content=chunk)
 
     # ── /ai_reset ─────────────────────────────────────────────────────────
     @app_commands.command(name="ai_reset", description="Clear your AI conversation memory.")

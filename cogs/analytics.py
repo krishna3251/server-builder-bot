@@ -168,7 +168,13 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
             bar = _ascii_bar(v, max_val)
             lines.append(f"`{d[5:]}` {bar} **{v}**")
 
-        em = info_embed("\U0001f4ca Messages (7 days)", "\n".join(lines) or "No data yet.")
+        em = info_embed(
+            "📊 Message activity",
+            "Daily message volume across the last seven days.\n\n" + ("\n".join(lines) or "No data yet."),
+        )
+        em.add_field(name="7-day total", value=f"**{sum(values):,}**", inline=True)
+        em.add_field(name="Daily average", value=f"**{sum(values) // max(len(values), 1):,}**", inline=True)
+        em.add_field(name="Peak day", value=f"**{max(values) if values else 0:,}**", inline=True)
         await interaction.response.send_message(embed=em)
 
     @analytics_group.command(name="members", description="Join/leave trend (last 7 days).")
@@ -189,7 +195,15 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
             l = leaves.get(d, 0)
             lines.append(f"`{d[5:]}` \U0001f4e5 **{j}** joined | \U0001f4e4 **{l}** left")
 
-        em = info_embed("\U0001f4ca Member Trend (7 days)", "\n".join(lines) or "No data yet.")
+        total_joins = sum(joins.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), 0) for i in range(7))
+        total_leaves = sum(leaves.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), 0) for i in range(7))
+        em = info_embed(
+            "📊 Member activity",
+            "Join and leave totals for the last seven days.\n\n" + ("\n".join(lines) or "No data yet."),
+        )
+        em.add_field(name="Joined", value=f"**+{total_joins:,}**", inline=True)
+        em.add_field(name="Left", value=f"**−{total_leaves:,}**", inline=True)
+        em.add_field(name="Net change", value=f"**{total_joins - total_leaves:+,}**", inline=True)
         await interaction.response.send_message(embed=em)
 
     @analytics_group.command(name="commands", description="Most used commands.")
@@ -201,16 +215,22 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         cmds: dict[str, int] = _data.get(gk, {}).get("commands", {})
 
         if not cmds:
-            em = info_embed("\U0001f4ca Command Usage", "No data yet.")
+            em = info_embed("📊 Command usage", "No command usage has been recorded yet.")
             return await interaction.response.send_message(embed=em)
 
-        sorted_cmds = sorted(cmds.items(), key=lambda x: x[1], reverse=True)[:10]
-        max_val = sorted_cmds[0][1] if sorted_cmds else 1
-
-        lines = [f"`/{name:15s}` {_ascii_bar(count, max_val)} **{count}**" for name, count in sorted_cmds]
-        em = info_embed("\U0001f4ca Command Usage (Top 10)", "\n".join(lines))
+        sorted_cmds = sorted(cmds.items(), key=lambda item: item[1], reverse=True)[:10]
+        max_val = max(sorted_cmds[0][1], 1)
+        lines = [
+            f"`/{name}`  {_ascii_bar(count, max_val, width=12)}  **{count:,}**"
+            for name, count in sorted_cmds
+        ]
+        em = info_embed(
+            "📊 Command usage",
+            "Most-used commands recorded by this bot.\n\n" + "\n".join(lines),
+        )
+        em.add_field(name="Tracked commands", value=str(len(cmds)), inline=True)
+        em.add_field(name="Total uses", value=f"{sum(cmds.values()):,}", inline=True)
         await interaction.response.send_message(embed=em)
-
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AnalyticsCog(bot))

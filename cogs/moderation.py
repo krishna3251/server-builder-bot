@@ -15,6 +15,7 @@ from discord.ext import commands
 
 import config
 from services.embed_service import error_embed, success_embed, warning_embed
+from utils.paginator import Paginator
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
 from utils.helpers import parse_duration
@@ -67,6 +68,64 @@ async def _dm_user(user: discord.User | discord.Member, embed: discord.Embed) ->
         await user.send(embed=embed)
     except discord.HTTPException:
         pass
+
+
+class ClearWarningsConfirmView(discord.ui.View):
+    """Require an explicit confirmation before deleting a member's warning history."""
+
+    def __init__(self, *, guild_id: int, member: discord.Member, owner_id: int) -> None:
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.member = member
+        self.owner_id = owner_id
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the moderator who started this action can confirm it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Clear warnings", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Defer the component update before loading and saving the warning store.
+        await interaction.response.defer()
+        await _load_warnings()
+        _warnings.pop(_warn_key(self.guild_id, self.member.id), None)
+        await _save_warnings()
+        for child in self.children:
+            child.disabled = True
+        em = success_embed(
+            "Warning history cleared",
+            f"All recorded warnings for **{self.member.display_name}** have been removed.",
+        )
+        await interaction.edit_original_response(embed=em, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            embed=info_embed("Action cancelled", "The member's warning history was not changed."),
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    embed=info_embed("Confirmation expired", "The warning history was left unchanged."),
+                    view=self,
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
 
 class ModerationCog(commands.Cog, name="Moderation"):
@@ -244,11 +303,32 @@ class ModerationCog(commands.Cog, name="Moderation"):
         if not warns:
             return await interaction.response.send_message(embed=success_embed("No Warnings", f"**{user}** has no warnings."), ephemeral=True)
 
-        lines: list[str] = []
-        for i, w in enumerate(warns, 1):
-            lines.append(f"**{i}.** {w['reason']} \u2014 <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>")
-        em = warning_embed(f"Warnings for {user}", "\n".join(lines))
-        await interaction.response.send_message(embed=em)
+        pages: list[discord.Embed] = []
+        for offset in range(0, len(warns), 5):
+            chunk = warns[offset:offset + 5]
+            lines: list[str] = []
+            for index, item in enumerate(chunk, start=offset + 1):
+                reason = str(item.get("reason", "No reason provided")).replace("\n", " ").strip()
+                if len(reason) > 280:
+                    reason = reason[:277] + "..."
+                timestamp = datetime.fromisoformat(item["timestamp"])
+                lines.append(
+                    f"**#{index}** · <t:{int(timestamp.timestamp())}:R>\n"
+                    f"> {discord.utils.escape_markdown(reason)}"
+                )
+            page = warning_embed(f"Warning history · {user.display_name}", "\n\n".join(lines))
+            page.set_thumbnail(url=user.display_avatar.url)
+            page.add_field(name="Total warnings", value=str(len(warns)), inline=True)
+            pages.append(page)
+
+        if len(pages) == 1:
+            return await interaction.response.send_message(embed=pages[0], ephemeral=True)
+        view = Paginator(pages, author_id=interaction.user.id)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     # ── /clearwarnings ────────────────────────────────────────────────────
     @app_commands.command(name="clearwarnings", description="Clear all warnings for a member.")
@@ -259,10 +339,28 @@ class ModerationCog(commands.Cog, name="Moderation"):
         assert interaction.guild is not None
         await _load_warnings()
         k = _warn_key(interaction.guild.id, user.id)
-        _warnings.pop(k, None)
-        await _save_warnings()
-        em = success_embed("Cleared", f"All warnings for **{user}** have been removed.")
-        await interaction.response.send_message(embed=em)
+        count = len(_warnings.get(k, []))
+        if count == 0:
+            return await interaction.response.send_message(
+                embed=success_embed("No warnings to clear", f"**{user.display_name}** has no recorded warnings."),
+                ephemeral=True,
+            )
+
+        view = ClearWarningsConfirmView(
+            guild_id=interaction.guild.id,
+            member=user,
+            owner_id=interaction.user.id,
+        )
+        em = warning_embed(
+            "Confirm warning reset",
+            f"This will permanently remove **{count}** warning(s) recorded for {user.mention}. "
+            "This action cannot be undone.",
+        )
+        await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     # ── /slowmode ─────────────────────────────────────────────────────────
     @app_commands.command(name="slowmode", description="Set slowmode on a channel.")

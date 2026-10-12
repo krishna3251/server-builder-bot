@@ -17,6 +17,8 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from services.embed_service import add_usage_footer, error_embed, info_embed, success_embed, warning_embed
+
 load_dotenv()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -144,11 +146,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         ticket_counter_str = channel.name.split("-")[1] if "-" in channel.name else "????"
 
         # Step 1 \u2014 Send closing embed in channel
-        close_embed = discord.Embed(
-            title="\U0001f512 Ticket Closed",
-            color=0xFF4444,
-            timestamp=discord.utils.utcnow(),
-        )
+        close_embed = warning_embed("Ticket closed", "")
         close_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
         close_embed.add_field(name="Reason", value=reason, inline=False)
         close_embed.add_field(
@@ -156,8 +154,9 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
             inline=True,
         )
-        close_embed.set_footer(
-            text=f"This channel will be deleted in {AUTO_DELETE_DELAY} seconds."
+        add_usage_footer(
+            close_embed,
+            f"This channel will be deleted in {AUTO_DELETE_DELAY} seconds.",
         )
         await interaction.response.send_message(embed=close_embed)
 
@@ -177,11 +176,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
 
         if log_channel:
             opener_mention = f"<@{opener_id}>" if opener_id else "Unknown"
-            log_embed = discord.Embed(
-                title=f"\U0001f4c1 Ticket Closed \u2014 #{ticket_counter_str}",
-                color=0xFF4444,
-                timestamp=discord.utils.utcnow(),
-            )
+            log_embed = warning_embed(f"Ticket closed • #{ticket_counter_str}", "")
             log_embed.add_field(name="Ticket", value=channel.name, inline=True)
             log_embed.add_field(name="Opened by", value=opener_mention, inline=True)
             log_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
@@ -292,11 +287,7 @@ class TicketControlView(discord.ui.View):
         config_data["claimed_tickets"] = claimed_tickets
         await cog.config_manager.save_guild(interaction.guild.id, config_data)
 
-        claim_embed = discord.Embed(
-            title="\u2705 Ticket Claimed",
-            color=0x00FF7F,
-            timestamp=discord.utils.utcnow(),
-        )
+        claim_embed = success_embed("Ticket claimed", "")
         claim_embed.add_field(name="Claimed by", value=interaction.user.mention, inline=True)
         claim_embed.add_field(
             name="Claimed at",
@@ -317,11 +308,16 @@ class TicketControlView(discord.ui.View):
                     embed.add_field(
                         name="Claimed by", value=interaction.user.mention, inline=True
                     )
-                    await control_msg.edit(embed=embed)
+                    button.label = "Claimed"
+                    button.disabled = True
+                    await control_msg.edit(embed=embed, view=self)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.warning("Could not edit control message to add claim info: %s", e)
 
-        await interaction.response.send_message("You have claimed this ticket.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=success_embed("Ticket claimed", "You are now responsible for this ticket."),
+            ephemeral=True,
+        )
         log.info("Ticket %s claimed by %s", interaction.channel.name, interaction.user)
 
     @discord.ui.button(
@@ -450,8 +446,7 @@ class TicketBlacklist(app_commands.Group):
         config_data["blacklisted_users"] = blacklist
         await self.cog.config_manager.save_guild(interaction.guild.id, config_data)
 
-        embed = discord.Embed(title="\U0001f6ab User Blacklisted", color=0xFF4444)
-        embed.add_field(name="User", value=user.mention, inline=True)
+        embed = warning_embed("User blacklisted", f"{user.mention} can no longer open tickets.")
         embed.add_field(name="Added by", value=interaction.user.mention, inline=True)
         await interaction.response.send_message(embed=embed)
 
@@ -479,8 +474,7 @@ class TicketBlacklist(app_commands.Group):
         config_data["blacklisted_users"] = blacklist
         await self.cog.config_manager.save_guild(interaction.guild.id, config_data)
 
-        embed = discord.Embed(title="\u2705 User Removed from Blacklist", color=0x00FF7F)
-        embed.add_field(name="User", value=user.mention, inline=True)
+        embed = success_embed("User removed from blacklist", f"{user.mention} can open tickets again.")
         embed.add_field(name="Removed by", value=interaction.user.mention, inline=True)
         await interaction.response.send_message(embed=embed)
 
@@ -502,11 +496,7 @@ class TicketBlacklist(app_commands.Group):
             )
 
         mentions = "\n".join(f"<@{uid}>" for uid in blacklist)
-        embed = discord.Embed(
-            title="\U0001f6ab Blacklisted Users",
-            description=mentions,
-            color=0xFF4444,
-        )
+        embed = warning_embed("Blacklisted users", mentions)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -622,7 +612,28 @@ class TicketSystem(commands.Cog):
             color=EMBED_COLOR,
             timestamp=discord.utils.utcnow(),
         )
-        panel_embed.set_footer(text="Click a button below to open a support ticket.")
+        panel_embed.set_author(name=f"{interaction.guild.name} • Support Center")
+        if interaction.guild.icon:
+            panel_embed.set_author(
+                name=f"{interaction.guild.name} • Support Center",
+                icon_url=interaction.guild.icon.url,
+            )
+        panel_embed.add_field(
+            name="🛠️ Technical support",
+            value="Troubleshooting, account issues, or help with the bot.",
+            inline=True,
+        )
+        panel_embed.add_field(
+            name="🛡️ Server support",
+            value="Server setup, access, or community questions.",
+            inline=True,
+        )
+        panel_embed.add_field(
+            name="⚔️ Moderation support",
+            value="Report a moderation concern privately to the team.",
+            inline=True,
+        )
+        add_usage_footer(panel_embed, "Choose a category below • One open ticket per member")
         if ticket_image_url:
             panel_embed.set_image(url=ticket_image_url)
 
@@ -655,7 +666,13 @@ class TicketSystem(commands.Cog):
 
         await self.config_manager.save_guild(interaction.guild.id, config_data)
 
-        await interaction.followup.send("Ticket panel created successfully! \u2705", ephemeral=True)
+        await interaction.followup.send(
+            embed=success_embed(
+                "Ticket panel published",
+                f"Posted the support panel in {panel_msg.channel.mention}. [Open panel]({panel_msg.jump_url})",
+            ),
+            ephemeral=True,
+        )
         log.info(
             "Ticket panel set up in guild %s by %s", interaction.guild.id, interaction.user
         )
@@ -778,11 +795,7 @@ class TicketSystem(commands.Cog):
             )
 
         # \u2500\u2500 Opening Embed \u2500\u2500
-        ticket_embed = discord.Embed(
-            title=f"Ticket #{counter:04d}",
-            color=EMBED_COLOR,
-            timestamp=discord.utils.utcnow(),
-        )
+        ticket_embed = info_embed(f"Ticket #{counter:04d}", "A private support conversation is open.")
         ticket_embed.set_thumbnail(url=interaction.user.display_avatar.url)
         ticket_image_url = config_data.get("ticket_image_url")
         if ticket_image_url:
@@ -794,7 +807,7 @@ class TicketSystem(commands.Cog):
             value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
             inline=True,
         )
-        ticket_embed.set_footer(text="Use the buttons below to manage this ticket.")
+        add_usage_footer(ticket_embed, "Use the buttons below to manage this ticket.")
 
         # \u2500\u2500 Role mention text \u2500\u2500
         mention_parts: list[str] = []
@@ -833,9 +846,12 @@ class TicketSystem(commands.Cog):
         )
 
         # Respond to the user
-        await interaction.followup.send(
-            f"Your ticket has been created: {ticket_channel.mention}", ephemeral=True
+        created_embed = success_embed(
+            "Ticket created",
+            f"Your **{ticket_type}** ticket is ready: {ticket_channel.mention}",
         )
+        add_usage_footer(created_embed, f"{interaction.guild.name} • Support")
+        await interaction.followup.send(embed=created_embed, ephemeral=True)
 
         # Notify staff (non-blocking)
         asyncio.create_task(
@@ -856,11 +872,15 @@ class TicketSystem(commands.Cog):
     ) -> None:
         """Send DM notifications to staff and post to the log channel."""
 
-        dm_embed = discord.Embed(
-            title="\U0001f4ec New Ticket Opened",
-            color=0xFFA500,
-            timestamp=discord.utils.utcnow(),
+        dm_embed = info_embed(
+            "📨 New support ticket",
+            "A new request is waiting for staff attention.",
         )
+        if guild.icon:
+            dm_embed.set_author(name=guild.name, icon_url=guild.icon.url)
+        else:
+            dm_embed.set_author(name=guild.name)
+        add_usage_footer(dm_embed, "Staff notification")
         dm_embed.add_field(
             name="Opened by", value=f"{opener.mention} ({opener.name})", inline=True
         )
