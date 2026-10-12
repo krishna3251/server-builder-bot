@@ -272,8 +272,9 @@ def _validate_schema(schema: dict[str, Any]) -> None:
         if name in role_names:
             raise ValueError(f"Duplicate role name: {name}")
         role_names.add(name)
-        if not isinstance(role.get("permissions", []), list):
-            raise ValueError(f"Permissions for role '{name}' must be a list.")
+        permissions = role.get("permissions", [])
+        if not isinstance(permissions, list) or any(not isinstance(p, str) for p in permissions):
+            raise ValueError(f"Permissions for role '{name}' must be a list of strings.")
 
     channel_count = 0
     for category in categories:
@@ -282,6 +283,8 @@ def _validate_schema(schema: dict[str, Any]) -> None:
         category_name = category.get("name")
         if not isinstance(category_name, str) or not category_name.strip() or len(category_name) > 100:
             raise ValueError("Every category needs a non-empty name of at most 100 characters.")
+        if not isinstance(category.get("permission_overwrites", []), list):
+            raise ValueError(f"Permission overwrites for category '{category_name}' must be a list.")
         channels = category.get("channels", [])
         if not isinstance(channels, list):
             raise ValueError(f"Channels for category '{category_name}' must be a list.")
@@ -292,6 +295,8 @@ def _validate_schema(schema: dict[str, Any]) -> None:
             channel_name = channel.get("name")
             if not isinstance(channel_name, str) or not channel_name.strip() or len(channel_name) > 100:
                 raise ValueError("Every channel needs a non-empty name of at most 100 characters.")
+            if not isinstance(channel.get("permission_overwrites", []), list):
+                raise ValueError(f"Permission overwrites for channel '{channel_name}' must be a list.")
             channel_type = channel.get("type", "text")
             if channel_type not in ("text", "voice"):
                 raise ValueError(f"Unsupported channel type '{channel_type}'. Use 'text' or 'voice'.")
