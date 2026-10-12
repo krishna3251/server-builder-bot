@@ -15,6 +15,7 @@ from discord.ext import commands
 
 import config
 from services.embed_service import error_embed, success_embed, warning_embed
+from utils.paginator import Paginator
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
 from utils.helpers import parse_duration
@@ -244,11 +245,32 @@ class ModerationCog(commands.Cog, name="Moderation"):
         if not warns:
             return await interaction.response.send_message(embed=success_embed("No Warnings", f"**{user}** has no warnings."), ephemeral=True)
 
-        lines: list[str] = []
-        for i, w in enumerate(warns, 1):
-            lines.append(f"**{i}.** {w['reason']} \u2014 <t:{int(datetime.fromisoformat(w['timestamp']).timestamp())}:R>")
-        em = warning_embed(f"Warnings for {user}", "\n".join(lines))
-        await interaction.response.send_message(embed=em)
+        pages: list[discord.Embed] = []
+        for offset in range(0, len(warns), 5):
+            chunk = warns[offset:offset + 5]
+            lines: list[str] = []
+            for index, item in enumerate(chunk, start=offset + 1):
+                reason = str(item.get("reason", "No reason provided")).replace("\n", " ").strip()
+                if len(reason) > 280:
+                    reason = reason[:277] + "..."
+                timestamp = datetime.fromisoformat(item["timestamp"])
+                lines.append(
+                    f"**#{index}** · <t:{int(timestamp.timestamp())}:R>\n"
+                    f"> {discord.utils.escape_markdown(reason)}"
+                )
+            page = warning_embed(f"Warning history · {user.display_name}", "\n\n".join(lines))
+            page.set_thumbnail(url=user.display_avatar.url)
+            page.add_field(name="Total warnings", value=str(len(warns)), inline=True)
+            pages.append(page)
+
+        if len(pages) == 1:
+            return await interaction.response.send_message(embed=pages[0], ephemeral=True)
+        view = Paginator(pages, author_id=interaction.user.id)
+        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     # ── /clearwarnings ────────────────────────────────────────────────────
     @app_commands.command(name="clearwarnings", description="Clear all warnings for a member.")
