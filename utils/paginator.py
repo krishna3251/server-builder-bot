@@ -32,7 +32,7 @@ class Paginator(discord.ui.View):
             # Strip an older paginator footer if the same embed is paginated again.
             existing = existing.split(" • Page ")[0]
             footer = f"{existing} • Page {index}/{total}" if existing else f"Page {index}/{total}"
-            page.set_footer(text=footer[:2048], icon_url=page.footer.icon_url or discord.utils.MISSING)
+            page.set_footer(text=footer[:2048], icon_url=page.footer.icon_url)
 
     def _update_buttons(self) -> None:
         self.btn_prev.disabled = self.current == 0
