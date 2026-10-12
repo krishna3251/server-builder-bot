@@ -13,7 +13,7 @@ from discord.ext import commands
 
 import config
 from services import level_service
-from services.embed_service import info_embed, success_embed, error_embed
+from services.embed_service import add_member_context, info_embed, success_embed, error_embed, progress_bar
 from utils.decorators import admin_only, guild_only
 from utils.helpers import format_number
 
@@ -82,16 +82,14 @@ class LevelingCog(commands.Cog, name="Leveling"):
         level = stats["level"]
         next_lvl_xp = level_service.xp_for_level(level + 1)
 
-        # ASCII progress bar
+        # Render a compact profile card using the shared UI primitives.
         progress = min(xp / max(next_lvl_xp, 1), 1.0)
-        bar_filled = int(progress * 20)
-        bar = "█" * bar_filled + "░" * (20 - bar_filled)
-
-        em = info_embed(f"{target.display_name}'s Rank", "")
-        em.set_thumbnail(url=target.display_avatar.url)
-        em.add_field(name="Level", value=str(level), inline=True)
-        em.add_field(name="XP", value=f"{format_number(xp)} / {format_number(next_lvl_xp)}", inline=True)
-        em.add_field(name="Progress", value=f"`{bar}` {int(progress * 100)}%", inline=False)
+        em = info_embed(f"🏅 {target.display_name}'s Rank", "Your activity snapshot for this server.")
+        add_member_context(em, target)
+        em.add_field(name="LEVEL", value=f"**{level:,}**", inline=True)
+        em.add_field(name="TOTAL XP", value=f"**{format_number(xp)}**", inline=True)
+        em.add_field(name="NEXT LEVEL", value=f"{format_number(max(0, next_lvl_xp - xp))} XP to go", inline=True)
+        em.add_field(name="Progress to next level", value=progress_bar(progress, 1, width=18), inline=False)
         await interaction.response.send_message(embed=em)
 
     # ── /setxp ────────────────────────────────────────────────────────────
