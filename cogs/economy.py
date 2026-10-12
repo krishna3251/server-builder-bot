@@ -106,6 +106,8 @@ class ShopBuyButton(discord.ui.Button):
             )
 
         item = view.items[view.selected_index]
+        # Acknowledge immediately: the purchase and balance reads may hit the database.
+        await interaction.response.defer()
         ok, message = await eco.buy_item(view.guild_id, view.owner_id, str(item.get("name", "")))
         if ok:
             receipt = success_embed("Purchase complete", message)
@@ -114,10 +116,13 @@ class ShopBuyButton(discord.ui.Button):
                 value=f"{config.CURRENCY_SYMBOL} {format_number(await eco.get_balance(view.guild_id, view.owner_id))}",
                 inline=True,
             )
-            await interaction.response.edit_message(embed=receipt, view=None)
+            await interaction.edit_original_response(embed=receipt, view=None)
             view.stop()
         else:
-            await interaction.response.send_message(embed=error_embed("Purchase unavailable", message), ephemeral=True)
+            await interaction.edit_original_response(
+                embed=error_embed("Purchase unavailable", message),
+                view=view,
+            )
 
 
 class ShopCloseButton(discord.ui.Button):
@@ -334,15 +339,16 @@ class EconomyCog(commands.Cog, name="Economy"):
     @guild_only()
     async def shop(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
         items = await eco.get_shop_items()
         if not items:
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=info_embed("🛒 Server Shop", "The catalogue is empty right now."),
-                ephemeral=True,
+                view=None,
             )
 
         view = ShopView(items, guild_id=interaction.guild.id, owner_id=interaction.user.id)
-        await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+        await interaction.edit_original_response(embed=view.make_embed(), view=view)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
