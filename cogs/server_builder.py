@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from services import ai_service
-from services.embed_service import error_embed, info_embed, success_embed
+from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from services.json_builder import build_server, _validate_schema
 
 
