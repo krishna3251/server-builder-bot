@@ -16,6 +16,109 @@ from services.embed_service import add_member_context, info_embed, success_embed
 from utils.decorators import guild_only
 from utils.helpers import format_number, parse_duration, time_until
 
+_HELP_PAGES: dict[str, tuple[str, str]] = {
+    "overview": (
+        "🤖 Command center",
+        "Choose a category from the menu to explore the bot. Admin tools are permission-gated, "
+        "and some commands only work inside a server.",
+    ),
+    "builder": (
+        "🧱 Server builder",
+        "**Quick start:** `/builder_panel`\n"
+        "**Commands:** `/setup_server`, `/setup_custom`, `/server_json`, `/generate_server`, `/channel_summaries`\n\n"
+        "Review previews before applying changes. Cleaning an existing server is destructive.",
+    ),
+    "tickets": (
+        "🎫 Tickets",
+        "**Setup:** `/setup_tickets`\n"
+        "**Controls:** use the ticket panel buttons to open a category, claim, or close a ticket.\n"
+        "**Blacklist:** `/ticket_blacklist add`, `/ticket_blacklist remove`, `/ticket_blacklist list`\n"
+        "**Other:** `/cancel_delete`",
+    ),
+    "moderation": (
+        "🛡️ Moderation",
+        "`/kick` · `/ban` · `/unban` · `/mute` · `/unmute`\n"
+        "`/warn` · `/warnings` · `/clearwarnings` · `/clear`\n"
+        "`/slowmode` · `/lock` · `/unlock`\n\n"
+        "Moderation commands require the relevant server permissions and respect role hierarchy.",
+    ),
+    "economy": (
+        "💰 Economy & leveling",
+        "`/balance` · `/daily` · `/work` · `/pay`\n"
+        "`/leaderboard` · `/shop` · `/buy` · `/inventory`\n"
+        "`/rank` · `/setxp`\n\n"
+        "The shop has an interactive catalogue. Purchases are recorded in your server inventory.",
+    ),
+    "ai": (
+        "✨ AI assistant",
+        "`/ai` — chat with the assistant\n"
+        "`/ai_persona` — choose its response style\n"
+        "`/ai_reset` — clear your conversation memory",
+    ),
+    "utility": (
+        "🔧 Utility & analytics",
+        "`/ping` · `/serverinfo` · `/userinfo` · `/roleinfo`\n"
+        "`/avatar` · `/banner` · `/invite` · `/uptime` · `/botinfo`\n"
+        "`/poll` · `/remind`\n"
+        "`/analytics messages` · `/analytics members` · `/analytics commands`",
+    ),
+}
+
+
+class HelpCategorySelect(discord.ui.Select):
+    def __init__(self) -> None:
+        options = [
+            discord.SelectOption(label="Overview", value="overview", emoji="🤖", default=True),
+            discord.SelectOption(label="Server Builder", value="builder", emoji="🧱"),
+            discord.SelectOption(label="Tickets", value="tickets", emoji="🎫"),
+            discord.SelectOption(label="Moderation", value="moderation", emoji="🛡️"),
+            discord.SelectOption(label="Economy & Leveling", value="economy", emoji="💰"),
+            discord.SelectOption(label="AI Assistant", value="ai", emoji="✨"),
+            discord.SelectOption(label="Utilities & Analytics", value="utility", emoji="🔧"),
+        ]
+        super().__init__(
+            placeholder="Browse command categories…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, CommandHelpView):
+            return
+        if interaction.user.id != view.owner_id:
+            return await interaction.response.send_message(
+                "This command guide belongs to the person who opened it.",
+                ephemeral=True,
+            )
+        key = self.values[0]
+        title, description = _HELP_PAGES[key]
+        em = info_embed(title, description)
+        em.set_footer(text=f"{config.BOT_NAME} • Command guide")
+        await interaction.response.edit_message(embed=em, view=view)
+
+
+class CommandHelpView(discord.ui.View):
+    """Private dropdown help navigation so the command list stays readable."""
+
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.message: discord.Message | None = None
+        self.add_item(HelpCategorySelect())
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
 log = logging.getLogger("cogs.utility")
 
 
@@ -24,6 +127,23 @@ class UtilityCog(commands.Cog, name="Utility"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    @app_commands.command(name="help", description="Open the interactive command guide.")
+    async def help(self, interaction: discord.Interaction) -> None:
+        title, description = _HELP_PAGES["overview"]
+        em = info_embed(title, description)
+        em.add_field(
+            name="Featured commands",
+            value="`/builder_panel` · `/shop` · `/rank` · `/ai`",
+            inline=False,
+        )
+        em.set_footer(text=f"{config.BOT_NAME} • Select a category below")
+        view = CommandHelpView(interaction.user.id)
+        await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     # ── /ping ─────────────────────────────────────────────────────────────
     @app_commands.command(name="ping", description="Check bot latency.")
