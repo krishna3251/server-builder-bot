@@ -317,7 +317,9 @@ class TicketControlView(discord.ui.View):
                     embed.add_field(
                         name="Claimed by", value=interaction.user.mention, inline=True
                     )
-                    await control_msg.edit(embed=embed)
+                    button.label = "Claimed"
+                    button.disabled = True
+                    await control_msg.edit(embed=embed, view=self)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.warning("Could not edit control message to add claim info: %s", e)
 
@@ -622,7 +624,28 @@ class TicketSystem(commands.Cog):
             color=EMBED_COLOR,
             timestamp=discord.utils.utcnow(),
         )
-        panel_embed.set_footer(text="Click a button below to open a support ticket.")
+        panel_embed.set_author(name=f"{interaction.guild.name} • Support Center")
+        if interaction.guild.icon:
+            panel_embed.set_author(
+                name=f"{interaction.guild.name} • Support Center",
+                icon_url=interaction.guild.icon.url,
+            )
+        panel_embed.add_field(
+            name="🛠️ Technical support",
+            value="Troubleshooting, account issues, or help with the bot.",
+            inline=True,
+        )
+        panel_embed.add_field(
+            name="🛡️ Server support",
+            value="Server setup, access, or community questions.",
+            inline=True,
+        )
+        panel_embed.add_field(
+            name="⚔️ Moderation support",
+            value="Report a moderation concern privately to the team.",
+            inline=True,
+        )
+        panel_embed.set_footer(text="Choose a category below • One open ticket per member")
         if ticket_image_url:
             panel_embed.set_image(url=ticket_image_url)
 
@@ -833,9 +856,14 @@ class TicketSystem(commands.Cog):
         )
 
         # Respond to the user
-        await interaction.followup.send(
-            f"Your ticket has been created: {ticket_channel.mention}", ephemeral=True
+        created_embed = discord.Embed(
+            title="✅ Ticket created",
+            description=f"Your **{ticket_type}** ticket is ready: {ticket_channel.mention}",
+            color=0x57F287,
+            timestamp=discord.utils.utcnow(),
         )
+        created_embed.set_footer(text=f"{interaction.guild.name} • Support")
+        await interaction.followup.send(embed=created_embed, ephemeral=True)
 
         # Notify staff (non-blocking)
         asyncio.create_task(
