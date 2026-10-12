@@ -719,7 +719,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         channels = sum(len(category.get("channels", [])) for category in categories)
         preview = (
             warning_embed(
-                f"⚠️ {template.name} preset • destructive preview",
+                f"{template.name} preset • destructive preview",
                 "Existing channels and eligible roles will be deleted first. The command channel is kept, "
                 "but deleted content cannot be restored by this bot.",
             )
@@ -1216,7 +1216,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     )
     @app_commands.checks.has_permissions(administrator=True)
     async def generate_server(
-        self, interaction: discord.Interaction, theme: str, preview: bool = False
+        self, interaction: discord.Interaction, theme: str, preview: bool = True
     ) -> None:
         if not interaction.guild:
             return
@@ -1239,6 +1239,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             schema = json.loads(raw[start:end])
             if not isinstance(schema, dict):
                 raise ValueError("The generated template root must be a JSON object.")
+            if not schema.get("roles") and not schema.get("categories"):
+                raise ValueError("The generated plan contains no roles or categories.")
             _validate_schema(schema)
         except (json.JSONDecodeError, ValueError) as exc:
             await interaction.edit_original_response(
