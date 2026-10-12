@@ -14,6 +14,64 @@ from services import ai_service
 from services.embed_service import error_embed, info_embed, success_embed
 from services.json_builder import build_server
 
+
+class BuilderQuickstartView(discord.ui.View):
+    """Interactive help panel that points administrators to existing builder commands."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=120)
+
+    async def _show(self, interaction: discord.Interaction, title: str, description: str) -> None:
+        await interaction.response.send_message(
+            embed=info_embed(title, description),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Preset setup", emoji="🧩", style=discord.ButtonStyle.primary)
+    async def preset(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._show(
+            interaction,
+            "Preset server setup",
+            "Run `/setup_server` and choose a template from Discord's option list. "
+            "Use this for a fast starter layout, then customize roles and channels afterward.",
+        )
+
+    @discord.ui.button(label="Custom build", emoji="🛠️", style=discord.ButtonStyle.secondary)
+    async def custom(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._show(
+            interaction,
+            "Custom server build",
+            "Run `/setup_custom` to configure your own structure. Review the preview before "
+            "applying changes, and keep a backup of any configuration you need to preserve.",
+        )
+
+    @discord.ui.button(label="AI generator", emoji="✨", style=discord.ButtonStyle.success)
+    async def ai_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._show(
+            interaction,
+            "AI server generator",
+            "Run `/generate_server` with a clear theme, such as `gaming community` or "
+            "`study group`. Enable preview mode to inspect the generated schema first.",
+        )
+
+    @discord.ui.button(label="JSON builder", emoji="📄", style=discord.ButtonStyle.secondary)
+    async def json_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._show(
+            interaction,
+            "JSON server builder",
+            "Run `/server_json` to build from a structured schema. Review role permissions, "
+            "category/channel definitions, and overwrite rules. Start with a small test schema.",
+        )
+
+    @discord.ui.button(label="Channel guide", emoji="📚", style=discord.ButtonStyle.secondary)
+    async def channel_guide(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._show(
+            interaction,
+            "Channel guide",
+            "Run `/channel_summaries` to get suggested purposes for the server's text channels. "
+            "Summaries use names, existing topics, and common channel patterns.",
+        )
+
 log = logging.getLogger("cogs.server_builder")
 
 # ── Preset server templates ──────────────────────────────────────────────────────
@@ -408,6 +466,23 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    @app_commands.command(
+        name="builder_panel",
+        description="Open the interactive server builder quick-start panel.",
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def builder_panel(self, interaction: discord.Interaction) -> None:
+        em = info_embed(
+            "🧱 Server Builder",
+            "Choose a workflow below. Each option explains when to use it and points to the matching command.",
+        )
+        em.add_field(name="Preset", value="Fast start from a template", inline=True)
+        em.add_field(name="Custom", value="Design your own structure", inline=True)
+        em.add_field(name="AI / JSON", value="Generate or supply a schema", inline=True)
+        em.set_footer(text="Preview first • Check permissions • Avoid destructive cleanup unless intended")
+        await interaction.response.send_message(embed=em, view=BuilderQuickstartView(), ephemeral=True)
 
     @staticmethod
     def _infer_channel_summary(channel_name: str, topic: str | None = None) -> str:
