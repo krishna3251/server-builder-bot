@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from services.embed_service import add_member_context, info_embed, success_embed, error_embed
+from services.embed_service import add_member_context, add_usage_footer, info_embed, success_embed, error_embed
 from utils.decorators import guild_only
 from utils.helpers import format_number, parse_duration, time_until
 
@@ -94,9 +94,11 @@ class HelpCategorySelect(discord.ui.Select):
                 ephemeral=True,
             )
         key = self.values[0]
+        for option in self.options:
+            option.default = option.value == key
         title, description = _HELP_PAGES[key]
         em = info_embed(title, description)
-        em.set_footer(text=f"{config.BOT_NAME} • Command guide")
+        add_usage_footer(em, "Command guide")
         await interaction.response.edit_message(embed=em, view=view)
 
 
@@ -137,7 +139,7 @@ class UtilityCog(commands.Cog, name="Utility"):
             value="`/builder_panel` · `/shop` · `/rank` · `/ai`",
             inline=False,
         )
-        em.set_footer(text=f"{config.BOT_NAME} • Select a category below")
+        add_usage_footer(em, "Select a category below")
         view = CommandHelpView(interaction.user.id)
         await interaction.response.send_message(embed=em, view=view, ephemeral=True)
         try:
@@ -294,7 +296,7 @@ class UtilityCog(commands.Cog, name="Utility"):
         number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
         desc = "\n".join(f"{number_emojis[i]} {item}" for i, item in enumerate(items))
         em = info_embed(f"📊 {question}", desc)
-        em.set_footer(text=f"Poll by {interaction.user}")
+        add_usage_footer(em, f"Poll by {interaction.user}")
         await interaction.response.send_message(embed=em)
         msg = await interaction.original_response()
         for i in range(len(items)):
