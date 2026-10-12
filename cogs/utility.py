@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from services.embed_service import info_embed, success_embed, error_embed
+from services.embed_service import add_member_context, info_embed, success_embed, error_embed
 from utils.decorators import guild_only
 from utils.helpers import format_number, parse_duration, time_until
 
@@ -46,14 +46,14 @@ class UtilityCog(commands.Cog, name="Utility"):
         em = info_embed(g.name, "")
         if g.icon:
             em.set_thumbnail(url=g.icon.url)
-        em.add_field(name="Owner", value=str(g.owner), inline=True)
-        em.add_field(name="Members", value=format_number(g.member_count or 0), inline=True)
-        em.add_field(name="Roles", value=str(len(g.roles)), inline=True)
-        em.add_field(name="Text Channels", value=str(len(g.text_channels)), inline=True)
-        em.add_field(name="Voice Channels", value=str(len(g.voice_channels)), inline=True)
-        em.add_field(name="Boosts", value=str(g.premium_subscription_count), inline=True)
-        em.add_field(name="Created", value=f"<t:{int(g.created_at.timestamp())}:R>", inline=True)
-        em.add_field(name="ID", value=str(g.id), inline=True)
+        em.add_field(name="OWNER", value=str(g.owner or "Unknown"), inline=True)
+        em.add_field(name="MEMBERS", value=format_number(g.member_count or 0), inline=True)
+        em.add_field(name="ROLES", value=format_number(len(g.roles)), inline=True)
+        em.add_field(name="TEXT CHANNELS", value=format_number(len(g.text_channels)), inline=True)
+        em.add_field(name="VOICE CHANNELS", value=format_number(len(g.voice_channels)), inline=True)
+        em.add_field(name="BOOSTS", value=format_number(g.premium_subscription_count or 0), inline=True)
+        em.add_field(name="CREATED", value=f"<t:{int(g.created_at.timestamp())}:D>", inline=True)
+        em.add_field(name="SERVER ID", value=f"`{g.id}`", inline=True)
         await interaction.response.send_message(embed=em)
 
     # ── /userinfo ─────────────────────────────────────────────────────────
@@ -63,14 +63,14 @@ class UtilityCog(commands.Cog, name="Utility"):
     async def userinfo(self, interaction: discord.Interaction, user: discord.Member | None = None) -> None:
         target = user or interaction.user
         assert isinstance(target, discord.Member)
-        em = info_embed(str(target), "")
-        em.set_thumbnail(url=target.display_avatar.url)
-        em.add_field(name="ID", value=str(target.id), inline=True)
-        em.add_field(name="Nickname", value=target.nick or "None", inline=True)
-        em.add_field(name="Top Role", value=target.top_role.mention, inline=True)
-        em.add_field(name="Joined Server", value=f"<t:{int(target.joined_at.timestamp())}:R>" if target.joined_at else "Unknown", inline=True)
-        em.add_field(name="Account Created", value=f"<t:{int(target.created_at.timestamp())}:R>", inline=True)
-        em.add_field(name="Roles", value=str(len(target.roles) - 1), inline=True)
+        em = info_embed(f"👤 {target.display_name}", "Member profile for this server.")
+        add_member_context(em, target)
+        em.add_field(name="USER ID", value=f"`{target.id}`", inline=True)
+        em.add_field(name="NICKNAME", value=target.nick or "Not set", inline=True)
+        em.add_field(name="TOP ROLE", value=target.top_role.mention, inline=True)
+        em.add_field(name="JOINED SERVER", value=f"<t:{int(target.joined_at.timestamp())}:R>" if target.joined_at else "Unknown", inline=True)
+        em.add_field(name="ACCOUNT CREATED", value=f"<t:{int(target.created_at.timestamp())}:D>", inline=True)
+        em.add_field(name="ROLE COUNT", value=format_number(max(0, len(target.roles) - 1)), inline=True)
         await interaction.response.send_message(embed=em)
 
     # ── /roleinfo ─────────────────────────────────────────────────────────
@@ -115,14 +115,34 @@ class UtilityCog(commands.Cog, name="Utility"):
     @app_commands.command(name="invite", description="Get the bot's invite link.")
     async def invite(self, interaction: discord.Interaction) -> None:
         assert self.bot.user is not None
-        url = discord.utils.oauth_url(self.bot.user.id, permissions=discord.Permissions(administrator=True))
-        em = info_embed("Invite Me!", f"[Click here to invite]({url})")
+        permissions = discord.Permissions(
+            view_channel=True,
+            send_messages=True,
+            embed_links=True,
+            read_message_history=True,
+            attach_files=True,
+            use_application_commands=True,
+            manage_channels=True,
+            manage_roles=True,
+            manage_messages=True,
+            manage_guild=True,
+            moderate_members=True,
+            kick_members=True,
+            ban_members=True,
+        )
+        url = discord.utils.oauth_url(self.bot.user.id, permissions=permissions)
+        em = info_embed(
+            "🤖 Add the bot",
+            f"[**Invite {config.BOT_NAME} to your server**]({url})\n\n"
+            "The invite requests permissions used by its setup, moderation, and ticket features. "
+            "Review the permission list on Discord before approving it; Administrator is not requested.",
+        )
+        em.add_field(name="Requested access", value="Channels · Roles · Messages · Moderation · Application commands", inline=False)
         await interaction.response.send_message(embed=em, ephemeral=True)
 
     # ── /uptime ───────────────────────────────────────────────────────────
     @app_commands.command(name="uptime", description="Show how long the bot has been running.")
     async def uptime(self, interaction: discord.Interaction) -> None:
-        up = time_until(self.bot.start_time + (datetime.datetime.now(datetime.timezone.utc) - self.bot.start_time) * 2)  # type: ignore
         delta = datetime.datetime.now(datetime.timezone.utc) - self.bot.start_time  # type: ignore
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
