@@ -697,12 +697,6 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         template: app_commands.Choice[str],
         clean_existing: bool = False,
     ) -> None:
-    async def setup_server(
-        self,
-        interaction: discord.Interaction,
-        template: app_commands.Choice[str],
-        clean_existing: bool = False,
-    ) -> None:
         if not interaction.guild:
             return
 
