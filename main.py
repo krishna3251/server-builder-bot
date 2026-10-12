@@ -77,12 +77,16 @@ class ServerBot(commands.Bot):
             try:
                 await self.load_extension(ext)
                 log.info("Loaded cog: %s", ext)
-            except Exception as exc:
-                log.error("Failed to load cog %s: %s", ext, exc)
+            except Exception:
+                log.exception("Failed to load cog %s", ext)
 
-        # Sync application commands globally
-        synced = await self.tree.sync()
-        log.info("Synced %d slash commands globally.", len(synced))
+        # A sync outage should be visible in logs but must not hide the original
+        # connection/startup error by crashing setup_hook without a traceback.
+        try:
+            synced = await self.tree.sync()
+            log.info("Synced %d slash commands globally.", len(synced))
+        except Exception:
+            log.exception("Failed to sync application commands globally")
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)  # type: ignore[union-attr]
@@ -121,9 +125,23 @@ async def on_app_command_error(
 
 
 async def main() -> None:
-    async with bot:
-        await asyncio.sleep(3)  # small delay before login
-        await bot.start(config.DISCORD_TOKEN)
+    if not config.DISCORD_TOKEN.strip():
+        log.critical(
+            "DISCORD_TOKEN is missing. Add it to the hosting environment variables; "
+            "the bot will not attempt to log in."
+        )
+        return
+
+    try:
+        async with bot:
+            await asyncio.sleep(1)
+            await bot.start(config.DISCORD_TOKEN.strip())
+    except discord.LoginFailure:
+        log.critical("Discord rejected DISCORD_TOKEN. Check the token and rotate it if exposed.")
+        raise
+    except Exception:
+        log.exception("Fatal bot startup/runtime error")
+        raise
 
 
 if __name__ == "__main__":

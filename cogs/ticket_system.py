@@ -609,6 +609,9 @@ class TicketSystem(commands.Cog):
                 )
             ticket_image_url = ticket_image.url
 
+        # Acknowledge before MongoDB/channel operations to prevent expired interactions.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         # Load existing config or create new one
         config_data = await self.config_manager.get_guild(interaction.guild.id)
 
@@ -652,7 +655,7 @@ class TicketSystem(commands.Cog):
 
         await self.config_manager.save_guild(interaction.guild.id, config_data)
 
-        await interaction.response.send_message("Ticket panel created successfully! \u2705", ephemeral=True)
+        await interaction.followup.send("Ticket panel created successfully! \u2705", ephemeral=True)
         log.info(
             "Ticket panel set up in guild %s by %s", interaction.guild.id, interaction.user
         )
@@ -664,10 +667,13 @@ class TicketSystem(commands.Cog):
     ) -> None:
         assert interaction.guild is not None
 
+        # Acknowledge before any database/network await to avoid Discord error 10062.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         # CHECK 1 \u2014 Config exists
         config_data = await self.config_manager.get_guild(interaction.guild.id)
         if not config_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "This server has no ticket setup. Ask an admin to run /setup_tickets.",
                 ephemeral=True,
             )
@@ -675,7 +681,7 @@ class TicketSystem(commands.Cog):
         # CHECK 2 \u2014 Blacklist
         blacklist: list = config_data.get("blacklisted_users", [])
         if interaction.user.id in blacklist:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "You are not permitted to open tickets in this server.", ephemeral=True
             )
 
@@ -686,7 +692,7 @@ class TicketSystem(commands.Cog):
             existing_channel_id = open_tickets[user_id_str]
             existing_channel = interaction.guild.get_channel(existing_channel_id)
             if existing_channel:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     f"You already have an open ticket: {existing_channel.mention}. "
                     "Please resolve it before opening a new one.",
                     ephemeral=True,
@@ -700,13 +706,10 @@ class TicketSystem(commands.Cog):
         # CHECK 4 \u2014 Cooldown
         remaining = self._check_cooldown(interaction.user.id)
         if remaining is not None:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"Please wait {remaining} seconds before opening another ticket.",
                 ephemeral=True,
             )
-
-        # Defer the response since channel creation may take a moment
-        await interaction.response.defer(ephemeral=True)
 
         # \u2500\u2500 Ticket ID Format \u2500\u2500
         counter = config_data.get("ticket_counter", 0) + 1

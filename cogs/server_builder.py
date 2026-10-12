@@ -633,7 +633,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             log.exception("Server setup failed: %s", exc)
             em = error_embed(
                 "Build Failed",
-                f"An error occurred and changes were rolled back.\n`{exc}`",
+                f"Build failed. Newly created resources were rolled back where possible; pre-existing resources are not restored.\n`{exc}`",
             )
             await progress_msg.edit(embed=em)
 
@@ -970,7 +970,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             log.exception("Custom setup failed: %s", exc)
             em = error_embed(
                 "Build Failed",
-                f"An error occurred and changes were rolled back.\n`{exc}`",
+                f"Build failed. Newly created resources were rolled back where possible; pre-existing resources are not restored.\n`{exc}`",
             )
             await progress_msg.edit(embed=em)
 
@@ -1096,7 +1096,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             log.exception("Server build failed: %s", exc)
             em = error_embed(
                 "Build Failed",
-                f"An error occurred and changes were rolled back.\n`{exc}`",
+                f"Build failed. Newly created resources were rolled back where possible; pre-existing resources are not restored.\n`{exc}`",
             )
             await progress_msg.edit(embed=em)
 

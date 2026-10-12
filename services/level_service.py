@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -16,6 +17,7 @@ log = logging.getLogger("services.level")
 
 _xp_data: dict[str, dict[str, Any]] = {}
 _loaded: bool = False
+_xp_lock = asyncio.Lock()
 
 
 async def _ensure_loaded() -> None:
@@ -58,33 +60,36 @@ def level_from_xp(xp: int) -> int:
 
 async def add_xp(guild_id: int, user_id: int, amount: int) -> tuple[int, int, bool]:
     """Add *amount* XP. Returns ``(new_xp, new_level, leveled_up)``."""
-    await _ensure_loaded()
-    k = _key(guild_id, user_id)
-    if k not in _xp_data:
-        _xp_data[k] = {"xp": 0, "level": 0}
+    async with _xp_lock:
+        await _ensure_loaded()
+        k = _key(guild_id, user_id)
+        if k not in _xp_data:
+            _xp_data[k] = {"xp": 0, "level": 0}
 
-    old_level = _xp_data[k]["level"]
-    _xp_data[k]["xp"] += amount
-    new_level = level_from_xp(_xp_data[k]["xp"])
-    leveled_up = new_level > old_level
-    _xp_data[k]["level"] = new_level
-    await _save()
-    return _xp_data[k]["xp"], new_level, leveled_up
+        old_level = _xp_data[k]["level"]
+        _xp_data[k]["xp"] += amount
+        new_level = level_from_xp(_xp_data[k]["xp"])
+        leveled_up = new_level > old_level
+        _xp_data[k]["level"] = new_level
+        await _save()
+        return _xp_data[k]["xp"], new_level, leveled_up
 
 
 async def get_stats(guild_id: int, user_id: int) -> dict[str, int]:
-    await _ensure_loaded()
-    k = _key(guild_id, user_id)
-    data = _xp_data.get(k, {"xp": 0, "level": 0})
-    return {"xp": data["xp"], "level": data["level"]}
+    async with _xp_lock:
+        await _ensure_loaded()
+        k = _key(guild_id, user_id)
+        data = _xp_data.get(k, {"xp": 0, "level": 0})
+        return {"xp": data["xp"], "level": data["level"]}
 
 
 async def set_xp(guild_id: int, user_id: int, xp: int) -> int:
-    await _ensure_loaded()
-    k = _key(guild_id, user_id)
-    _xp_data[k] = {"xp": xp, "level": level_from_xp(xp)}
-    await _save()
-    return _xp_data[k]["level"]
+    async with _xp_lock:
+        await _ensure_loaded()
+        k = _key(guild_id, user_id)
+        _xp_data[k] = {"xp": xp, "level": level_from_xp(xp)}
+        await _save()
+        return _xp_data[k]["level"]
 
 
 async def get_leaderboard(guild_id: int, limit: int = 10) -> list[tuple[int, int, int]]:
