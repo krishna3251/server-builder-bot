@@ -12,7 +12,8 @@ from discord.ext import commands
 
 import config
 from services import economy_service as eco
-from services.embed_service import error_embed, info_embed, success_embed
+from services.embed_service import add_member_context, error_embed, info_embed, success_embed
+from utils.paginator import Paginator
 from utils.decorators import guild_only
 from utils.helpers import format_number
 
@@ -31,7 +32,10 @@ class EconomyCog(commands.Cog, name="Economy"):
     async def balance(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         bal = await eco.get_balance(interaction.guild.id, interaction.user.id)
-        em = info_embed("Balance", f"{config.CURRENCY_SYMBOL} **{format_number(bal)}**")
+        em = info_embed("💰 Wallet", "Your current balance in this server.")
+        em.add_field(name="Available coins", value=f"**{config.CURRENCY_SYMBOL} {format_number(bal)}**", inline=False)
+        if isinstance(interaction.user, discord.Member):
+            add_member_context(em, interaction.user)
         await interaction.response.send_message(embed=em, ephemeral=True)
 
     # ── /daily ────────────────────────────────────────────────────────────
@@ -115,7 +119,8 @@ class EconomyCog(commands.Cog, name="Economy"):
             for i, (uid, xp, level) in enumerate(entries, 1):
                 member = interaction.guild.get_member(uid)
                 name = member.display_name if member else f"User#{uid}"
-                lines.append(f"**{i}.** {name} — Level {level} ({format_number(xp)} XP)")
+                place = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"**#{i}**")
+                lines.append(f"{place} **{discord.utils.escape_markdown(name)}** · Level **{level}** · {format_number(xp)} XP")
             em = info_embed("🏆 XP Leaderboard", "\n".join(lines) or "No data yet.")
         else:
             entries_eco = await eco.get_leaderboard(interaction.guild.id)
@@ -123,7 +128,8 @@ class EconomyCog(commands.Cog, name="Economy"):
             for i, (uid, bal) in enumerate(entries_eco, 1):
                 member = interaction.guild.get_member(uid)
                 name = member.display_name if member else f"User#{uid}"
-                lines.append(f"**{i}.** {name} — {config.CURRENCY_SYMBOL} {format_number(bal)}")
+                place = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"**#{i}**")
+                lines.append(f"{place} **{discord.utils.escape_markdown(name)}** · {config.CURRENCY_SYMBOL} {format_number(bal)}")
             em = info_embed("🏆 Coin Leaderboard", "\n".join(lines) or "No data yet.")
         await interaction.response.send_message(embed=em)
 
@@ -132,9 +138,36 @@ class EconomyCog(commands.Cog, name="Economy"):
     @guild_only()
     async def shop(self, interaction: discord.Interaction) -> None:
         items = await eco.get_shop_items()
-        lines = [f"**{it['name']}** — {config.CURRENCY_SYMBOL} {format_number(it['price'])}\n> {it['description']}" for it in items]
-        em = info_embed("🛒 Shop", "\n\n".join(lines) or "Shop is empty.")
-        await interaction.response.send_message(embed=em)
+        if not items:
+            return await interaction.response.send_message(
+                embed=info_embed("🛒 Item Shop", "The shop is empty right now."),
+                ephemeral=True,
+            )
+
+        pages: list[discord.Embed] = []
+        for offset in range(0, len(items), 5):
+            chunk = items[offset:offset + 5]
+            em = info_embed(
+                "🛒 Item Shop",
+                "Browse the catalogue. Use `/buy` with an item name to purchase it.",
+            )
+            for item in chunk:
+                item_name = str(item.get("name", "Unknown item"))[:256]
+                description = str(item.get("description", "No description provided."))[:900]
+                price = int(item.get("price", 0))
+                em.add_field(
+                    name=f"{item_name} · {config.CURRENCY_SYMBOL} {format_number(price)}",
+                    value=description,
+                    inline=False,
+                )
+            pages.append(em)
+
+        view = Paginator(pages, author_id=interaction.user.id)
+        await interaction.response.send_message(embed=pages[0], view=view)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     # ── /buy ──────────────────────────────────────────────────────────────
     @app_commands.command(name="buy", description="Purchase an item from the shop.")
