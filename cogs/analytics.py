@@ -215,7 +215,15 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         cmds: dict[str, int] = _data.get(gk, {}).get("commands", {})
 
         if not cmds:
-            lines = [f"`/{name}`  {_ascii_bar(count, max_val, width=12)}  **{count:,}**" for name, count in sorted_cmds]
+            em = info_embed("📊 Command usage", "No command usage has been recorded yet.")
+            return await interaction.response.send_message(embed=em)
+
+        sorted_cmds = sorted(cmds.items(), key=lambda item: item[1], reverse=True)[:10]
+        max_val = max(sorted_cmds[0][1], 1)
+        lines = [
+            f"`/{name}`  {_ascii_bar(count, max_val, width=12)}  **{count:,}**"
+            for name, count in sorted_cmds
+        ]
         em = info_embed(
             "📊 Command usage",
             "Most-used commands recorded by this bot.\n\n" + "\n".join(lines),
@@ -223,7 +231,6 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         em.add_field(name="Tracked commands", value=str(len(cmds)), inline=True)
         em.add_field(name="Total uses", value=f"{sum(cmds.values()):,}", inline=True)
         await interaction.response.send_message(embed=em)
-
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AnalyticsCog(bot))
