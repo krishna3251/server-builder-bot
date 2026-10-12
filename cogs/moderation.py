@@ -91,6 +91,8 @@ class ClearWarningsConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Clear warnings", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Defer the component update before loading and saving the warning store.
+        await interaction.response.defer()
         await _load_warnings()
         _warnings.pop(_warn_key(self.guild_id, self.member.id), None)
         await _save_warnings()
@@ -100,7 +102,7 @@ class ClearWarningsConfirmView(discord.ui.View):
             "Warning history cleared",
             f"All recorded warnings for **{self.member.display_name}** have been removed.",
         )
-        await interaction.response.edit_message(embed=em, view=self)
+        await interaction.edit_original_response(embed=em, view=self)
         self.stop()
 
     @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.secondary)
