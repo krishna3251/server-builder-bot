@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ log = logging.getLogger("cogs.analytics")
 
 _data: dict[str, Any] = {}
 _loaded: bool = False
+_dirty: bool = False
+_data_lock = asyncio.Lock()
+_writer_task: asyncio.Task[None] | None = None
 
 
 async def _ensure_loaded() -> None:
@@ -54,14 +58,36 @@ def _guild_key(guild_id: int) -> str:
 
 
 async def _inc(guild_id: int, section: str, key: str, amount: int = 1) -> None:
-    await _ensure_loaded()
-    gk = _guild_key(guild_id)
-    if gk not in _data:
-        _data[gk] = {}
-    if section not in _data[gk]:
-        _data[gk][section] = {}
-    _data[gk][section][key] = _data[gk][section].get(key, 0) + amount
-    await _save()
+    """Update in-memory counters; disk writes are batched by the background task."""
+    global _dirty
+    async with _data_lock:
+        await _ensure_loaded()
+        gk = _guild_key(guild_id)
+        if gk not in _data:
+            _data[gk] = {}
+        if section not in _data[gk]:
+            _data[gk][section] = {}
+        _data[gk][section][key] = _data[gk][section].get(key, 0) + amount
+        _dirty = True
+
+
+async def _flush_if_dirty() -> None:
+    global _dirty
+    async with _data_lock:
+        if _dirty:
+            await _save()
+            _dirty = False
+
+
+async def _periodic_writer() -> None:
+    """Persist counters every 15 seconds instead of writing once per message."""
+    try:
+        while True:
+            await asyncio.sleep(15)
+            await _flush_if_dirty()
+    except asyncio.CancelledError:
+        await _flush_if_dirty()
+        raise
 
 
 def _ascii_bar(value: int, max_value: int, width: int = 15) -> str:
@@ -76,6 +102,22 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        global _writer_task
+        if _writer_task is None or _writer_task.done():
+            _writer_task = asyncio.create_task(_periodic_writer(), name="analytics-json-writer")
+
+    async def cog_unload(self) -> None:
+        global _writer_task
+        task = _writer_task
+        _writer_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     # ── Event listeners ───────────────────────────────────────────────────
     @commands.Cog.listener()
