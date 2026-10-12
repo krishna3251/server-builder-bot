@@ -1244,11 +1244,11 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     # \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
     @app_commands.command(
         name="generate_server",
-        description="Generate and build a server from an AI-generated template.",
+        description="Generate a server template with an optional review and confirmation step.",
     )
     @app_commands.describe(
         theme="Describe the server theme (e.g., 'gaming community', 'study group')",
-        preview="If true, shows the JSON before building",
+        preview="Show a preview and require confirmation before building",
     )
     @app_commands.checks.has_permissions(administrator=True)
     async def generate_server(
@@ -1256,16 +1256,15 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     ) -> None:
         if not interaction.guild:
             return
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=preview)
 
         # Ask AI for a server schema
         raw = await ai_service.get_ai_response(
             _GENERATION_PROMPT.format(theme=theme), interaction.user.id
         )
 
-        if raw.startswith("\u26a0\ufe0f"):
-            em = error_embed("AI Error", raw)
-            await interaction.followup.send(embed=em)
+        if raw.startswith("\\u26a0\\ufe0f"):
+            await interaction.edit_original_response(embed=error_embed("AI Error", raw))
             return
 
         try:
@@ -1274,22 +1273,46 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             if start == -1 or end == 0:
                 raise ValueError("No JSON object found in response.")
             schema = json.loads(raw[start:end])
-        except (json.JSONDecodeError, ValueError):
-            em = error_embed("Parse Error", f"AI returned invalid JSON.\n```\n{raw[:500]}\n```")
-            await interaction.followup.send(embed=em)
+            if not isinstance(schema, dict):
+                raise ValueError("The generated template root must be a JSON object.")
+            _validate_schema(schema)
+        except (json.JSONDecodeError, ValueError) as exc:
+            await interaction.edit_original_response(
+                embed=error_embed(
+                    "Invalid generated template",
+                    f"The AI response could not be used as a server plan.\\n`{str(exc)[:500]}`",
+                )
+            )
             return
 
         if preview:
-            preview_text = json.dumps(schema, indent=2)
-            if len(preview_text) > 4000:
-                preview_text = preview_text[:4000] + "\n..."
-            em = info_embed("Server Preview", f"```json\n{preview_text}\n```")
-            em.set_footer(text="Building will start in 5 seconds...")
-            await interaction.followup.send(embed=em)
-            await asyncio.sleep(5)
+            preview_text = json.dumps(schema, indent=2, ensure_ascii=False)
+            if len(preview_text) > 3400:
+                preview_text = preview_text[:3400] + "\\n… (preview truncated)"
+            categories = schema.get("categories", [])
+            roles = schema.get("roles", [])
+            channel_count = sum(len(category.get("channels", [])) for category in categories)
+            em = info_embed(
+                "✨ AI server build preview",
+                "Review the generated structure below. **Nothing has been created yet.**\\n\\n"
+                + f"```json\\n{preview_text}\\n```",
+            )
+            em.add_field(name="Roles", value=str(len(roles)), inline=True)
+            em.add_field(name="Categories", value=str(len(categories)), inline=True)
+            em.add_field(name="Channels", value=str(channel_count), inline=True)
+            em.set_footer(text="Confirm to build • Cancel to leave the server unchanged")
+            view = CustomBuildConfirmView(
+                self,
+                schema,
+                owner_id=interaction.user.id,
+                command_channel_id=interaction.channel_id,
+            )
+            message = await interaction.edit_original_response(embed=em, view=view)
+            view.message = message
+            return
 
-        progress_em = info_embed("Building Server", "Starting...")
-        progress_msg = await interaction.followup.send(embed=progress_em, wait=True)
+        progress_em = info_embed("🧱 Building server", "Starting the build…")
+        progress_msg = await interaction.edit_original_response(embed=progress_em)
 
         try:
             logs, role_map = await build_server(interaction.guild, schema, progress_msg)
