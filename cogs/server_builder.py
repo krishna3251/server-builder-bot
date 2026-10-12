@@ -16,61 +16,288 @@ from services.json_builder import build_server, _validate_schema
 
 
 class BuilderQuickstartView(discord.ui.View):
-    """Interactive help panel that points administrators to existing builder commands."""
+    """Interactive quick-start menu that opens the actual builder workflows."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        cog: "ServerBuilderCog",
+        *,
+        owner_id: int,
+        command_channel_id: int,
+    ) -> None:
         super().__init__(timeout=120)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.command_channel_id = command_channel_id
+        self.message: discord.Message | None = None
 
-    async def _show(self, interaction: discord.Interaction, title: str, description: str) -> None:
-        await interaction.response.send_message(
-            embed=info_embed(title, description),
-            ephemeral=True,
-        )
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This builder panel belongs to the administrator who opened it.",
+                ephemeral=True,
+            )
+            return False
+        return True
 
-    @discord.ui.button(label="Preset setup", emoji="🧩", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Choose preset", emoji="🧩", style=discord.ButtonStyle.primary)
     async def preset(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._show(
-            interaction,
-            "Preset server setup",
-            "Run `/setup_server` and choose a template from Discord's option list. "
-            "Use this for a fast starter layout, then customize roles and channels afterward.",
+        await interaction.response.edit_message(
+            embed=info_embed(
+                "Choose a server preset",
+                "Select a template to review its roles, categories, and channels before anything is created.",
+            ),
+            view=PresetPickerView(self.cog, self.owner_id, self.command_channel_id),
         )
 
-    @discord.ui.button(label="Custom build", emoji="🛠️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Custom JSON", emoji="🛠️", style=discord.ButtonStyle.secondary)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._show(
-            interaction,
-            "Custom server build",
-            "Run `/setup_custom` to configure your own structure. Review the preview before "
-            "applying changes, and keep a backup of any configuration you need to preserve.",
+        await interaction.response.send_modal(
+            CustomSchemaModal(
+                self.cog,
+                owner_id=self.owner_id,
+                command_channel_id=self.command_channel_id,
+                build_label="Custom build",
+            )
         )
 
     @discord.ui.button(label="AI generator", emoji="✨", style=discord.ButtonStyle.success)
     async def ai_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._show(
-            interaction,
-            "AI server generator",
-            "Run `/generate_server` with a clear theme, such as `gaming community` or "
-            "`study group`. Enable preview mode to inspect the generated schema first.",
+        await interaction.response.send_modal(
+            AIThemeModal(
+                self.cog,
+                owner_id=self.owner_id,
+                command_channel_id=self.command_channel_id,
+            )
         )
 
-    @discord.ui.button(label="JSON builder", emoji="📄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="JSON format", emoji="📄", style=discord.ButtonStyle.secondary)
     async def json_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._show(
-            interaction,
-            "JSON server builder",
-            "Run `/server_json` to build from a structured schema. Review role permissions, "
-            "category/channel definitions, and overwrite rules. Start with a small test schema.",
+        await interaction.response.send_message(
+            embed=info_embed(
+                "JSON builder",
+                "Use the Custom JSON button to paste a schema up to 4,000 characters. "
+                "For larger templates, use /server_json to export a file and /setup_custom to upload it. "
+                "Every build now shows a preview and requires confirmation.",
+            ),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="Channel guide", emoji="📚", style=discord.ButtonStyle.secondary)
     async def channel_guide(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self._show(
-            interaction,
-            "Channel guide",
-            "Run `/channel_summaries` to get suggested purposes for the server's text channels. "
-            "Summaries use names, existing topics, and common channel patterns.",
+        await interaction.response.send_message(
+            embed=info_embed(
+                "Channel guide",
+                "Use /channel_summaries to get suggested purposes for your server's text channels. "
+                "Summaries use names, existing topics, and common channel patterns.",
+            ),
+            ephemeral=True,
         )
+
+
+class PresetSelect(discord.ui.Select):
+    """Select a preset, then replace the menu with a preview and confirmation controls."""
+
+    def __init__(self) -> None:
+        options = [
+            discord.SelectOption(label="Gaming Server", value="gaming", emoji="🎮", description="Gaming community roles and channels"),
+            discord.SelectOption(label="Community Server", value="community", emoji="🌐", description="General social and community layout"),
+            discord.SelectOption(label="Study Group", value="study", emoji="📚", description="Learning-focused roles and channels"),
+            discord.SelectOption(label="Business / Team", value="business", emoji="💼", description="Work and team collaboration layout"),
+        ]
+        super().__init__(
+            placeholder="Choose a server preset…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, PresetPickerView):
+            return
+        if interaction.user.id != view.owner_id:
+            return await interaction.response.send_message(
+                "Only the person who opened this panel can choose a preset.",
+                ephemeral=True,
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                embed=error_embed("Server required", "Use this menu inside a Discord server."),
+                ephemeral=True,
+            )
+
+        schema = TEMPLATES.get(self.values[0])
+        if not schema:
+            return await interaction.response.send_message(
+                embed=error_embed("Preset unavailable", "That preset could not be loaded."),
+                ephemeral=True,
+            )
+        try:
+            _validate_schema(schema)
+        except ValueError as exc:
+            return await interaction.response.send_message(
+                embed=error_embed("Invalid preset", str(exc)),
+                ephemeral=True,
+            )
+
+        title = next((option.label for option in self.options if option.value == self.values[0]), "Server")
+        preview = view.cog._schema_preview_embed(
+            schema,
+            title=f"🧩 {title} preview",
+            description="Review the proposed layout before building. Existing channels and roles will be kept.",
+        )
+        confirm_view = CustomBuildConfirmView(
+            view.cog,
+            schema,
+            owner_id=view.owner_id,
+            command_channel_id=view.command_channel_id,
+            build_label=title,
+        )
+        await interaction.response.edit_message(embed=preview, view=confirm_view)
+        confirm_view.message = interaction.message
+
+
+class PresetPickerView(discord.ui.View):
+    def __init__(self, cog: "ServerBuilderCog", owner_id: int, command_channel_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.command_channel_id = command_channel_id
+        self.add_item(PresetSelect())
+
+
+class CustomSchemaModal(discord.ui.Modal):
+    def __init__(
+        self,
+        cog: "ServerBuilderCog",
+        *,
+        owner_id: int,
+        command_channel_id: int,
+        build_label: str,
+    ) -> None:
+        super().__init__(title="Build from JSON", timeout=300)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.command_channel_id = command_channel_id
+        self.build_label = build_label
+        self.schema_input = discord.ui.TextInput(
+            label="Server schema JSON",
+            placeholder='{"roles": [], "categories": [...]}',
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.schema_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message(
+                "Only the person who opened this builder can submit the schema.",
+                ephemeral=True,
+            )
+        try:
+            raw = self.schema_input.value
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start < 0 or end == 0:
+                raise ValueError("No JSON object found. Paste a complete server schema.")
+            schema = json.loads(raw[start:end])
+            if not isinstance(schema, dict):
+                raise ValueError("The JSON root must be an object.")
+            if not schema.get("roles") and not schema.get("categories"):
+                raise ValueError("Add at least one role or category before building.")
+            _validate_schema(schema)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return await interaction.response.send_message(
+                embed=error_embed("Invalid server schema", str(exc)),
+                ephemeral=True,
+            )
+
+        preview = self.cog._schema_preview_embed(
+            schema,
+            title="🧱 Custom server preview",
+            description="Review the schema before creating anything. Existing resources will be kept.",
+        )
+        view = CustomBuildConfirmView(
+            self.cog,
+            schema,
+            owner_id=interaction.user.id,
+            command_channel_id=self.command_channel_id,
+            build_label=self.build_label,
+        )
+        await interaction.response.send_message(embed=preview, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
+
+
+class AIThemeModal(discord.ui.Modal):
+    def __init__(self, cog: "ServerBuilderCog", *, owner_id: int, command_channel_id: int) -> None:
+        super().__init__(title="Generate a server template", timeout=300)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.command_channel_id = command_channel_id
+        self.theme_input = discord.ui.TextInput(
+            label="What is your server about?",
+            placeholder="Gaming community, anime club, study group…",
+            style=discord.TextStyle.short,
+            required=True,
+            min_length=3,
+            max_length=150,
+        )
+        self.add_item(self.theme_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message(
+                "Only the person who opened this builder can submit the theme.",
+                ephemeral=True,
+            )
+
+        theme = self.theme_input.value.strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raw = await ai_service.get_ai_response(
+            _GENERATION_PROMPT.format(theme=theme),
+            interaction.user.id,
+        )
+        if raw.startswith("\u26a0\ufe0f"):
+            return await interaction.edit_original_response(
+                embed=error_embed("AI generation failed", raw)
+            )
+
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start < 0 or end == 0:
+                raise ValueError("No JSON object found in the AI response.")
+            schema = json.loads(raw[start:end])
+            if not isinstance(schema, dict):
+                raise ValueError("The AI response root must be a JSON object.")
+            if not schema.get("roles") and not schema.get("categories"):
+                raise ValueError("The generated plan contains no roles or categories.")
+            _validate_schema(schema)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return await interaction.edit_original_response(
+                embed=error_embed("Invalid generated plan", str(exc)[:900])
+            )
+
+        preview = self.cog._schema_preview_embed(
+            schema,
+            title="✨ AI server preview",
+            description=f"Generated for {theme}. Nothing has been created yet.",
+        )
+        view = CustomBuildConfirmView(
+            self.cog,
+            schema,
+            owner_id=interaction.user.id,
+            command_channel_id=self.command_channel_id,
+            build_label=f"AI build · {theme[:50]}",
+        )
+        message = await interaction.edit_original_response(embed=preview, view=view)
+        view.message = message
+
 
 class CustomBuildConfirmView(discord.ui.View):
     """Owner-locked preview gate for custom and AI-generated server builds."""
@@ -555,6 +782,38 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    def _schema_preview_embed(
+        self,
+        schema: dict,
+        *,
+        title: str,
+        description: str,
+    ) -> discord.Embed:
+        roles = schema.get("roles", [])
+        categories = schema.get("categories", [])
+        channel_count = sum(len(category.get("channels", [])) for category in categories)
+        role_names = [str(role.get("name", "Unnamed")) for role in roles]
+        category_lines = [
+            f"• **{str(category.get('name', 'Unnamed'))[:80]}** · {len(category.get('channels', []))} channels"
+            for category in categories[:8]
+        ]
+        if len(categories) > 8:
+            category_lines.append(f"…and {len(categories) - 8} more categories")
+
+        em = info_embed(title, description)
+        em.add_field(name="Server name", value=str(schema.get("server_name") or "Keep current name")[:100], inline=True)
+        em.add_field(name="Roles", value=str(len(roles)), inline=True)
+        em.add_field(name="Categories", value=str(len(categories)), inline=True)
+        em.add_field(name="Channels", value=str(channel_count), inline=True)
+        em.add_field(
+            name="Role names",
+            value=", ".join(role_names[:12]) + (f" … +{len(role_names) - 12}" if len(role_names) > 12 else "") or "None",
+            inline=False,
+        )
+        em.add_field(name="Structure", value="\n".join(category_lines) or "No categories", inline=False)
+        em.set_footer(text="Confirm to build • Cancel to leave the server unchanged")
+        return em
+
     @staticmethod
     def _safe_command_channel_id(interaction: discord.Interaction) -> int:
         channel = interaction.channel
@@ -577,7 +836,16 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         em.add_field(name="Custom", value="Design your own structure", inline=True)
         em.add_field(name="AI / JSON", value="Generate or supply a schema", inline=True)
         em.set_footer(text="Preview first • Check permissions • Avoid destructive cleanup unless intended")
-        await interaction.response.send_message(embed=em, view=BuilderQuickstartView(), ephemeral=True)
+        view = BuilderQuickstartView(
+            self,
+            owner_id=interaction.user.id,
+            command_channel_id=self._safe_command_channel_id(interaction),
+        )
+        await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     @staticmethod
     def _infer_channel_summary(channel_name: str, topic: str | None = None) -> str:
