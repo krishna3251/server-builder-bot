@@ -1263,7 +1263,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             _GENERATION_PROMPT.format(theme=theme), interaction.user.id
         )
 
-        if raw.startswith("\\u26a0\\ufe0f"):
+        if raw.startswith("\u26a0\ufe0f"):
             await interaction.edit_original_response(embed=error_embed("AI Error", raw))
             return
 
@@ -1280,7 +1280,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             await interaction.edit_original_response(
                 embed=error_embed(
                     "Invalid generated template",
-                    f"The AI response could not be used as a server plan.\\n`{str(exc)[:500]}`",
+                    f"The AI response could not be used as a server plan.\n`{str(exc)[:500]}`",
                 )
             )
             return
@@ -1288,14 +1288,14 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         if preview:
             preview_text = json.dumps(schema, indent=2, ensure_ascii=False)
             if len(preview_text) > 3400:
-                preview_text = preview_text[:3400] + "\\n… (preview truncated)"
+                preview_text = preview_text[:3400] + "\n… (preview truncated)"
             categories = schema.get("categories", [])
             roles = schema.get("roles", [])
             channel_count = sum(len(category.get("channels", [])) for category in categories)
             em = info_embed(
                 "✨ AI server build preview",
-                "Review the generated structure below. **Nothing has been created yet.**\\n\\n"
-                + f"```json\\n{preview_text}\\n```",
+                "Review the generated structure below. **Nothing has been created yet.**\n\n"
+                + f"```json\n{preview_text}\n```",
             )
             em.add_field(name="Roles", value=str(len(roles)), inline=True)
             em.add_field(name="Categories", value=str(len(categories)), inline=True)
