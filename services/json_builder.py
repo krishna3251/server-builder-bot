@@ -108,6 +108,7 @@ async def _build_server_unlocked(
     created_roles: list[discord.Role] = []
     created_channels: list[discord.abc.GuildChannel] = []
     logs: list[str] = []
+    original_guild_name = guild.name
 
     # Count total items for progress
     total = len(schema.get("roles", [])) + sum(
@@ -218,8 +219,14 @@ async def _build_server_unlocked(
                     await _update_progress(progress_msg, progress)
 
     except Exception as exc:
-        log.error("Build failed, rolling back: %s", exc)
-        # Rollback
+        log.exception("Build failed; rolling back newly created resources: %s", exc)
+        # Restore the server name if this build changed it.
+        if guild.name != original_guild_name:
+            try:
+                await guild.edit(name=original_guild_name, reason="Server build rollback")
+            except discord.HTTPException:
+                log.exception("Could not restore the original server name during rollback")
+        # Rollback newly created channels/categories and roles.
         for ch in reversed(created_channels):
             try:
                 await ch.delete(reason="Server build rollback")
