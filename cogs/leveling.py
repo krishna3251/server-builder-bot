@@ -47,12 +47,16 @@ class LevelingCog(commands.Cog, name="Leveling"):
         )
 
         if leveled_up:
-            em = discord.Embed(
-                title="🎉 Level Up!",
-                description=f"Congratulations {message.author.mention}! You reached **Level {new_level}**!",
-                colour=0xFFD700,
+            em = info_embed(
+                f"🎉 Level {new_level} unlocked!",
+                f"Congratulations {message.author.mention}, your activity paid off. Keep going!",
             )
+            em.colour = discord.Colour.gold()
             em.set_thumbnail(url=message.author.display_avatar.url)
+            em.add_field(name="NEW LEVEL", value=f"**{new_level:,}**", inline=True)
+            em.add_field(name="TOTAL XP", value=f"**{format_number(new_xp)}**", inline=True)
+            if isinstance(message.author, discord.Member):
+                add_member_context(em, message.author)
             try:
                 await message.channel.send(embed=em)
             except discord.HTTPException:
@@ -101,7 +105,7 @@ class LevelingCog(commands.Cog, name="Leveling"):
         assert interaction.guild is not None
         new_level = await level_service.set_xp(interaction.guild.id, user.id, xp)
         em = success_embed("XP Set", f"**{user}** now has **{format_number(xp)}** XP (Level {new_level}).")
-        await interaction.response.send_message(embed=em)
+        await interaction.response.send_message(embed=em, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
