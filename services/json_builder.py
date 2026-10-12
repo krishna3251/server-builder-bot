@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import discord
 
 log = logging.getLogger("services.json_builder")
+_BUILD_LOCK = asyncio.Lock()
 
 # ── Permission name → discord.Permissions flag mapping ────────────────────
 _PERM_MAP: dict[str, int] = {
@@ -92,7 +94,7 @@ class BuildProgress:
         return "\u2588" * filled + "\u2591" * (20 - filled) + f" {self.done}/{self.total}"
 
 
-async def build_server(
+async def _build_server_unlocked(
     guild: discord.Guild,
     schema: dict[str, Any],
     progress_msg: discord.Message | None = None,
@@ -231,6 +233,78 @@ async def build_server(
         raise
 
     return logs, role_map
+
+
+def _validate_schema(schema: dict[str, Any]) -> None:
+    """Reject malformed or oversized plans before making any Discord API changes."""
+    if not isinstance(schema, dict):
+        raise ValueError("Server template must be a JSON object.")
+
+    server_name = schema.get("server_name")
+    if server_name is not None and (
+        not isinstance(server_name, str) or len(server_name.strip()) > 100
+    ):
+        raise ValueError("server_name must be a string of at most 100 characters.")
+
+    roles = schema.get("roles", [])
+    categories = schema.get("categories", [])
+    if not isinstance(roles, list) or not isinstance(categories, list):
+        raise ValueError("'roles' and 'categories' must be lists.")
+    if len(roles) > 40:
+        raise ValueError("A single build may create at most 40 roles.")
+    if len(categories) > 30:
+        raise ValueError("A single build may create at most 30 categories.")
+
+    role_names: set[str] = set()
+    for role in roles:
+        if not isinstance(role, dict):
+            raise ValueError("Every role entry must be an object.")
+        name = role.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > 100:
+            raise ValueError("Every role needs a non-empty name of at most 100 characters.")
+        if name in role_names:
+            raise ValueError(f"Duplicate role name: {name}")
+        role_names.add(name)
+        if not isinstance(role.get("permissions", []), list):
+            raise ValueError(f"Permissions for role '{name}' must be a list.")
+
+    channel_count = 0
+    for category in categories:
+        if not isinstance(category, dict):
+            raise ValueError("Every category entry must be an object.")
+        category_name = category.get("name")
+        if not isinstance(category_name, str) or not category_name.strip() or len(category_name) > 100:
+            raise ValueError("Every category needs a non-empty name of at most 100 characters.")
+        channels = category.get("channels", [])
+        if not isinstance(channels, list):
+            raise ValueError(f"Channels for category '{category_name}' must be a list.")
+        channel_count += len(channels)
+        for channel in channels:
+            if not isinstance(channel, dict):
+                raise ValueError("Every channel entry must be an object.")
+            channel_name = channel.get("name")
+            if not isinstance(channel_name, str) or not channel_name.strip() or len(channel_name) > 100:
+                raise ValueError("Every channel needs a non-empty name of at most 100 characters.")
+            channel_type = channel.get("type", "text")
+            if channel_type not in ("text", "voice"):
+                raise ValueError(f"Unsupported channel type '{channel_type}'. Use 'text' or 'voice'.")
+            if not isinstance(channel.get("threads", []), list):
+                raise ValueError(f"Threads for channel '{channel_name}' must be a list.")
+    if channel_count > 100:
+        raise ValueError("A single build may create at most 100 channels.")
+
+
+async def build_server(
+    guild: discord.Guild,
+    schema: dict[str, Any],
+    progress_msg: discord.Message | None = None,
+) -> tuple[list[str], dict[str, discord.Role]]:
+    """Validate and serialize server builds to prevent malformed concurrent operations."""
+    _validate_schema(schema)
+    if _BUILD_LOCK.locked():
+        raise RuntimeError("Another server build is already running. Wait for it to finish.")
+    async with _BUILD_LOCK:
+        return await _build_server_unlocked(guild, schema, progress_msg)
 
 
 _last_progress_update: float = 0.0
