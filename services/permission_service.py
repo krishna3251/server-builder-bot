@@ -13,7 +13,7 @@ def can_moderate(member: discord.Member) -> bool:
 
 def is_above(actor: discord.Member, target: discord.Member) -> bool:
     """Return ``True`` if *actor*'s top role is higher than *target*'s."""
-    return actor.top_role > target.top_role
+    return actor.id != target.id and target.id != target.guild.owner_id and (actor.id == actor.guild.owner_id or actor.top_role > target.top_role)
 
 
 def bot_can_act(guild: discord.Guild, target: discord.Member) -> bool:
@@ -21,4 +21,4 @@ def bot_can_act(guild: discord.Guild, target: discord.Member) -> bool:
     me = guild.me
     if me is None:
         return False
-    return me.top_role > target.top_role
+    return target.id != guild.owner_id and target.id != me.id and me.top_role > target.top_role

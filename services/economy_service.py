@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+
 import json
 import logging
 import os
@@ -10,12 +15,31 @@ from typing import Any
 import aiofiles
 
 import config
+from utils.storage import write_json_atomic
 
 log = logging.getLogger("services.economy")
 
 _wallets: dict[str, dict[str, Any]] = {}
 _shop: list[dict[str, Any]] = []
 _loaded: bool = False
+_wallet_lock = asyncio.Lock()
+
+
+def serialized(function):
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        global _wallets
+        async with _wallet_lock:
+            await _ensure_loaded()
+            before = copy.deepcopy(_wallets) if not function.__name__.startswith("get_") else None
+            try:
+                return await function(*args, **kwargs)
+            except Exception:
+                if before is not None:
+                    _wallets = before
+                raise
+    return wrapped
+
 
 
 async def _ensure_loaded() -> None:
@@ -31,7 +55,7 @@ async def _ensure_loaded() -> None:
                 _wallets = json.loads(raw) if raw.strip() else {}
         except Exception as exc:
             log.warning("Could not load wallets: %s", exc)
-            _wallets = {}
+            raise RuntimeError("Wallet data could not be read; refusing to overwrite it.") from exc
     # Load shop
     if os.path.exists(config.SHOP_FILE):
         try:
@@ -57,15 +81,11 @@ def _default_shop() -> list[dict[str, Any]]:
 
 
 async def _save_wallets() -> None:
-    os.makedirs(os.path.dirname(config.WALLETS_FILE), exist_ok=True)
-    async with aiofiles.open(config.WALLETS_FILE, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(_wallets, indent=2))
+    await write_json_atomic(config.WALLETS_FILE, _wallets)
 
 
 async def _save_shop() -> None:
-    os.makedirs(os.path.dirname(config.SHOP_FILE), exist_ok=True)
-    async with aiofiles.open(config.SHOP_FILE, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(_shop, indent=2))
+    await write_json_atomic(config.SHOP_FILE, _shop)
 
 
 def _key(guild_id: int, user_id: int) -> str:
@@ -83,13 +103,17 @@ def _ensure_wallet(key: str) -> dict[str, Any]:
     return _wallets[key]
 
 
+@serialized
 async def get_balance(guild_id: int, user_id: int) -> int:
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
     return w["balance"]
 
 
+@serialized
 async def add_balance(guild_id: int, user_id: int, amount: int) -> int:
+    if type(amount) is not int or amount < 0:
+        raise ValueError("Amount must be a non-negative integer.")
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
     w["balance"] += amount
@@ -97,7 +121,10 @@ async def add_balance(guild_id: int, user_id: int, amount: int) -> int:
     return w["balance"]
 
 
+@serialized
 async def remove_balance(guild_id: int, user_id: int, amount: int) -> int:
+    if type(amount) is not int or amount < 0:
+        raise ValueError("Amount must be a non-negative integer.")
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
     w["balance"] = max(0, w["balance"] - amount)
@@ -105,8 +132,11 @@ async def remove_balance(guild_id: int, user_id: int, amount: int) -> int:
     return w["balance"]
 
 
+@serialized
 async def transfer(guild_id: int, from_id: int, to_id: int, amount: int) -> bool:
     await _ensure_loaded()
+    if type(amount) is not int or amount <= 0 or from_id == to_id:
+        return False
     sender = _ensure_wallet(_key(guild_id, from_id))
     if sender["balance"] < amount:
         return False
@@ -117,12 +147,14 @@ async def transfer(guild_id: int, from_id: int, to_id: int, amount: int) -> bool
     return True
 
 
+@serialized
 async def get_last_daily(guild_id: int, user_id: int) -> str | None:
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
     return w.get("last_daily")
 
 
+@serialized
 async def set_last_daily(guild_id: int, user_id: int, ts: str) -> None:
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
@@ -130,12 +162,14 @@ async def set_last_daily(guild_id: int, user_id: int, ts: str) -> None:
     await _save_wallets()
 
 
+@serialized
 async def get_last_work(guild_id: int, user_id: int) -> str | None:
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
     return w.get("last_work")
 
 
+@serialized
 async def set_last_work(guild_id: int, user_id: int, ts: str) -> None:
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
@@ -143,6 +177,7 @@ async def set_last_work(guild_id: int, user_id: int, ts: str) -> None:
     await _save_wallets()
 
 
+@serialized
 async def get_leaderboard(guild_id: int, limit: int = 10) -> list[tuple[int, int]]:
     """Return top users as ``[(user_id, balance), \u2026]``."""
     await _ensure_loaded()
@@ -156,11 +191,13 @@ async def get_leaderboard(guild_id: int, limit: int = 10) -> list[tuple[int, int
     return entries[:limit]
 
 
+@serialized
 async def get_shop_items() -> list[dict[str, Any]]:
     await _ensure_loaded()
-    return _shop
+    return copy.deepcopy(_shop)
 
 
+@serialized
 async def buy_item(guild_id: int, user_id: int, item_name: str) -> tuple[bool, str]:
     """Purchase an item. Returns ``(success, message)``."""
     await _ensure_loaded()
@@ -176,7 +213,29 @@ async def buy_item(guild_id: int, user_id: int, item_name: str) -> tuple[bool, s
     return True, f"Purchased **{item['name']}**!"
 
 
+@serialized
 async def get_inventory(guild_id: int, user_id: int) -> list[str]:
     await _ensure_loaded()
     w = _ensure_wallet(_key(guild_id, user_id))
-    return w.get("inventory", [])
+    return list(w.get("inventory", []))
+
+
+@serialized
+async def claim_reward(guild_id: int, user_id: int, kind: str, amount: int) -> tuple[bool, int, datetime | None]:
+    """Check eligibility and commit reward + timestamp in one transaction."""
+    if kind not in ("daily", "work") or type(amount) is not int or amount < 0:
+        raise ValueError("Invalid reward request.")
+    wallet = _ensure_wallet(_key(guild_id, user_id))
+    now = datetime.now(timezone.utc)
+    field = "last_" + kind
+    if wallet.get(field):
+        last = datetime.fromisoformat(wallet[field])
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        ready = last + timedelta(hours=24 if kind == "daily" else 1)
+        if now < ready:
+            return False, wallet["balance"], ready
+    wallet["balance"] += amount
+    wallet[field] = now.isoformat()
+    await _save_wallets()
+    return True, wallet["balance"], None

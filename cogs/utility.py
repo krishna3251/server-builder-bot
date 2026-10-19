@@ -8,6 +8,7 @@ import logging
 import platform
 
 import discord
+from services.error_service import SafeView, SafeModal
 from discord import app_commands
 from discord.ext import commands
 
@@ -33,7 +34,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "**Setup:** `/setup_tickets`\n"
         "**Controls:** use the ticket panel buttons to open a category, claim, or close a ticket.\n"
         "**Blacklist:** `/ticket_blacklist add`, `/ticket_blacklist remove`, `/ticket_blacklist list`\n"
-        "**Other:** `/cancel_delete`",
+        "**Other:** `/cancel_delete` · `/diagnostics` (admin)",
     ),
     "moderation": (
         "🛡️ Moderation",
@@ -102,7 +103,7 @@ class HelpCategorySelect(discord.ui.Select):
         await interaction.response.edit_message(embed=em, view=view)
 
 
-class CommandHelpView(discord.ui.View):
+class CommandHelpView(SafeView):
     """Private dropdown help navigation so the command list stays readable."""
 
     def __init__(self, owner_id: int) -> None:
@@ -146,6 +147,28 @@ class UtilityCog(commands.Cog, name="Utility"):
             view.message = await interaction.original_response()
         except discord.HTTPException:
             pass
+
+    @app_commands.command(name="diagnostics", description="Check modules, server permissions, and recent error references.")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def diagnostics(self, interaction: discord.Interaction):
+        from services.error_service import recent_errors
+        guild = interaction.guild
+        em = info_embed("🩺 Bot diagnostics", "Configuration and runtime checks for administrators. Error references match the bot logs.")
+        em.add_field(name="Connection", value=f"{'✅ Ready' if self.bot.is_ready() else '⏳ Connecting'} · {round(self.bot.latency * 1000)} ms", inline=True)
+        em.add_field(name="AI configuration", value="✅ Key configured" if config.OPENROUTER_API_KEY else "⚠️ Set OPENROUTER_API_KEY", inline=True)
+        em.add_field(name="Ticket configuration", value="✅ MongoDB URI configured" if config.MONGO_URI else "⚠️ Set MONGO_URI", inline=True)
+        loaded = sorted(self.bot.extensions)
+        em.add_field(name="Loaded modules", value="\n".join(f"✅ {name.removeprefix('cogs.')}" for name in loaded) or "None", inline=True)
+        failed = getattr(self.bot, "extension_errors", {})
+        em.add_field(name="Modules needing attention", value="\n".join(f"⚠️ {name}: `{reference}`" for name, reference in failed.items())[:1000] or "✅ No startup failures recorded", inline=True)
+        required = ("manage_channels", "manage_roles", "manage_guild", "send_messages", "embed_links", "attach_files", "read_message_history")
+        missing = [p.replace("_", " ") for p in required if not getattr(guild.me.guild_permissions, p, False)]
+        em.add_field(name="Server permissions", value=", ".join(missing) if missing else "✅ Core permissions available", inline=False)
+        current_errors = [item for item in recent_errors if item.get("guild_id") in (None, guild.id)]
+        em.add_field(name="Recent errors · this process", value="\n".join(f"`{item['reference']}` · {item['type']}" for item in current_errors[-5:]) or "✅ No captured errors", inline=False)
+        em.add_field(name="Data storage", value="Economy, XP, analytics, and AI memory use local JSON. Keep the data directory on persistent storage and run one bot process. Tickets use MongoDB.", inline=False)
+        await interaction.response.send_message(embed=em, ephemeral=True)
 
     # ── /ping ─────────────────────────────────────────────────────────────
     @app_commands.command(name="ping", description="Check bot latency.")

@@ -10,6 +10,7 @@ from typing import Any
 
 import aiofiles
 import discord
+from services.error_service import SafeView, SafeModal
 from discord import app_commands
 from discord.ext import commands
 
@@ -70,7 +71,7 @@ async def _dm_user(user: discord.User | discord.Member, embed: discord.Embed) ->
         pass
 
 
-class ClearWarningsConfirmView(discord.ui.View):
+class ClearWarningsConfirmView(SafeView):
     """Require an explicit confirmation before deleting a member's warning history."""
 
     def __init__(self, *, guild_id: int, member: discord.Member, owner_id: int) -> None:
@@ -137,7 +138,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /kick ─────────────────────────────────────────────────────────────
     @app_commands.command(name="kick", description="Kick a member from the server.")
     @app_commands.describe(user="Member to kick", reason="Reason for kick")
-    @mod_only()
+    @app_commands.checks.has_permissions(kick_members=True)
     @guild_only()
     async def kick(self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided") -> None:
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
@@ -158,10 +159,10 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /ban ──────────────────────────────────────────────────────────────
     @app_commands.command(name="ban", description="Ban a member from the server.")
     @app_commands.describe(user="Member to ban", reason="Reason for ban", delete_days="Days of messages to delete (0-7)")
-    @mod_only()
+    @app_commands.checks.has_permissions(ban_members=True)
     @guild_only()
     async def ban(
-        self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided", delete_days: int = 0
+        self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided", delete_days: app_commands.Range[int, 0, 7] = 0
     ) -> None:
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
         if not is_above(interaction.user, user):
@@ -181,7 +182,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /unban ────────────────────────────────────────────────────────────
     @app_commands.command(name="unban", description="Unban a user by ID.")
     @app_commands.describe(user_id="The user ID to unban")
-    @mod_only()
+    @app_commands.checks.has_permissions(ban_members=True)
     @guild_only()
     async def unban(self, interaction: discord.Interaction, user_id: str) -> None:
         assert interaction.guild is not None
@@ -192,13 +193,13 @@ class ModerationCog(commands.Cog, name="Moderation"):
             await interaction.response.send_message(embed=em)
         except discord.NotFound:
             await interaction.response.send_message(embed=error_embed("Error", "User not found or not banned."), ephemeral=True)
-        except Exception as exc:
-            await interaction.response.send_message(embed=error_embed("Error", str(exc)), ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message(embed=error_embed("Invalid user ID", "Enter a numeric Discord user ID."), ephemeral=True)
 
     # ── /mute ─────────────────────────────────────────────────────────────
     @app_commands.command(name="mute", description="Timeout a member.")
     @app_commands.describe(user="Member to mute", duration="Duration (e.g. 10m, 2h, 1d)", reason="Reason")
-    @mod_only()
+    @app_commands.checks.has_permissions(moderate_members=True)
     @guild_only()
     async def mute(
         self, interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = "No reason provided"
@@ -214,6 +215,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
         except ValueError:
             return await interaction.response.send_message(embed=error_embed("Error", "Invalid duration format. Use e.g. `10m`, `2h`, `1d`."), ephemeral=True)
 
+        if td.total_seconds() <= 0 or td.total_seconds() > 28 * 86400:
+            return await interaction.response.send_message(embed=error_embed("Invalid timeout", "Choose a duration greater than zero and no longer than 28 days."), ephemeral=True)
         await user.timeout(td, reason=reason)
         dm_em = warning_embed("Muted", f"You were muted in **{interaction.guild.name}** for {duration}.\nReason: {reason}")
         await _dm_user(user, dm_em)
@@ -226,10 +229,12 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /unmute ───────────────────────────────────────────────────────────
     @app_commands.command(name="unmute", description="Remove timeout from a member.")
     @app_commands.describe(user="Member to unmute")
-    @mod_only()
+    @app_commands.checks.has_permissions(moderate_members=True)
     @guild_only()
     async def unmute(self, interaction: discord.Interaction, user: discord.Member) -> None:
         assert interaction.guild is not None
+        if not is_above(interaction.user, user) or not bot_can_act(interaction.guild, user):
+            return await interaction.response.send_message(embed=error_embed("Role hierarchy", "You and the bot must outrank this member."), ephemeral=True)
         await user.timeout(None, reason=f"Unmuted by {interaction.user}")
         em = success_embed("Unmuted", f"**{user}** has been unmuted.")
         await interaction.response.send_message(embed=em)
@@ -237,7 +242,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /clear ────────────────────────────────────────────────────────────
     @app_commands.command(name="clear", description="Bulk delete messages.")
     @app_commands.describe(amount="Number of messages to delete (1-100)", user="Only delete messages from this user")
-    @mod_only()
+    @app_commands.checks.has_permissions(manage_messages=True)
     @guild_only()
     async def clear(
         self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], user: discord.Member | None = None
@@ -281,7 +286,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
         await _mod_log(interaction.guild, log_em)
 
         # Auto-mute on 3rd warning
-        if count >= 3 and count % 3 == 0:
+        if count >= 3 and count % 3 == 0 and interaction.user.guild_permissions.moderate_members and bot_can_act(interaction.guild, user) and is_above(interaction.user, user):
             try:
                 td = parse_duration("1h")
                 await user.timeout(td, reason=f"Auto-mute: {count} warnings reached")
@@ -365,7 +370,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /slowmode ─────────────────────────────────────────────────────────
     @app_commands.command(name="slowmode", description="Set slowmode on a channel.")
     @app_commands.describe(channel="Target channel", seconds="Slowmode delay in seconds (0 to disable)")
-    @mod_only()
+    @app_commands.checks.has_permissions(manage_channels=True)
     @guild_only()
     async def slowmode(self, interaction: discord.Interaction, channel: discord.TextChannel, seconds: app_commands.Range[int, 0, 21600]) -> None:
         await channel.edit(slowmode_delay=seconds)
@@ -375,7 +380,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /lock ─────────────────────────────────────────────────────────────
     @app_commands.command(name="lock", description="Lock a channel (prevent sending messages).")
     @app_commands.describe(channel="Channel to lock")
-    @mod_only()
+    @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
     async def lock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
@@ -388,7 +393,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /unlock ───────────────────────────────────────────────────────────
     @app_commands.command(name="unlock", description="Unlock a channel.")
     @app_commands.describe(channel="Channel to unlock")
-    @mod_only()
+    @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
     async def unlock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
