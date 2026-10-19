@@ -7,6 +7,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 import discord
+from services.error_service import SafeView, SafeModal
 from discord import app_commands
 from discord.ext import commands
 
@@ -143,7 +144,7 @@ class ShopCloseButton(discord.ui.Button):
         view.stop()
 
 
-class ShopView(discord.ui.View):
+class ShopView(SafeView):
     """Owner-locked shop with item details, buy action, and catalogue paging."""
 
     page_size = 25
@@ -244,45 +245,28 @@ class EconomyCog(commands.Cog, name="Economy"):
     @guild_only()
     async def daily(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        last = await eco.get_last_daily(interaction.guild.id, interaction.user.id)
-        now = datetime.now(timezone.utc)
-        if last:
-            last_dt = datetime.fromisoformat(last)
-            if now - last_dt < timedelta(hours=24):
-                remaining = last_dt + timedelta(hours=24) - now
-                h, m = divmod(int(remaining.total_seconds()), 3600)
-                mins = m // 60
-                em = error_embed("Cooldown", f"Come back in **{h}h {mins}m**.")
-                return await interaction.response.send_message(embed=em, ephemeral=True)
-
-        new_bal = await eco.add_balance(interaction.guild.id, interaction.user.id, config.DAILY_REWARD)
-        await eco.set_last_daily(interaction.guild.id, interaction.user.id, now.isoformat())
+        await interaction.response.defer(ephemeral=True)
+        claimed, new_bal, ready = await eco.claim_reward(interaction.guild.id, interaction.user.id, "daily", config.DAILY_REWARD)
+        if not claimed:
+            return await interaction.edit_original_response(embed=info_embed("Daily reward claimed", f"Your next reward is available <t:{int(ready.timestamp())}:R>."))
         em = success_embed("Daily Reward!", f"You received {config.CURRENCY_SYMBOL} **{format_number(config.DAILY_REWARD)}**!\nNew balance: {config.CURRENCY_SYMBOL} **{format_number(new_bal)}**")
-        await interaction.response.send_message(embed=em)
+        await interaction.edit_original_response(embed=em)
 
     # ── /work ─────────────────────────────────────────────────────────────
     @app_commands.command(name="work", description="Work for a random reward.")
     @guild_only()
     async def work(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        last = await eco.get_last_work(interaction.guild.id, interaction.user.id)
-        now = datetime.now(timezone.utc)
-        if last:
-            last_dt = datetime.fromisoformat(last)
-            if now - last_dt < timedelta(hours=1):
-                remaining = last_dt + timedelta(hours=1) - now
-                mins = int(remaining.total_seconds()) // 60
-                em = error_embed("Cooldown", f"You can work again in **{mins}m**.")
-                return await interaction.response.send_message(embed=em, ephemeral=True)
-
+        await interaction.response.defer(ephemeral=True)
         amount = random.randint(config.WORK_MIN, config.WORK_MAX)
-        new_bal = await eco.add_balance(interaction.guild.id, interaction.user.id, amount)
-        await eco.set_last_work(interaction.guild.id, interaction.user.id, now.isoformat())
+        claimed, new_bal, ready = await eco.claim_reward(interaction.guild.id, interaction.user.id, "work", amount)
+        if not claimed:
+            return await interaction.edit_original_response(embed=info_embed("Take a break", f"Your next shift starts <t:{int(ready.timestamp())}:R>."))
 
         jobs = ["flipped burgers", "walked dogs", "coded a website", "delivered packages", "tutored students", "streamed on Twitch"]
         job = random.choice(jobs)
         em = success_embed("Work Complete!", f"You {job} and earned {config.CURRENCY_SYMBOL} **{format_number(amount)}**!\nBalance: {config.CURRENCY_SYMBOL} **{format_number(new_bal)}**")
-        await interaction.response.send_message(embed=em)
+        await interaction.edit_original_response(embed=em)
 
     # ── /pay ──────────────────────────────────────────────────────────────
     @app_commands.command(name="pay", description="Transfer coins to another user.")

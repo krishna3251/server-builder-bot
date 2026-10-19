@@ -13,6 +13,7 @@ from flask import Flask
 
 import config
 from utils.logger import setup_logging
+from services.error_service import respond_error, report_error
 
 # ── Keep-alive server for Render free tier ────────────────────────────────
 _keep_alive_app = Flask(__name__)
@@ -20,7 +21,10 @@ _keep_alive_app = Flask(__name__)
 
 @_keep_alive_app.route("/")
 def _health_check():
-    return "Bot is alive!", 200
+    active_bot = globals().get("bot")
+    ready = bool(active_bot and active_bot.is_ready())
+    failures = sorted(getattr(active_bot, "extension_errors", {}))
+    return {"ready": ready, "failed_extensions": failures}, 200 if ready and not failures else 503
 
 
 def _run_keep_alive():
@@ -28,7 +32,7 @@ def _run_keep_alive():
     _keep_alive_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
-Thread(target=_run_keep_alive, daemon=True).start()
+
 # ─────────────────────────────────────────────────────────────────────────
 
 # ── Ensure data directories exist ────────────────────────────────────────
@@ -61,10 +65,12 @@ class ServerBot(commands.Bot):
             command_prefix="!",
             intents=intents,
             help_command=None,
+            allowed_mentions=discord.AllowedMentions(everyone=False),
             activity=discord.Activity(
                 type=discord.ActivityType.watching, name="/help | v" + config.BOT_VERSION
             ),
         )
+        self.extension_errors: dict[str, str] = {}
         self.start_time: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
 
     async def setup_hook(self) -> None:
@@ -77,8 +83,8 @@ class ServerBot(commands.Bot):
             try:
                 await self.load_extension(ext)
                 log.info("Loaded cog: %s", ext)
-            except Exception:
-                log.exception("Failed to load cog %s", ext)
+            except Exception as exc:
+                self.extension_errors[ext] = report_error(exc, context=f"Loading {ext}")
 
         # A sync outage should be visible in logs but must not hide the original
         # connection/startup error by crashing setup_hook without a traceback.
@@ -87,6 +93,12 @@ class ServerBot(commands.Bot):
             log.info("Synced %d slash commands globally.", len(synced))
         except Exception:
             log.exception("Failed to sync application commands globally")
+
+    async def on_error(self, event_method, *args, **kwargs):
+        import sys
+        error = sys.exc_info()[1]
+        if error is not None:
+            report_error(error, context=f"Event {event_method}")
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)  # type: ignore[union-attr]
@@ -104,24 +116,22 @@ async def on_app_command_error(
     from services.embed_service import error_embed
 
     if isinstance(error, discord.app_commands.CommandOnCooldown):
-        em = error_embed("Cooldown", f"Try again in **{error.retry_after:.1f}s**.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
-    elif isinstance(error, discord.app_commands.MissingPermissions):
-        em = error_embed("Missing Permissions", "You lack the required permissions.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        em = error_embed("Take a moment", f"Try again in **{error.retry_after:.1f}s**.")
+    elif isinstance(error, (discord.app_commands.MissingPermissions, discord.app_commands.BotMissingPermissions)):
+        who = "The bot needs" if isinstance(error, discord.app_commands.BotMissingPermissions) else "You need"
+        em = error_embed("Permission required", who + ": **" + ", ".join(p.replace("_", " ") for p in error.missing_permissions) + "**.")
     elif isinstance(error, discord.app_commands.CheckFailure):
-        em = error_embed("Check Failed", str(error) or "You cannot use this command.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        em = error_embed("Action unavailable", "Check your server permissions and use this command inside a server.")
     else:
-        log.exception("Unhandled app-command error: %s", error)
-        em = error_embed("Error", "An unexpected error occurred. Please try again later.")
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(embed=em, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=em, ephemeral=True)
-        except discord.HTTPException:
-            pass
+        await respond_error(interaction, getattr(error, "original", error), context="Slash command")
+        return
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=em, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=em, ephemeral=True)
+    except discord.HTTPException:
+        log.warning("Could not deliver a command permission/cooldown response")
 
 
 async def main() -> None:
@@ -130,8 +140,9 @@ async def main() -> None:
             "DISCORD_TOKEN is missing. Add it to the hosting environment variables; "
             "the bot will not attempt to log in."
         )
-        return
+        raise RuntimeError("DISCORD_TOKEN is required to start the bot.")
 
+    Thread(target=_run_keep_alive, daemon=True).start()
     try:
         async with bot:
             await asyncio.sleep(1)

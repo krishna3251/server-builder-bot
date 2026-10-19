@@ -22,6 +22,7 @@ A full-featured Discord bot built with **discord.py 2.x** featuring:
    ```env
    DISCORD_TOKEN=your_bot_token
    OPENROUTER_API_KEY=your_openrouter_key
+   MONGO_URI=mongodb+srv://your_mongodb_connection
    ```
 4. Run the bot:
    ```bash
@@ -48,7 +49,7 @@ cogs/                # All bot modules (slash commands)
   moderation.py      # Moderation commands
   server_builder.py  # Server template builder
   ticket_system.py   # Advanced ticket system
-  tickets.py         # Basic ticket commands
+  _tickets_old.py    # Archived; not loaded
   utility.py         # Utility commands
 services/            # Business logic layer
   ai_service.py      # OpenRouter API integration
@@ -69,3 +70,28 @@ data/                # Runtime data (JSON storage)
 ## License
 
 MIT
+
+
+## Discord UI (v2.1)
+
+- `/builder_panel`: choose a preset, custom JSON, or AI theme. Review the plan with the section menu, Previous/Next controls, and JSON export before confirming.
+- `/help`: private category menu for the command guide.
+- `/diagnostics`: administrator-only module status, configuration checks, server permissions, and recent error references.
+- Buttons and modals report unexpected errors privately with a reference ID. Operators can look up that ID in `logs/error.log` or hosting logs.
+
+## Operations and validation
+
+Run **one bot process**. Economy and ticket transition locks are process-local. Keep the `data/` directory on persistent storage; setting `MONGO_URI` persists ticket state only, not economy/XP/AI data. Ticket deletion deadlines are stored in MongoDB and restored after a normal restart. Do not run two deployments against the same data at once.
+
+A configured MongoDB URI is required to load tickets; an OpenRouter key is required for AI requests. `/diagnostics` distinguishes configuration from verified connectivity. Enable **Server Members Intent** and **Message Content Intent** in the Discord Developer Portal. The bot must also have the relevant permissions and role position. Presets that create Administrator roles require the bot to be able to grant Administrator.
+
+The HTTP health endpoint returns 503 until Discord is ready or if a cog failed to load. It does not verify every remote dependency. Missing `DISCORD_TOKEN` exits with an error. Cleaning an existing server permanently deletes content; rollback only covers newly created resources.
+
+Offline checks (no credentials needed):
+
+```bash
+python -m compileall -q .
+python -m unittest discover -s tests -v
+```
+
+See [UPDATE_REPORT.md](UPDATE_REPORT.md) for fixes, verified checks, and remaining limitations.

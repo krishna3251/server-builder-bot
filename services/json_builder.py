@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import discord
 
 log = logging.getLogger("services.json_builder")
-_BUILD_LOCK = asyncio.Lock()
+_BUILD_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+@asynccontextmanager
+async def build_session(guild_id: int):
+    """Cover cleanup and creation with one per-server reservation."""
+    lock = _BUILD_LOCKS.setdefault(guild_id, asyncio.Lock())
+    if lock.locked():
+        raise RuntimeError("A build is already running in this server. Wait for it to finish.")
+    async with lock:
+        try:
+            yield
+        finally:
+            _BUILD_LOCKS.pop(guild_id, None)
 
 # ── Permission name → discord.Permissions flag mapping ────────────────────
 _PERM_MAP: dict[str, int] = {
@@ -32,6 +46,18 @@ _PERM_MAP: dict[str, int] = {
     "attach_files": discord.Permissions.attach_files.flag,
     "manage_webhooks": discord.Permissions.manage_webhooks.flag,
     "view_audit_log": discord.Permissions.view_audit_log.flag,
+    "view_channel": discord.Permissions.view_channel.flag,
+    "read_message_history": discord.Permissions.read_message_history.flag,
+    "use_application_commands": discord.Permissions.use_application_commands.flag,
+    "create_public_threads": discord.Permissions.create_public_threads.flag,
+    "send_messages_in_threads": discord.Permissions.send_messages_in_threads.flag,
+}
+
+_PRIVILEGED = {
+    "administrator", "manage_guild", "manage_channels", "manage_roles",
+    "manage_messages", "kick_members", "ban_members", "manage_webhooks",
+    "mute_members", "deafen_members", "move_members", "mention_everyone",
+    "view_audit_log",
 }
 
 
@@ -84,6 +110,7 @@ class BuildProgress:
     def __init__(self, total: int) -> None:
         self.total = total
         self.done = 0
+        self.last_update = 0.0
 
     def advance(self) -> None:
         self.done += 1
@@ -98,6 +125,7 @@ async def _build_server_unlocked(
     guild: discord.Guild,
     schema: dict[str, Any],
     progress_msg: discord.Message | None = None,
+    created_channel_ids: set[int] | None = None,
 ) -> tuple[list[str], dict[str, discord.Role]]:
     """Build roles, categories, and channels in *guild* from *schema*.
 
@@ -164,7 +192,8 @@ async def _build_server_unlocked(
 
             for ch_data in cat_data.get("channels", []):
                 # ── Per-channel permission overwrites ────────────────────────
-                ch_overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
+                # Explicit channel overwrites must retain the category's privacy rules.
+                ch_overwrites = dict(overwrites)
                 for ow in ch_data.get("permission_overwrites", []):
                     target = role_map.get(ow.get("role", ""))
                     if not target and ow.get("role", "").lower() == "@everyone":
@@ -172,7 +201,13 @@ async def _build_server_unlocked(
                     if target:
                         allow = _resolve_permissions(ow.get("allow", []))
                         deny = _resolve_permissions(ow.get("deny", []))
-                        ch_overwrites[target] = discord.PermissionOverwrite.from_pair(allow, deny)
+                        explicit = discord.PermissionOverwrite.from_pair(allow, deny)
+                        inherited = ch_overwrites.get(target, discord.PermissionOverwrite())
+                        combined = discord.PermissionOverwrite.from_pair(*inherited.pair())
+                        for permission, value in explicit:
+                            if value is not None:
+                                setattr(combined, permission, value)
+                        ch_overwrites[target] = combined
 
                 ch_type = ch_data.get("type", "text").lower()
                 if ch_type == "voice":
@@ -203,6 +238,8 @@ async def _build_server_unlocked(
                         kwargs["overwrites"] = ch_overwrites
                     tc = await guild.create_text_channel(**kwargs)
                     created_channels.append(tc)
+                    if created_channel_ids is not None:
+                        created_channel_ids.add(tc.id)
                     perm_note = f" (perms: {', '.join(o.get('role','') for o in ch_data.get('permission_overwrites', []))})" if ch_overwrites else ""
                     logs.append(f"Created text channel: **#{ch_data['name']}**{perm_note}")
 
@@ -210,6 +247,7 @@ async def _build_server_unlocked(
                     for thread_data in ch_data.get("threads", []):
                         await tc.create_thread(
                             name=thread_data["name"],
+                            type=discord.ChannelType.public_thread,
                             auto_archive_duration=thread_data.get("auto_archive", 1440),
                         )
                         logs.append(f"  \u2514 Created thread: **{thread_data['name']}**")
@@ -218,7 +256,7 @@ async def _build_server_unlocked(
                 if progress_msg:
                     await _update_progress(progress_msg, progress)
 
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         log.exception("Build failed; rolling back newly created resources: %s", exc)
         # Restore the server name if this build changed it.
         if guild.name != original_guild_name:
@@ -243,96 +281,184 @@ async def _build_server_unlocked(
 
 
 def _validate_schema(schema: dict[str, Any]) -> None:
-    """Reject malformed or oversized plans before making any Discord API changes."""
+    """Fully validate untrusted plans before any resource is changed."""
+    def name(value, label, maximum=100):
+        if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+            raise ValueError(f"{label} must contain 1–{maximum} characters.")
+
+    def permissions(value, label):
+        if not isinstance(value, list) or any(not isinstance(p, str) or p.lower() not in _PERM_MAP for p in value):
+            raise ValueError(f"{label} must contain supported permission names.")
+
+    def integer(value, label, low, high):
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"{label} must be an integer between {low} and {high}.")
+
     if not isinstance(schema, dict):
         raise ValueError("Server template must be a JSON object.")
-
-    server_name = schema.get("server_name")
-    if server_name is not None and (
-        not isinstance(server_name, str) or len(server_name.strip()) > 100
-    ):
-        raise ValueError("server_name must be a string of at most 100 characters.")
-
-    roles = schema.get("roles", [])
-    categories = schema.get("categories", [])
+    if "server_name" in schema and schema["server_name"] is not None:
+        name(schema["server_name"], "Server name")
+        if len(schema["server_name"].strip()) < 2:
+            raise ValueError("Server name must contain at least 2 characters.")
+    roles, categories = schema.get("roles", []), schema.get("categories", [])
     if not isinstance(roles, list) or not isinstance(categories, list):
-        raise ValueError("'roles' and 'categories' must be lists.")
-    if len(roles) > 40:
-        raise ValueError("A single build may create at most 40 roles.")
-    if len(categories) > 30:
-        raise ValueError("A single build may create at most 30 categories.")
-
-    role_names: set[str] = set()
+        raise ValueError("Roles and categories must be arrays.")
+    if len(roles) > 40 or len(categories) > 30:
+        raise ValueError("A build supports at most 40 roles and 30 categories.")
+    role_names = set()
     for role in roles:
         if not isinstance(role, dict):
-            raise ValueError("Every role entry must be an object.")
-        name = role.get("name")
-        if not isinstance(name, str) or not name.strip() or len(name) > 100:
-            raise ValueError("Every role needs a non-empty name of at most 100 characters.")
-        if name in role_names:
-            raise ValueError(f"Duplicate role name: {name}")
-        role_names.add(name)
-        permissions = role.get("permissions", [])
-        if not isinstance(permissions, list) or any(not isinstance(p, str) for p in permissions):
-            raise ValueError(f"Permissions for role '{name}' must be a list of strings.")
+            raise ValueError("Every role must be an object.")
+        name(role.get("name"), "Role name")
+        if role["name"].lower() == "@everyone" or role["name"] in role_names:
+            raise ValueError("Role names must be unique and cannot be @everyone.")
+        role_names.add(role["name"])
+        permissions(role.get("permissions", []), "Role permissions")
+        for key in ("hoist", "mentionable"):
+            if key in role and type(role[key]) is not bool:
+                raise ValueError(f"Role {key} must be true or false.")
+        color = role.get("color")
+        if color is not None:
+            if not isinstance(color, str):
+                raise ValueError("Role color must be a named color or hex string.")
+            cleaned = color.strip().lower().replace(" ", "_").replace("-", "_")
+            if cleaned not in _NAMED_COLOURS:
+                try:
+                    if not 0 <= int(cleaned.lstrip("#"), 16) <= 0xFFFFFF:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError(f"Invalid role color: {color}") from None
 
-    channel_count = 0
+    auto_assign = schema.get("auto_assign")
+    if auto_assign is not None:
+        if not isinstance(auto_assign, str) or auto_assign not in role_names:
+            raise ValueError("auto_assign must name a role in this plan.")
+        role = next(r for r in roles if r["name"] == auto_assign)
+        if _PRIVILEGED.intersection(p.lower() for p in role.get("permissions", [])):
+            raise ValueError("Privileged roles cannot be automatically assigned to members.")
+
+    def overwrites(value):
+        if not isinstance(value, list):
+            raise ValueError("Permission overwrites must be an array.")
+        seen = set()
+        for ow in value:
+            if not isinstance(ow, dict) or not isinstance(ow.get("role"), str):
+                raise ValueError("Every overwrite must be an object with a role name.")
+            target = ow["role"]
+            if target.lower() != "@everyone" and target not in role_names:
+                raise ValueError(f"Unknown overwrite role: {target}")
+            if target in seen:
+                raise ValueError(f"Duplicate overwrite for role: {target}")
+            seen.add(target)
+            permissions(ow.get("allow", []), "Allowed permissions")
+            permissions(ow.get("deny", []), "Denied permissions")
+            if (target == auto_assign or target.lower() == "@everyone") and _PRIVILEGED.intersection(p.lower() for p in ow.get("allow", [])):
+                raise ValueError("Privileged channel permissions cannot be granted to everyone or the automatic member role.")
+            if _resolve_permissions(ow.get("allow", [])).value & _resolve_permissions(ow.get("deny", [])).value:
+                raise ValueError("A permission cannot be both allowed and denied.")
+
+    channel_count = thread_count = 0
     for category in categories:
         if not isinstance(category, dict):
-            raise ValueError("Every category entry must be an object.")
-        category_name = category.get("name")
-        if not isinstance(category_name, str) or not category_name.strip() or len(category_name) > 100:
-            raise ValueError("Every category needs a non-empty name of at most 100 characters.")
-        if not isinstance(category.get("permission_overwrites", []), list):
-            raise ValueError(f"Permission overwrites for category '{category_name}' must be a list.")
+            raise ValueError("Every category must be an object.")
+        name(category.get("name"), "Category name")
+        overwrites(category.get("permission_overwrites", []))
         channels = category.get("channels", [])
-        if not isinstance(channels, list):
-            raise ValueError(f"Channels for category '{category_name}' must be a list.")
+        if not isinstance(channels, list) or len(channels) > 50:
+            raise ValueError("Each category supports at most 50 channels.")
         channel_count += len(channels)
         for channel in channels:
             if not isinstance(channel, dict):
-                raise ValueError("Every channel entry must be an object.")
-            channel_name = channel.get("name")
-            if not isinstance(channel_name, str) or not channel_name.strip() or len(channel_name) > 100:
-                raise ValueError("Every channel needs a non-empty name of at most 100 characters.")
-            if not isinstance(channel.get("permission_overwrites", []), list):
-                raise ValueError(f"Permission overwrites for channel '{channel_name}' must be a list.")
-            channel_type = channel.get("type", "text")
-            if channel_type not in ("text", "voice"):
-                raise ValueError(f"Unsupported channel type '{channel_type}'. Use 'text' or 'voice'.")
-            if not isinstance(channel.get("threads", []), list):
-                raise ValueError(f"Threads for channel '{channel_name}' must be a list.")
-    if channel_count > 100:
-        raise ValueError("A single build may create at most 100 channels.")
+                raise ValueError("Every channel must be an object.")
+            name(channel.get("name"), "Channel name")
+            if channel.get("type", "text") not in ("text", "voice"):
+                raise ValueError("Channel type must be text or voice.")
+            overwrites(channel.get("permission_overwrites", []))
+            if not isinstance(channel.get("topic", ""), str) or len(channel.get("topic", "")) > 1024:
+                raise ValueError("Channel topics must be strings of at most 1,024 characters.")
+            integer(channel.get("slowmode", 0), "Slowmode", 0, 21600)
+            integer(channel.get("bitrate", 64000), "Bitrate", 8000, 384000)
+            integer(channel.get("user_limit", 0), "Voice user limit", 0, 99)
+            if type(channel.get("nsfw", False)) is not bool:
+                raise ValueError("NSFW must be true or false.")
+            threads = channel.get("threads", [])
+            if not isinstance(threads, list):
+                raise ValueError("Threads must be an array.")
+            if threads and channel.get("type", "text") != "text":
+                raise ValueError("Threads can only be created in text channels.")
+            thread_count += len(threads)
+            for thread in threads:
+                if not isinstance(thread, dict):
+                    raise ValueError("Every thread must be an object.")
+                name(thread.get("name"), "Thread name")
+                if type(thread.get("auto_archive", 1440)) is not int or thread.get("auto_archive", 1440) not in (60, 1440, 4320, 10080):
+                    raise ValueError("Thread archive duration must be 60, 1440, 4320, or 10080 minutes.")
+    if channel_count > 100 or thread_count > 100:
+        raise ValueError("A build supports at most 100 channels and 100 threads.")
+
+
+def preflight_build(guild: discord.Guild, schema: dict, *, clean_existing: bool = False) -> None:
+    """Check permissions and remaining server capacity before cleanup starts."""
+    _validate_schema(schema)
+    me = guild.me
+    if me is None:
+        raise ValueError("The bot's server membership could not be resolved.")
+    required = {"manage_channels", "manage_roles"}
+    if schema.get("server_name"):
+        required.add("manage_guild")
+    if any(c.get("threads") for cat in schema.get("categories", []) for c in cat.get("channels", [])):
+        required.add("create_public_threads")
+    missing = sorted(p for p in required if not getattr(me.guild_permissions, p, False))
+    if missing:
+        raise ValueError("Bot needs these server permissions: " + ", ".join(missing))
+    for role in schema.get("roles", []):
+        requested = _resolve_permissions(role.get("permissions", []))
+        if requested.value & ~me.guild_permissions.value and not me.guild_permissions.administrator:
+            raise ValueError(f"Bot cannot grant all permissions requested by role {role['name']}.")
+    channels = len(schema.get("categories", [])) + sum(len(c.get("channels", [])) for c in schema.get("categories", []))
+    existing_channels = 1 if clean_existing else len(guild.channels)
+    existing_roles = sum(r.is_default() or r.managed or r >= me.top_role for r in guild.roles) if clean_existing else len(guild.roles)
+    if existing_channels + channels > 500 or existing_roles + len(schema.get("roles", [])) > 250:
+        raise ValueError("This plan exceeds the server's channel or role capacity.")
 
 
 async def build_server(
     guild: discord.Guild,
     schema: dict[str, Any],
     progress_msg: discord.Message | None = None,
+    *,
+    clean_existing: bool = False,
+    safe_channel_id: int | None = None,
+    created_channel_ids: set[int] | None = None,
 ) -> tuple[list[str], dict[str, discord.Role]]:
-    """Validate and serialize server builds to prevent malformed concurrent operations."""
-    _validate_schema(schema)
-    if _BUILD_LOCK.locked():
-        raise RuntimeError("Another server build is already running. Wait for it to finish.")
-    async with _BUILD_LOCK:
-        return await _build_server_unlocked(guild, schema, progress_msg)
-
-
-_last_progress_update: float = 0.0
+    """Validate, reserve this server, then perform cleanup and creation."""
+    async with build_session(guild.id):
+        preflight_build(guild, schema, clean_existing=clean_existing)
+        cleanup_logs = []
+        if clean_existing:
+            if safe_channel_id is None or guild.get_channel(safe_channel_id) is None:
+                raise ValueError("The command channel must exist before cleanup can start.")
+            for channel in list(guild.channels):
+                if channel.id != safe_channel_id:
+                    await channel.delete(reason="Confirmed server builder cleanup")
+            for role in list(guild.roles):
+                if not (role.is_default() or role.managed or role >= guild.me.top_role):
+                    await role.delete(reason="Confirmed server builder cleanup")
+            cleanup_logs.append("Removed existing channels and eligible roles as confirmed.")
+        logs, role_map = await _build_server_unlocked(guild, schema, progress_msg, created_channel_ids)
+        return cleanup_logs + logs, role_map
 
 
 async def _update_progress(msg: discord.Message, progress: BuildProgress) -> None:
     """Edit the progress message embed, throttled to once every 2s to avoid rate limits."""
     import time
     import discord as _d
-    global _last_progress_update
     now = time.monotonic()
     # Only update every 2 seconds or on completion to avoid Discord rate limits
-    if now - _last_progress_update < 2.0 and progress.done < progress.total:
+    if now - progress.last_update < 2.0 and progress.done < progress.total:
         return
-    _last_progress_update = now
-    em = _d.Embed(title="\U0001f528 Building Server\u2026", description=progress.bar, colour=0x5865F2)
+    progress.last_update = now
+    em = _d.Embed(title="🔨 Building your server", description="Step 3 of 3 · Creating roles and channels\n\n" + progress.bar, colour=0x5865F2)
     try:
         await msg.edit(embed=em)
     except discord.HTTPException:

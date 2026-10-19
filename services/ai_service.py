@@ -6,12 +6,14 @@ import asyncio
 import json
 import logging
 import os
+from functools import wraps
 from typing import Any
 
 import aiofiles
 import aiohttp
 
 import config
+from utils.storage import write_json_atomic
 
 log = logging.getLogger("services.ai")
 
@@ -52,9 +54,29 @@ PERSONAS: dict[str, str] = {
 # ── In-memory cache (loaded from disk on init) ───────────────────────────────
 _memory: dict[str, Any] = {}
 _loaded: bool = False
+_memory_lock = asyncio.Lock()
+_user_locks: dict[int, asyncio.Lock] = {}
+
+
+def user_session(user_arg: int):
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(*args, **kwargs):
+            user_id = kwargs.get("user_id", args[user_arg] if len(args) > user_arg else None)
+            lock = _user_locks.setdefault(user_id, asyncio.Lock())
+            async with lock:
+                return await function(*args, **kwargs)
+        return wrapped
+    return decorate
+
 
 
 async def _ensure_loaded() -> None:
+    async with _memory_lock:
+        await _load_memory_unlocked()
+
+
+async def _load_memory_unlocked() -> None:
     """Load memory from disk once."""
     global _memory, _loaded
     if _loaded:
@@ -66,34 +88,37 @@ async def _ensure_loaded() -> None:
                 _memory = json.loads(raw) if raw.strip() else {}
         except Exception as exc:
             log.warning("Could not load memory file: %s", exc)
-            _memory = {}
+            raise RuntimeError("AI memory could not be read; refusing to overwrite it.") from exc
     _loaded = True
 
 
 async def _save_memory() -> None:
     """Persist memory to disk."""
-    os.makedirs(os.path.dirname(config.MEMORY_FILE), exist_ok=True)
-    async with aiofiles.open(config.MEMORY_FILE, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(_memory, indent=2))
+    async with _memory_lock:
+        await write_json_atomic(config.MEMORY_FILE, _memory)
 
 
 def _user_key(user_id: int) -> str:
     return str(user_id)
 
 
-async def get_ai_response(prompt: str, user_id: int, persona: str = "default") -> str:
+@user_session(1)
+async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *, use_history: bool = True) -> str:
     """Send *prompt* to OpenRouter and return the assistant reply.
 
     Maintains per-user conversation history (max ``config.AI_MAX_HISTORY`` exchanges).
     """
-    await _ensure_loaded()
+    if not config.OPENROUTER_API_KEY:
+        return "⚠️ AI is unavailable. Ask an administrator to configure OPENROUTER_API_KEY."
+    if use_history:
+        await _ensure_loaded()
     key = _user_key(user_id)
 
     # Initialise user entry if missing
-    if key not in _memory:
+    if use_history and key not in _memory:
         _memory[key] = {"persona": persona, "history": []}
 
-    user_data = _memory[key]
+    user_data = _memory[key] if use_history else {"persona": persona, "history": []}
     active_persona = user_data.get("persona", persona)
     system_prompt = PERSONAS.get(active_persona, PERSONAS["default"])
 
@@ -164,7 +189,8 @@ async def get_ai_response(prompt: str, user_id: int, persona: str = "default") -
                 break
 
     if not reply:
-        return f"\u26a0\ufe0f AI error: {last_error}"
+        log.warning("AI models exhausted: %s", last_error)
+        return "⚠️ AI could not respond. Try again shortly; an administrator can check the bot logs."
 
     # Update history (FIFO, max AI_MAX_HISTORY messages)
     user_data["history"].append({"role": "user", "content": prompt})
@@ -172,10 +198,12 @@ async def get_ai_response(prompt: str, user_id: int, persona: str = "default") -
     if len(user_data["history"]) > config.AI_MAX_HISTORY * 2:
         user_data["history"] = user_data["history"][-(config.AI_MAX_HISTORY * 2) :]
 
-    await _save_memory()
+    if use_history:
+        await _save_memory()
     return reply
 
 
+@user_session(0)
 async def reset_user_memory(user_id: int) -> None:
     """Clear conversation history for a user."""
     await _ensure_loaded()
@@ -185,6 +213,7 @@ async def reset_user_memory(user_id: int) -> None:
         await _save_memory()
 
 
+@user_session(0)
 async def set_user_persona(user_id: int, persona: str) -> None:
     """Switch the active persona for a user."""
     await _ensure_loaded()

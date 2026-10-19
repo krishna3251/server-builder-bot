@@ -8,6 +8,8 @@ import asyncio
 import io
 import logging
 import os
+from functools import wraps
+from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -17,6 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import add_usage_footer, error_embed, info_embed, success_embed, warning_embed
 
 load_dotenv()
@@ -29,13 +32,36 @@ AUTO_DELETE_DELAY: int = 10  # seconds before ticket channel is deleted after cl
 log = logging.getLogger("cogs.ticket_system")
 
 
+def ticket_transaction(function):
+    """Acknowledge immediately and serialize one guild's state transitions.
+
+    Run one bot process; the JSON economy and these locks are process-local.
+    """
+    @wraps(function)
+    async def wrapped(self, interaction, *args, **kwargs):
+        if not interaction.guild:
+            return await interaction.response.send_message("Use tickets inside a server.", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        cog = getattr(self, "cog", self)
+        if not hasattr(cog, "ticket_locks"):
+            cog = interaction.client.get_cog("TicketSystem")
+        if cog is None:
+            return await interaction.followup.send("Ticket system is unavailable. Ask an administrator to check /diagnostics.", ephemeral=True)
+        async with cog.ticket_locks.setdefault(interaction.guild.id, asyncio.Lock()):
+            return await function(self, interaction, *args, **kwargs)
+    return wrapped
+
+
 # ── Config Manager (MongoDB via motor) ────────────────────────────────────────
 class ConfigManager:
     """Handles all config persistence for the ticket system using MongoDB Atlas."""
 
     def __init__(self) -> None:
         import config as _config
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(_config.MONGO_URI)
+        if not _config.MONGO_URI.strip():
+            raise RuntimeError("Tickets require MONGO_URI. Configure MongoDB and restart the bot.")
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(_config.MONGO_URI, serverSelectionTimeoutMS=5000)
         self.db = self.client["ticket_bot"]
         self.col = self.db["guild_configs"]
 
@@ -74,8 +100,14 @@ class ConfigManager:
 class AutoDeleteManager:
     """Manages scheduled auto-deletion tasks for closed ticket channels."""
 
-    def __init__(self) -> None:
+    def __init__(self, config_manager, locks=None) -> None:
+        self.config_manager = config_manager
+        self.locks = locks if locks is not None else {}
         self.pending_deletes: dict[int, asyncio.Task] = {}
+
+    async def remove_deadline(self, channel):
+        async with self.locks.setdefault(channel.guild.id, asyncio.Lock()):
+            await self.config_manager.delete_key(channel.guild.id, f"pending_deletions.{channel.id}")
 
     async def schedule_delete(
         self,
@@ -90,24 +122,27 @@ class AutoDeleteManager:
                 f"\u23f3 This ticket channel will be automatically deleted in **{delay} seconds**."
             )
             await asyncio.sleep(delay)
-            await channel.delete(reason="Ticket closed \u2014 auto-deleted by ticket system.")
+            await channel.delete(reason="Ticket closed — auto-deleted by ticket system.")
+            await self.remove_deadline(channel)
             log.info("Auto-deleted ticket channel: %s", ticket_name)
             if channel.id in self.pending_deletes:
                 del self.pending_deletes[channel.id]
         except discord.NotFound:
             log.info("Channel %s was already deleted before auto-delete ran.", ticket_name)
+            await self.remove_deadline(channel)
         except discord.Forbidden:
             log.error("No permission to delete channel %s.", ticket_name)
         except asyncio.CancelledError:
-            log.info("Auto-delete for %s was cancelled.", ticket_name)
-            try:
-                await channel.send("\U0001f6ab Auto-delete has been cancelled by a moderator.")
-            except (discord.NotFound, discord.Forbidden):
-                pass
+            log.info("Auto-delete task stopped for %s; persisted deadline retained.", ticket_name)
+            raise
+        except Exception as exc:
+            report_error(exc, context="Ticket auto-delete")
+        finally:
+            self.pending_deletes.pop(channel.id, None)
 
 
 # ── Close Ticket Modal ───────────────────────────────────────────────────────
-class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
+class CloseTicketModal(SafeModal, title="Close Ticket"):
     """Modal that asks for a reason before closing a ticket."""
 
     reason_input = discord.ui.TextInput(
@@ -122,6 +157,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
         super().__init__()
         self.cog = cog
 
+    @ticket_transaction
     async def on_submit(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         assert isinstance(interaction.channel, discord.TextChannel)
@@ -130,7 +166,7 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
 
         config_data = await self.cog.config_manager.get_guild(interaction.guild.id)
         if not config_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No ticket config found for this server.", ephemeral=True
             )
 
@@ -141,6 +177,14 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             if cid == channel.id:
                 opener_id = int(uid_str)
                 break
+
+        member = interaction.user
+        role_ids = {r.id for r in getattr(member, "roles", [])}
+        staff = bool(role_ids.intersection({config_data.get("support_role_id"), config_data.get("mod_role_id")})) or member.guild_permissions.manage_guild
+        if opener_id is None:
+            return await interaction.followup.send("This ticket is already closed or is no longer tracked.", ephemeral=True)
+        if member.id != opener_id and not staff:
+            return await interaction.followup.send("You no longer have permission to close this ticket.", ephemeral=True)
 
         # Determine ticket counter from channel name
         ticket_counter_str = channel.name.split("-")[1] if "-" in channel.name else "????"
@@ -158,7 +202,6 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             close_embed,
             f"This channel will be deleted in {AUTO_DELETE_DELAY} seconds.",
         )
-        await interaction.response.send_message(embed=close_embed)
 
         # Step 2 \u2014 Generate transcript
         messages = [msg async for msg in channel.history(limit=200, oldest_first=True)]
@@ -192,10 +235,10 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             try:
                 await log_channel.send(embed=log_embed, file=transcript_file)
             except (discord.Forbidden, discord.HTTPException) as e:
-                log.error("Failed to send transcript to log channel: %s", e)
+                reference = report_error(e, context="Saving ticket transcript", guild_id=interaction.guild.id)
+                return await interaction.followup.send(f"The transcript could not be saved. The ticket remains open. Fix log channel permissions and try again. Reference: `{reference}`", ephemeral=True)
         else:
-            if log_channel_id:
-                log.warning("Log channel %s not found in guild %s.", log_channel_id, interaction.guild.id)
+            return await interaction.followup.send("The ticket log channel is unavailable. Ask an administrator to run /setup_tickets before closing this ticket.", ephemeral=True)
 
         # Step 4 \u2014 Lock out the opener
         if opener_id:
@@ -217,20 +260,19 @@ class CloseTicketModal(discord.ui.Modal, title="Close Ticket"):
             del claimed_tickets[str(channel.id)]
         config_data["open_tickets"] = open_tickets
         config_data["claimed_tickets"] = claimed_tickets
+        delay = config_data.get("auto_delete_delay", AUTO_DELETE_DELAY)
+        config_data.setdefault("pending_deletions", {})[str(channel.id)] = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay)
+        ).isoformat()
+        config_data.get("control_messages", {}).pop(str(channel.id), None)
         await self.cog.config_manager.save_guild(interaction.guild.id, config_data)
 
-        # Step 6 \u2014 Schedule auto-delete
-        delay = config_data.get("auto_delete_delay", AUTO_DELETE_DELAY)
-        task = asyncio.create_task(
-            self.cog.auto_delete_manager.schedule_delete(
-                channel, delay, log_channel, transcript_bytes, channel.name
-            )
-        )
-        self.cog.auto_delete_manager.pending_deletes[channel.id] = task
+        self.cog._schedule_deletion(channel, delay)
+        await interaction.followup.send(embed=close_embed, ephemeral=True)
 
 
 # ── Ticket Control View (Claim / Close) ──────────────────────────────────────
-class TicketControlView(discord.ui.View):
+class TicketControlView(SafeView):
     """Persistent view inside each ticket channel with Claim and Close buttons."""
 
     def __init__(self) -> None:
@@ -241,6 +283,7 @@ class TicketControlView(discord.ui.View):
         style=discord.ButtonStyle.success,
         custom_id="ticket_claim",
     )
+    @ticket_transaction
     async def claim_ticket(
         self, interaction: discord.Interaction, button: discord.ui.Button  # type: ignore[type-arg]
     ) -> None:
@@ -249,13 +292,13 @@ class TicketControlView(discord.ui.View):
 
         cog: Optional[TicketSystem] = interaction.client.get_cog("TicketSystem")  # type: ignore[assignment]
         if cog is None:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "Ticket system is not loaded.", ephemeral=True
             )
 
         config_data = await cog.config_manager.get_guild(interaction.guild.id)
         if not config_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No ticket config found.", ephemeral=True
             )
 
@@ -268,17 +311,20 @@ class TicketControlView(discord.ui.View):
         has_support = any(r.id == support_role_id for r in member.roles)
         has_mod = any(r.id == mod_role_id for r in member.roles)
 
-        if not has_support and not has_mod:
-            return await interaction.response.send_message(
+        if not has_support and not has_mod and not member.guild_permissions.manage_guild:
+            return await interaction.followup.send(
                 "Only support staff can claim tickets.", ephemeral=True
             )
+
+        if interaction.channel.id not in config_data.get("open_tickets", {}).values():
+            return await interaction.followup.send("This ticket is closed or no longer tracked.", ephemeral=True)
 
         # Already claimed check
         claimed_tickets: dict = config_data.get("claimed_tickets", {})
         channel_id_str = str(interaction.channel.id)
         if channel_id_str in claimed_tickets:
             claimer_id = claimed_tickets[channel_id_str]
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"This ticket was already claimed by <@{claimer_id}>.", ephemeral=True
             )
 
@@ -308,13 +354,14 @@ class TicketControlView(discord.ui.View):
                     embed.add_field(
                         name="Claimed by", value=interaction.user.mention, inline=True
                     )
-                    button.label = "Claimed"
-                    button.disabled = True
-                    await control_msg.edit(embed=embed, view=self)
+                    updated_view = TicketControlView()
+                    updated_view.claim_ticket.label = "Claimed"
+                    updated_view.claim_ticket.disabled = True
+                    await control_msg.edit(embed=embed, view=updated_view)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.warning("Could not edit control message to add claim info: %s", e)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=success_embed("Ticket claimed", "You are now responsible for this ticket."),
             ephemeral=True,
         )
@@ -337,41 +384,13 @@ class TicketControlView(discord.ui.View):
                 "Ticket system is not loaded.", ephemeral=True
             )
 
-        config_data = await cog.config_manager.get_guild(interaction.guild.id)
-        if not config_data:
-            return await interaction.response.send_message(
-                "No ticket config found.", ephemeral=True
-            )
-
-        # Permission check \u2014 support_role, mod_role, or ticket opener
-        support_role_id = config_data.get("support_role_id")
-        mod_role_id = config_data.get("mod_role_id")
-        member = interaction.user
-        assert isinstance(member, discord.Member)
-
-        has_support = any(r.id == support_role_id for r in member.roles)
-        has_mod = any(r.id == mod_role_id for r in member.roles)
-
-        # Check if the user is the ticket opener
-        open_tickets: dict = config_data.get("open_tickets", {})
-        is_opener = False
-        for uid_str, cid in open_tickets.items():
-            if cid == interaction.channel.id and int(uid_str) == member.id:
-                is_opener = True
-                break
-
-        if not has_support and not has_mod and not is_opener:
-            return await interaction.response.send_message(
-                "You do not have permission to close this ticket.", ephemeral=True
-            )
-
         # Open the close modal
         modal = CloseTicketModal(cog)
         await interaction.response.send_modal(modal)
 
 
 # ── Ticket Panel View (Tech / Server / Mod) ──────────────────────────────────
-class TicketPanelView(discord.ui.View):
+class TicketPanelView(SafeView):
     """Persistent panel view with three ticket type buttons."""
 
     def __init__(self) -> None:
@@ -426,19 +445,20 @@ class TicketBlacklist(app_commands.Group):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(user="The user to blacklist")
+    @ticket_transaction
     async def blacklist_add(
         self, interaction: discord.Interaction, user: discord.Member
     ) -> None:
         assert interaction.guild is not None
         config_data = await self.cog.config_manager.get_guild(interaction.guild.id)
         if not config_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No ticket config found. Run /setup_tickets first.", ephemeral=True
             )
 
         blacklist: list = config_data.get("blacklisted_users", [])
         if user.id in blacklist:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "User is already blacklisted.", ephemeral=True
             )
 
@@ -448,25 +468,26 @@ class TicketBlacklist(app_commands.Group):
 
         embed = warning_embed("User blacklisted", f"{user.mention} can no longer open tickets.")
         embed.add_field(name="Added by", value=interaction.user.mention, inline=True)
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="remove", description="Remove a user from the ticket blacklist.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(user="The user to remove from the blacklist")
+    @ticket_transaction
     async def blacklist_remove(
         self, interaction: discord.Interaction, user: discord.Member
     ) -> None:
         assert interaction.guild is not None
         config_data = await self.cog.config_manager.get_guild(interaction.guild.id)
         if not config_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No ticket config found. Run /setup_tickets first.", ephemeral=True
             )
 
         blacklist: list = config_data.get("blacklisted_users", [])
         if user.id not in blacklist:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "User is not blacklisted.", ephemeral=True
             )
 
@@ -476,28 +497,29 @@ class TicketBlacklist(app_commands.Group):
 
         embed = success_embed("User removed from blacklist", f"{user.mention} can open tickets again.")
         embed.add_field(name="Removed by", value=interaction.user.mention, inline=True)
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="list", description="View all blacklisted users.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
+    @ticket_transaction
     async def blacklist_list(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         config_data = await self.cog.config_manager.get_guild(interaction.guild.id)
         if not config_data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No ticket config found. Run /setup_tickets first.", ephemeral=True
             )
 
         blacklist: list = config_data.get("blacklisted_users", [])
         if not blacklist:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "No users are blacklisted.", ephemeral=True
             )
 
         mentions = "\n".join(f"<@{uid}>" for uid in blacklist)
         embed = warning_embed("Blacklisted users", mentions)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ── Main Cog ─────────────────────────────────────────────────────────────────
@@ -507,7 +529,9 @@ class TicketSystem(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.config_manager = ConfigManager()
-        self.auto_delete_manager = AutoDeleteManager()
+        self.ticket_locks: dict[int, asyncio.Lock] = {}
+        self.auto_delete_manager = AutoDeleteManager(self.config_manager, self.ticket_locks)
+        self.restore_task: asyncio.Task | None = None
         self.ticket_cooldowns: dict[int, datetime] = {}
 
         # Register blacklist command group
@@ -516,14 +540,46 @@ class TicketSystem(commands.Cog):
 
     async def cog_unload(self) -> None:
         self.bot.tree.remove_command("ticket_blacklist", type=discord.AppCommandType.chat_input)
+        if self.restore_task:
+            self.restore_task.cancel()
         # Cancel any pending deletion tasks
-        for task in self.auto_delete_manager.pending_deletes.values():
+        tasks = list(self.auto_delete_manager.pending_deletes.values())
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self.restore_task:
+            await asyncio.gather(self.restore_task, return_exceptions=True)
+        self.config_manager.client.close()
 
     async def cog_load(self) -> None:
         # Register persistent views so buttons survive bot restarts
         self.bot.add_view(TicketPanelView())
         self.bot.add_view(TicketControlView())
+        self.restore_task = asyncio.create_task(self._restore_deletions(), name="restore-ticket-deletions")
+
+    async def _restore_deletions(self) -> None:
+        await self.bot.wait_until_ready()
+        try:
+            async for doc in self.config_manager.col.find({"pending_deletions": {"$exists": True}}):
+                guild = self.bot.get_guild(int(doc["_id"]))
+                if guild is None:
+                    continue
+                for channel_id, deadline in doc.get("pending_deletions", {}).items():
+                    channel = guild.get_channel(int(channel_id))
+                    if not isinstance(channel, discord.TextChannel):
+                        await self.config_manager.delete_key(guild.id, f"pending_deletions.{channel_id}")
+                        continue
+                    delay = max(0, (datetime.fromisoformat(deadline) - datetime.now(timezone.utc)).total_seconds())
+                    self._schedule_deletion(channel, delay)
+        except Exception as exc:
+            report_error(exc, context="Restoring ticket deletion deadlines")
+
+    def _schedule_deletion(self, channel, delay):
+        if channel.id not in self.auto_delete_manager.pending_deletes:
+            self.auto_delete_manager.pending_deletes[channel.id] = asyncio.create_task(
+                self.auto_delete_manager.schedule_delete(channel, delay, None, b"", channel.name)
+            )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -561,6 +617,7 @@ class TicketSystem(commands.Cog):
         ticket_category="Category where ticket channels are created",
         ticket_image="Custom image used as the ticket panel banner",
     )
+    @ticket_transaction
     async def setup_tickets(
         self,
         interaction: discord.Interaction,
@@ -584,7 +641,7 @@ class TicketSystem(commands.Cog):
         }
         missing = [name for name, has in required_perms.items() if not has]
         if missing:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"Missing required permissions: {', '.join(missing)}. Please fix and retry.",
                 ephemeral=True,
             )
@@ -593,14 +650,13 @@ class TicketSystem(commands.Cog):
         ticket_image_url: Optional[str] = None
         if ticket_image is not None:
             if not ticket_image.content_type or not ticket_image.content_type.startswith("image/"):
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "The uploaded file is not a valid image. Please upload a PNG, JPG, GIF, or WEBP file.",
                     ephemeral=True,
                 )
             ticket_image_url = ticket_image.url
 
         # Acknowledge before MongoDB/channel operations to prevent expired interactions.
-        await interaction.response.defer(ephemeral=True, thinking=True)
 
         # Load existing config or create new one
         config_data = await self.config_manager.get_guild(interaction.guild.id)
@@ -679,13 +735,13 @@ class TicketSystem(commands.Cog):
 
     # ── Ticket Creation (called by panel buttons) ───────────────────────────
 
+    @ticket_transaction
     async def create_ticket(
         self, interaction: discord.Interaction, ticket_type: str
     ) -> None:
         assert interaction.guild is not None
 
         # Acknowledge before any database/network await to avoid Discord error 10062.
-        await interaction.response.defer(ephemeral=True, thinking=True)
 
         # CHECK 1 \u2014 Config exists
         config_data = await self.config_manager.get_guild(interaction.guild.id)
@@ -794,47 +850,55 @@ class TicketSystem(commands.Cog):
                 ephemeral=True,
             )
 
-        # \u2500\u2500 Opening Embed \u2500\u2500
-        ticket_embed = info_embed(f"Ticket #{counter:04d}", "A private support conversation is open.")
-        ticket_embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        ticket_image_url = config_data.get("ticket_image_url")
-        if ticket_image_url:
-            ticket_embed.set_image(url=ticket_image_url)
-        ticket_embed.add_field(name="Opened by", value=interaction.user.mention, inline=True)
-        ticket_embed.add_field(name="Ticket Type", value=ticket_type, inline=True)
-        ticket_embed.add_field(
-            name="Opened at",
-            value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
-            inline=True,
-        )
-        add_usage_footer(ticket_embed, "Use the buttons below to manage this ticket.")
+        try:
+            # \u2500\u2500 Opening Embed \u2500\u2500
+            ticket_embed = info_embed(f"Ticket #{counter:04d}", "A private support conversation is open.")
+            ticket_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            ticket_image_url = config_data.get("ticket_image_url")
+            if ticket_image_url:
+                ticket_embed.set_image(url=ticket_image_url)
+            ticket_embed.add_field(name="Opened by", value=interaction.user.mention, inline=True)
+            ticket_embed.add_field(name="Ticket Type", value=ticket_type, inline=True)
+            ticket_embed.add_field(
+                name="Opened at",
+                value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
+                inline=True,
+            )
+            add_usage_footer(ticket_embed, "Use the buttons below to manage this ticket.")
 
-        # \u2500\u2500 Role mention text \u2500\u2500
-        mention_parts: list[str] = []
-        if support_role:
-            mention_parts.append(support_role.mention)
-        if mod_role:
-            mention_parts.append(mod_role.mention)
-        mention_text = " ".join(mention_parts) + " \u2014 a new ticket has been opened." if mention_parts else "A new ticket has been opened."
+            # \u2500\u2500 Role mention text \u2500\u2500
+            mention_parts: list[str] = []
+            if support_role:
+                mention_parts.append(support_role.mention)
+            if mod_role:
+                mention_parts.append(mod_role.mention)
+            mention_text = " ".join(mention_parts) + " \u2014 a new ticket has been opened." if mention_parts else "A new ticket has been opened."
 
-        # \u2500\u2500 Send control view \u2500\u2500
-        control_view = TicketControlView()
-        control_msg = await ticket_channel.send(
-            content=mention_text,
-            embed=ticket_embed,
-            view=control_view,
-        )
+            # \u2500\u2500 Send control view \u2500\u2500
+            control_view = TicketControlView()
+            control_msg = await ticket_channel.send(
+                content=mention_text,
+                embed=ticket_embed,
+                view=control_view,
+            )
 
-        # Save control message ID for later editing (claim)
-        control_messages: dict = config_data.get("control_messages", {})
-        control_messages[str(ticket_channel.id)] = control_msg.id
-        config_data["control_messages"] = control_messages
+            # Save control message ID for later editing (claim)
+            control_messages: dict = config_data.get("control_messages", {})
+            control_messages[str(ticket_channel.id)] = control_msg.id
+            config_data["control_messages"] = control_messages
 
-        # \u2500\u2500 Post-creation \u2500\u2500
-        open_tickets[user_id_str] = ticket_channel.id
-        config_data["open_tickets"] = open_tickets
-        config_data["ticket_counter"] = counter
-        await self.config_manager.save_guild(interaction.guild.id, config_data)
+            # \u2500\u2500 Post-creation \u2500\u2500
+            open_tickets[user_id_str] = ticket_channel.id
+            config_data["open_tickets"] = open_tickets
+            config_data["ticket_counter"] = counter
+            await self.config_manager.save_guild(interaction.guild.id, config_data)
+
+        except Exception:
+            try:
+                await ticket_channel.delete(reason="Ticket creation failed before state was committed")
+            except discord.HTTPException:
+                log.exception("Could not remove incomplete ticket channel")
+            raise
 
         self.ticket_cooldowns[interaction.user.id] = datetime.now(timezone.utc)
 
@@ -929,20 +993,22 @@ class TicketSystem(commands.Cog):
     )
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
+    @ticket_transaction
     async def cancel_delete(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         assert interaction.channel is not None
 
         channel_id = interaction.channel.id
         if channel_id in self.auto_delete_manager.pending_deletes:
+            await self.config_manager.delete_key(interaction.guild.id, f"pending_deletions.{channel_id}")
             task = self.auto_delete_manager.pending_deletes.pop(channel_id)
             task.cancel()
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Auto-delete cancelled for this channel.", ephemeral=False
             )
             log.info("Auto-delete cancelled for channel %s by %s", channel_id, interaction.user)
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "No auto-delete is scheduled for this channel.", ephemeral=True
             )
 

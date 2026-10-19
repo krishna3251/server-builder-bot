@@ -11,11 +11,12 @@ from discord import app_commands
 from discord.ext import commands
 
 from services import ai_service
+from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
-from services.json_builder import build_server, _validate_schema
+from services.json_builder import build_server, _validate_schema, preflight_build
 
 
-class BuilderQuickstartView(discord.ui.View):
+class BuilderQuickstartView(SafeView):
     """Interactive quick-start menu that opens the actual builder workflows."""
 
     def __init__(
@@ -40,17 +41,17 @@ class BuilderQuickstartView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Choose preset", emoji="🧩", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Choose preset", emoji="🧩", style=discord.ButtonStyle.primary, row=0)
     async def preset(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        view = PresetPickerView(self.cog, self.owner_id, self.command_channel_id)
         await interaction.response.edit_message(
-            embed=info_embed(
-                "Choose a server preset",
-                "Select a template to review its roles, categories, and channels before anything is created.",
-            ),
-            view=PresetPickerView(self.cog, self.owner_id, self.command_channel_id),
+            embed=info_embed("Choose a server preset", "Select a template to review its roles, categories, and channels before anything is created."),
+            view=view,
         )
+        view.message = interaction.message
 
-    @discord.ui.button(label="Custom JSON", emoji="🛠️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Custom JSON", emoji="🛠️", style=discord.ButtonStyle.secondary, row=0)
     async def custom(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(
             CustomSchemaModal(
@@ -61,7 +62,7 @@ class BuilderQuickstartView(discord.ui.View):
             )
         )
 
-    @discord.ui.button(label="AI generator", emoji="✨", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="AI generator", emoji="✨", style=discord.ButtonStyle.success, row=0)
     async def ai_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(
             AIThemeModal(
@@ -71,19 +72,19 @@ class BuilderQuickstartView(discord.ui.View):
             )
         )
 
-    @discord.ui.button(label="JSON format", emoji="📄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="JSON format", emoji="📄", style=discord.ButtonStyle.secondary, row=1)
     async def json_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_message(
             embed=info_embed(
                 "JSON builder",
                 "Use the Custom JSON button to paste a schema up to 4,000 characters. "
                 "For larger templates, use /server_json to export a file and /setup_custom to upload it. "
-                "Every build now shows a preview and requires confirmation.",
+                "Custom and preset builds show a preview and require confirmation. AI generation previews are enabled by default.",
             ),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Channel guide", emoji="📚", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Channel guide", emoji="📚", style=discord.ButtonStyle.secondary, row=1)
     async def channel_guide(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_message(
             embed=info_embed(
@@ -93,6 +94,22 @@ class BuilderQuickstartView(discord.ui.View):
             ),
             ephemeral=True,
         )
+
+    @discord.ui.button(label="Close panel", style=discord.ButtonStyle.secondary, row=1)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        await interaction.response.edit_message(embed=info_embed("Builder closed", "Open /builder_panel whenever you're ready."), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
 class PresetSelect(discord.ui.Select):
@@ -154,20 +171,45 @@ class PresetSelect(discord.ui.Select):
             command_channel_id=view.command_channel_id,
             build_label=title,
         )
+        view.stop()
         await interaction.response.edit_message(embed=preview, view=confirm_view)
         confirm_view.message = interaction.message
 
 
-class PresetPickerView(discord.ui.View):
+class PresetPickerView(SafeView):
     def __init__(self, cog: "ServerBuilderCog", owner_id: int, command_channel_id: int) -> None:
         super().__init__(timeout=120)
         self.cog = cog
         self.owner_id = owner_id
         self.command_channel_id = command_channel_id
         self.add_item(PresetSelect())
+        self.message = None
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu belongs to the administrator who opened it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Back to builder", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        self.stop()
+        view = BuilderQuickstartView(self.cog, owner_id=self.owner_id, command_channel_id=self.command_channel_id)
+        await interaction.response.edit_message(embed=info_embed("🧱 Build your community", "Step 1 of 3 · Choose a preset, custom JSON, or AI generation."), view=view)
+        view.message = interaction.message
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
-class CustomSchemaModal(discord.ui.Modal):
+
+class CustomSchemaModal(SafeModal):
     def __init__(
         self,
         cog: "ServerBuilderCog",
@@ -233,7 +275,7 @@ class CustomSchemaModal(discord.ui.Modal):
             pass
 
 
-class AIThemeModal(discord.ui.Modal):
+class AIThemeModal(SafeModal):
     def __init__(self, cog: "ServerBuilderCog", *, owner_id: int, command_channel_id: int) -> None:
         super().__init__(title="Generate a server template", timeout=300)
         self.cog = cog
@@ -260,7 +302,7 @@ class AIThemeModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True, thinking=True)
         raw = await ai_service.get_ai_response(
             _GENERATION_PROMPT.format(theme=theme),
-            interaction.user.id,
+            interaction.user.id, use_history=False,
         )
         if raw.startswith("\u26a0\ufe0f"):
             return await interaction.edit_original_response(
@@ -299,7 +341,25 @@ class AIThemeModal(discord.ui.Modal):
         view.message = message
 
 
-class CustomBuildConfirmView(discord.ui.View):
+class PlanSectionSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="Inspect this plan before building…", row=0, options=[
+            discord.SelectOption(label="Overview", value="overview", emoji="🧱"),
+            discord.SelectOption(label="Channels & categories", value="channels", emoji="📁"),
+            discord.SelectOption(label="Roles & permissions", value="roles", emoji="🛡️"),
+        ])
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        view.section = self.values[0]
+        view.detail_page = 0
+        for option in self.options:
+            option.default = option.value == view.section
+        view.update_navigation()
+        await interaction.response.edit_message(embed=view.review_embed(), view=view)
+
+
+class CustomBuildConfirmView(SafeView):
     """Owner-locked preview gate for custom and AI-generated server builds."""
 
     def __init__(
@@ -318,6 +378,11 @@ class CustomBuildConfirmView(discord.ui.View):
         self.owner_id = owner_id
         self.command_channel_id = command_channel_id
         self.clean_existing = clean_existing
+        self.started = False
+        self.section = "overview"
+        self.detail_page = 0
+        self.add_item(PlanSectionSelect())
+        self.update_navigation()
         self.build_label = build_label
         self.message: discord.Message | None = None
         if clean_existing:
@@ -326,12 +391,60 @@ class CustomBuildConfirmView(discord.ui.View):
                     child.label = "Delete & build"
                     child.style = discord.ButtonStyle.danger
 
+    @property
+    def detail_page_count(self):
+        entries = self.schema.get("categories" if self.section == "channels" else "roles", [])
+        return max(1, (len(entries) + 4) // 5) if self.section != "overview" else 1
+
+    def update_navigation(self):
+        self.previous.disabled = self.detail_page == 0
+        self.next_page.disabled = self.detail_page >= self.detail_page_count - 1
+
+    def review_embed(self):
+        embed = self.cog._schema_preview_embed(self.schema, title="Review your server plan", description="Step 2 of 3 · Inspect the plan, then confirm when ready.")
+        if self.section != "overview":
+            embed.clear_fields()
+            entries = self.schema.get("categories" if self.section == "channels" else "roles", [])
+            for entry in entries[self.detail_page * 5:(self.detail_page + 1) * 5]:
+                if self.section == "channels":
+                    lines = [f"{'🔊' if c.get('type') == 'voice' else '#'} {c['name']}" for c in entry.get("channels", [])]
+                    value = "\n".join(lines) or "No channels"
+                    if len(value) > 800:
+                        value = value[:750] + "\n… Export JSON for all channels."
+                else:
+                    value = ", ".join(entry.get("permissions", [])) or "No extra server permissions"
+                embed.add_field(name=entry['name'], value=value[:800], inline=False)
+            if not entries:
+                embed.description += "\nNo entries in this section."
+            embed.set_footer(text=f"{self.section.title()} • Page {self.detail_page + 1}/{self.detail_page_count} • Export JSON for the complete plan")
+        if self.clean_existing:
+            embed.description += "\n⚠️ **Cleanup enabled: existing channels and eligible roles will be deleted.**"
+        return embed
+
+    @discord.ui.button(label="Previous", emoji="◀", style=discord.ButtonStyle.secondary, row=2)
+    async def previous(self, interaction, button):
+        self.detail_page = max(0, self.detail_page - 1)
+        self.update_navigation()
+        await interaction.response.edit_message(embed=self.review_embed(), view=self)
+
+    @discord.ui.button(label="Next", emoji="▶", style=discord.ButtonStyle.secondary, row=2)
+    async def next_page(self, interaction, button):
+        self.detail_page = min(self.detail_page_count - 1, self.detail_page + 1)
+        self.update_navigation()
+        await interaction.response.edit_message(embed=self.review_embed(), view=self)
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 "Only the administrator who started this build can confirm it.",
                 ephemeral=True,
             )
+            return False
+        if self.started:
+            await interaction.response.send_message("This build has already started.", ephemeral=True)
+            return False
+        if not interaction.guild or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Administrator permission is required to use this plan.", ephemeral=True)
             return False
         return True
 
@@ -340,9 +453,19 @@ class CustomBuildConfirmView(discord.ui.View):
         emoji="✅",
         style=discord.ButtonStyle.success,
         custom_id="server_builder_confirm",
-        row=0,
+        row=1,
     )
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.started:
+            return await interaction.response.send_message("This build has already started.", ephemeral=True)
+        if not interaction.guild or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("Administrator permission is required to confirm this build.", ephemeral=True)
+        try:
+            preflight_build(interaction.guild, self.schema, clean_existing=self.clean_existing)
+        except ValueError as exc:
+            return await interaction.response.send_message(embed=error_embed("Build needs attention", str(exc)), ephemeral=True)
+        self.started = True
+        self.stop()
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
@@ -363,7 +486,7 @@ class CustomBuildConfirmView(discord.ui.View):
         emoji="✖️",
         style=discord.ButtonStyle.secondary,
         custom_id="server_builder_cancel",
-        row=0,
+        row=1,
     )
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         for child in self.children:
@@ -373,6 +496,12 @@ class CustomBuildConfirmView(discord.ui.View):
             view=self,
         )
         self.stop()
+
+    @discord.ui.button(label="Export JSON", emoji="📄", style=discord.ButtonStyle.secondary, row=1)
+    async def export(self, interaction: discord.Interaction, button: discord.ui.Button):
+        import io
+        data = json.dumps(self.schema, ensure_ascii=False, indent=2).encode("utf-8")
+        await interaction.response.send_message(file=discord.File(io.BytesIO(data), filename="server-plan.json"), ephemeral=True)
 
     async def on_timeout(self) -> None:
         for child in self.children:
@@ -807,10 +936,15 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         em.add_field(name="Channels", value=str(channel_count), inline=True)
         em.add_field(
             name="Role names",
-            value=", ".join(role_names[:12]) + (f" … +{len(role_names) - 12}" if len(role_names) > 12 else "") or "None",
+            value=(", ".join(role_names[:12]) + (f" … +{len(role_names) - 12}" if len(role_names) > 12 else ""))[:1000] or "None",
             inline=False,
         )
         em.add_field(name="Structure", value="\n".join(category_lines) or "No categories", inline=False)
+        privileged = [r["name"] for r in roles if "administrator" in [p.lower() for p in r.get("permissions", [])]]
+        if privileged:
+            em.add_field(name="Administrator roles", value=", ".join(privileged)[:1000], inline=False)
+        if schema.get("auto_assign"):
+            em.add_field(name="Member role assignment", value=f"Assign **{schema['auto_assign']}** to existing human members after building."[:1000], inline=False)
         em.set_footer(text="Confirm to build • Cancel to leave the server unchanged")
         return em
 
@@ -828,14 +962,17 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
     async def builder_panel(self, interaction: discord.Interaction) -> None:
-        em = info_embed(
-            "🧱 Server Builder",
-            "Choose a workflow below. Each option explains when to use it and points to the matching command.",
-        )
-        em.add_field(name="Preset", value="Fast start from a template", inline=True)
-        em.add_field(name="Custom", value="Design your own structure", inline=True)
-        em.add_field(name="AI / JSON", value="Generate or supply a schema", inline=True)
-        em.set_footer(text="Preview first • Check permissions • Avoid destructive cleanup unless intended")
+        guild = interaction.guild
+        em = info_embed("🧱 Build your community", "**Step 1 of 3 · Choose your starting point**\nPick a preset, paste your own plan, or describe your server to AI.")
+        em.set_author(name=guild.name, **({"icon_url": guild.icon.url} if guild.icon else {}))
+        em.add_field(name="🧩 Presets", value="Gaming · Community\nStudy · Business", inline=True)
+        em.add_field(name="🛠️ Custom JSON", value="Your structure, roles,\nand channel permissions", inline=True)
+        em.add_field(name="✨ AI generator", value="Describe a theme,\nthen review its plan", inline=True)
+        em.add_field(name="This server", value=f"**{len(guild.channels)}** channels · **{len(guild.roles)}** roles · **{guild.member_count or len(guild.members)}** members", inline=False)
+        required = ("manage_channels", "manage_roles")
+        missing = [p.replace("_", " ") for p in required if not getattr(guild.me.guild_permissions, p, False)]
+        em.add_field(name="Builder readiness", value="⚠️ Missing: " + ", ".join(missing) if missing else "✅ Channel and role permissions ready. Each plan gets a full check before building.", inline=False)
+        em.set_footer(text="Choose → Review → Build • Existing resources are kept by default")
         view = BuilderQuickstartView(
             self,
             owner_id=interaction.user.id,
@@ -879,6 +1016,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         guild: discord.Guild,
         schema: dict,
         actor_mention: str,
+        created_channel_ids: set[int],
     ) -> tuple[int, int]:
         sent = 0
         failed = 0
@@ -892,7 +1030,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
                 if not channel_name:
                     continue
 
-                channel = discord.utils.get(guild.text_channels, name=channel_name)
+                channel = next((c for c in guild.text_channels if c.id in created_channel_ids and c.name == channel_name), None)
                 if not channel:
                     failed += 1
                     continue
@@ -982,38 +1120,10 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
                 ephemeral=True,
             )
 
-        roles = schema.get("roles", [])
-        categories = schema.get("categories", [])
-        channels = sum(len(category.get("channels", [])) for category in categories)
-        preview = (
-            warning_embed(
-                f"{template.name} preset • destructive preview",
-                "Existing channels and eligible roles will be deleted first. The command channel is kept, "
-                "but deleted content cannot be restored by this bot.",
-            )
-            if clean_existing
-            else info_embed(
-                f"🧩 {template.name} preset preview",
-                "Review the proposed server structure before applying it. Existing resources will be kept.",
-            )
-        )
-        preview.add_field(name="Roles", value=str(len(roles)), inline=True)
-        preview.add_field(name="Categories", value=str(len(categories)), inline=True)
-        preview.add_field(name="Channels", value=str(channels), inline=True)
-        preview.add_field(
-            name="Role names",
-            value=", ".join(str(role.get("name", "Unnamed")) for role in roles[:12]) or "None",
-            inline=False,
-        )
-        preview.add_field(
-            name="Category layout",
-            value="\n".join(
-                f"• **{category.get('name', 'Unnamed')}** · {len(category.get('channels', []))} channels"
-                for category in categories[:8]
-            ) or "No categories",
-            inline=False,
-        )
-        preview.set_footer(text="Confirm to build • Cancel to leave the server unchanged")
+        preview = self._schema_preview_embed(schema, title=f"🧩 {template.name} preview", description="Step 2 of 3 · Review this preset with the menu below.")
+        if clean_existing:
+            preview.colour = discord.Colour(0xED4245)
+            preview.description += "\n⚠️ **Cleanup enabled. Existing channels and eligible roles will be deleted. Deleted messages cannot be restored.**"
         view = CustomBuildConfirmView(
             self,
             schema,
@@ -1222,24 +1332,28 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         if not interaction.guild:
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
         # Get JSON from either text or file
         raw_json: str | None = None
         if json_file:
             if not json_file.filename.endswith(".json"):
-                return await interaction.response.send_message(
+                return await interaction.edit_original_response(
                     embed=error_embed("Error", "Please upload a `.json` file."),
-                    ephemeral=True,
                 )
-            raw_json = (await json_file.read()).decode("utf-8")
+            if json_file.size > 256_000:
+                return await interaction.edit_original_response(embed=error_embed("Template too large", "Upload a JSON template smaller than 256 KB."))
+            try:
+                raw_json = (await json_file.read()).decode("utf-8-sig")
+            except UnicodeDecodeError:
+                return await interaction.edit_original_response(embed=error_embed("Invalid encoding", "Save your JSON file as UTF-8 and upload it again."))
         elif json_text:
             raw_json = json_text
         else:
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=error_embed(
                     "Error",
                     "Provide either `json_text` or attach a `.json` file.\nUse `/server_json` to get the schema.",
                 ),
-                ephemeral=True,
             )
 
         # Parse JSON
@@ -1250,68 +1364,34 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
                 raise ValueError("No JSON object found.")
             schema = json.loads(raw_json[start:end])
         except (json.JSONDecodeError, ValueError) as exc:
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=error_embed("Invalid JSON", f"Could not parse your JSON:\n`{exc}`"),
-                ephemeral=True,
             )
 
         # Validate the schema before showing a preview or touching server resources.
         if not isinstance(schema, dict):
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=error_embed("Invalid Schema", "The JSON root must be an object."),
-                ephemeral=True,
             )
         if not isinstance(schema.get("roles", []), list) or not isinstance(schema.get("categories", []), list):
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=error_embed("Invalid Schema", "`roles` and `categories` must be arrays."),
-                ephemeral=True,
             )
         if not schema.get("roles") and not schema.get("categories"):
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=error_embed("Empty Schema", "Add at least one role or category before building."),
-                ephemeral=True,
             )
         try:
             _validate_schema(schema)
         except ValueError as exc:
-            return await interaction.response.send_message(
+            return await interaction.edit_original_response(
                 embed=error_embed("Invalid Server Plan", str(exc)),
-                ephemeral=True,
             )
 
-        categories = schema.get("categories", [])
-        channel_count = sum(len(category.get("channels", [])) for category in categories)
-        role_names = [str(role.get("name", "Unnamed")) for role in schema.get("roles", [])]
-        category_lines = [
-            f"• **{str(category.get('name', 'Unnamed'))[:80]}** · {len(category.get('channels', []))} channels"
-            for category in categories[:8]
-        ]
-        if len(categories) > 8:
-            category_lines.append(f"…and {len(categories) - 8} more categories")
-
+        preview = self._schema_preview_embed(schema, title="🛠️ Custom server preview", description="Step 2 of 3 · Review your roles, channels, and permissions below.")
         if clean_existing:
-            preview = warning_embed(
-                "Destructive build preview",
-                "This plan will remove existing channels and eligible roles before building. "
-                "The command channel is preserved. **Deleted content cannot be restored by this bot.**",
-            )
-        else:
-            preview = info_embed(
-                "🧱 Server build preview",
-                "Review the proposed structure before applying changes. No resources have been created yet.",
-            )
-        preview.add_field(name="Server name", value=str(schema.get("server_name") or interaction.guild.name)[:100], inline=True)
-        preview.add_field(name="New roles", value=str(len(role_names)), inline=True)
-        preview.add_field(name="Categories", value=str(len(categories)), inline=True)
-        preview.add_field(name="Channels", value=str(channel_count), inline=True)
-        preview.add_field(
-            name="Roles in this plan",
-            value=", ".join(role_names[:12]) + (f" … +{len(role_names) - 12}" if len(role_names) > 12 else "") or "None",
-            inline=False,
-        )
-        preview.add_field(name="Structure", value="\n".join(category_lines) or "No categories", inline=False)
-        preview.set_footer(text="Confirm to start • Cancel to leave the server unchanged")
-
+            preview.colour = discord.Colour(0xED4245)
+            preview.description += "\n⚠️ **Cleanup enabled. Existing channels and eligible roles will be deleted. Deleted messages cannot be restored.**"
         view = CustomBuildConfirmView(
             self,
             schema,
@@ -1320,7 +1400,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             clean_existing=clean_existing,
             build_label="Custom build",
         )
-        await interaction.response.send_message(embed=preview, view=view, ephemeral=True)
+        await interaction.edit_original_response(embed=preview, view=view)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -1335,6 +1415,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         clean_existing: bool,
         safe_channel_id: int,
         build_label: str = "Server build",
+        progress_msg: discord.Message | None = None,
     ) -> None:
         """Execute a custom build only after its preview is explicitly confirmed."""
         guild = interaction.guild
@@ -1349,41 +1430,22 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             if clean_existing
             else info_embed("Building server", "Starting the build…")
         )
-        progress_msg = await interaction.followup.send(
-            embed=progress_embed,
-            ephemeral=True,
-            wait=True,
-        )
-
-        if clean_existing:
-            deleted_channels = 0
-            deleted_roles = 0
-            for channel in list(guild.channels):
-                if channel.id == safe_channel_id:
-                    continue
-                try:
-                    await channel.delete(reason="Custom setup - confirmed clean existing")
-                    deleted_channels += 1
-                except (discord.Forbidden, discord.HTTPException):
-                    continue
-            bot_member = guild.me
-            for role in list(guild.roles):
-                if role.is_default() or role.managed or (bot_member and role >= bot_member.top_role):
-                    continue
-                try:
-                    await role.delete(reason="Custom setup - confirmed clean existing")
-                    deleted_roles += 1
-                except (discord.Forbidden, discord.HTTPException):
-                    continue
-            await progress_msg.edit(
-                embed=info_embed(
-                    "Cleanup complete",
-                    f"Deleted **{deleted_channels}** channels and **{deleted_roles}** eligible roles. Creating the requested structure now.",
-                )
+        if progress_msg is None:
+            progress_msg = await interaction.followup.send(
+                embed=progress_embed,
+                ephemeral=True,
+                wait=True,
             )
 
+        created_channel_ids: set[int] = set()
+        structure_built = False
         try:
-            logs, role_map = await build_server(guild, schema, progress_msg)
+            logs, role_map = await build_server(
+                guild, schema, progress_msg,
+                created_channel_ids=created_channel_ids,
+                clean_existing=clean_existing, safe_channel_id=safe_channel_id,
+            )
+            structure_built = True
             assign_logs: list[str] = []
 
             for role_data in schema.get("roles", []):
@@ -1413,7 +1475,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
                     assign_logs.append(f"Assigned **{auto_role.name}** to **{assigned}** existing members")
 
             sent, failed = await self._post_created_channel_summaries(
-                guild, schema, interaction.user.mention
+                guild, schema, interaction.user.mention, created_channel_ids
             )
             if sent:
                 assign_logs.append(f"Posted channel summaries in **{sent}** channels")
@@ -1437,8 +1499,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             await progress_msg.edit(
                 embed=error_embed(
                     "Build failed",
-                    "Newly created resources were rolled back where possible. Pre-existing resources removed by cleanup cannot be restored.\n"
-                    + f"`{str(exc)[:900]}`",
+                    ("The server structure was created, but finalization failed.\n" if structure_built else "Resource creation failed; rollback was attempted where possible. Cleanup deletions cannot be restored.\n")
+                    + f"Reference: `{report_error(exc, context=build_label)}`. Check /diagnostics and the bot logs.",
                 )
             )
 
@@ -1492,7 +1554,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
 
         # Ask AI for a server schema
         raw = await ai_service.get_ai_response(
-            _GENERATION_PROMPT.format(theme=theme), interaction.user.id
+            _GENERATION_PROMPT.format(theme=theme), interaction.user.id, use_history=False
         )
 
         if raw.startswith("\u26a0\ufe0f"):
@@ -1520,21 +1582,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             return
 
         if preview:
-            preview_text = json.dumps(schema, indent=2, ensure_ascii=False)
-            if len(preview_text) > 3400:
-                preview_text = preview_text[:3400] + "\n… (preview truncated)"
-            categories = schema.get("categories", [])
-            roles = schema.get("roles", [])
-            channel_count = sum(len(category.get("channels", [])) for category in categories)
-            em = info_embed(
-                "✨ AI server build preview",
-                "Review the generated structure below. **Nothing has been created yet.**\n\n"
-                + f"```json\n{preview_text}\n```",
-            )
-            em.add_field(name="Roles", value=str(len(roles)), inline=True)
-            em.add_field(name="Categories", value=str(len(categories)), inline=True)
-            em.add_field(name="Channels", value=str(channel_count), inline=True)
-            em.set_footer(text="Confirm to build • Cancel to leave the server unchanged")
+            em = self._schema_preview_embed(schema, title="✨ AI server preview", description="Step 2 of 3 · Review the generated plan before creating anything.")
             view = CustomBuildConfirmView(
                 self,
                 schema,
@@ -1549,49 +1597,11 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         progress_em = info_embed("🧱 Building server", "Starting the build…")
         progress_msg = await interaction.edit_original_response(embed=progress_em)
 
-        try:
-            logs, role_map = await build_server(interaction.guild, schema, progress_msg)
-
-            # Auto-assign roles
-            auto_role_name = schema.get("auto_assign")
-            if auto_role_name and auto_role_name in role_map:
-                for r in schema.get("roles", []):
-                    if "administrator" in r.get("permissions", []):
-                        if r["name"] in role_map:
-                            try:
-                                assert isinstance(interaction.user, discord.Member)
-                                await interaction.user.add_roles(
-                                    role_map[r["name"]], reason="Server build - owner"
-                                )
-                                logs.append(
-                                    f"Assigned **{r['name']}** to {interaction.user.mention}"
-                                )
-                            except discord.HTTPException:
-                                pass
-                        break
-
-            summary_sent, summary_failed = await self._post_created_channel_summaries(
-                interaction.guild,
-                schema,
-                interaction.user.mention,
-            )
-            if summary_sent:
-                logs.append(f"Posted channel summary messages in **{summary_sent}** channels")
-            if summary_failed:
-                logs.append(f"Skipped/failed channel summary messages in **{summary_failed}** channels")
-
-            result = "\n".join(logs) if logs else "Nothing was created."
-            if len(result) > 4000:
-                result = result[:4000] + "\n..."
-            em = success_embed("Server Built!", result)
-            await progress_msg.edit(embed=em)
-        except Exception as exc:
-            log.exception("Server build failed: %s", exc)
-            em = error_embed(
-                "Build Failed",
-                f"Build failed. Newly created resources were rolled back where possible; pre-existing resources are not restored.\n`{exc}`",
-            )
-            await progress_msg.edit(embed=em)
+        await self._execute_custom_build(
+            interaction, schema, clean_existing=False,
+            safe_channel_id=self._safe_command_channel_id(interaction),
+            build_label="AI server build", progress_msg=progress_msg,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

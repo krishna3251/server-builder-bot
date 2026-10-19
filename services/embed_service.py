@@ -22,7 +22,7 @@ def _base(title: str, description: str, colour: int) -> discord.Embed:
     """Create a branded embed with one consistent timestamp and footer."""
     em = discord.Embed(
         title=title[:256],
-        description=(description or None),
+        description=(description[:4096] if description else None),
         colour=colour,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )

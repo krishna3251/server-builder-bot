@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import discord
+from services.error_service import SafeView, SafeModal
 
 
-class Paginator(discord.ui.View):
+class Paginator(SafeView):
     """A tidy paginator with page count, guarded controls, and timeout cleanup."""
 
     def __init__(
