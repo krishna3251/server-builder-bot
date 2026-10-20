@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+from utils.interactions import acknowledged, respond, defer_response
+
 import logging
 import random
-from datetime import datetime, timedelta, timezone
 
 import discord
-from services.error_service import SafeView, SafeModal
+from services.error_service import SafeView
 from discord import app_commands
 from discord.ext import commands
 
 import config
 from services import economy_service as eco
 from services.embed_service import add_member_context, error_embed, info_embed, success_embed
-from utils.paginator import Paginator
 from utils.decorators import guild_only
 from utils.helpers import format_number
 
@@ -52,7 +52,7 @@ class ShopItemSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         view = self.shop_view
         if interaction.user.id != view.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "This shop session belongs to another member.", ephemeral=True
             )
         view.selected_index = int(self.values[0])
@@ -72,7 +72,7 @@ class ShopPageButton(discord.ui.Button):
         if not isinstance(view, ShopView):
             return
         if interaction.user.id != view.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "This shop session belongs to another member.", ephemeral=True
             )
         view.page = max(0, min(view.page + self.direction, view.page_count - 1))
@@ -98,17 +98,17 @@ class ShopBuyButton(discord.ui.Button):
         if not isinstance(view, ShopView):
             return
         if interaction.user.id != view.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "This shop session belongs to another member.", ephemeral=True
             )
         if view.selected_index is None:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "Choose an item from the menu first.", ephemeral=True
             )
 
         item = view.items[view.selected_index]
         # Acknowledge immediately: the purchase and balance reads may hit the database.
-        await interaction.response.defer()
+        await defer_response(interaction, )
         ok, message = await eco.buy_item(view.guild_id, view.owner_id, str(item.get("name", "")))
         if ok:
             receipt = success_embed("Purchase complete", message)
@@ -135,7 +135,7 @@ class ShopCloseButton(discord.ui.Button):
         if not isinstance(view, ShopView):
             return
         if interaction.user.id != view.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "This shop session belongs to another member.", ephemeral=True
             )
         for child in view.children:
@@ -231,6 +231,8 @@ class EconomyCog(commands.Cog, name="Economy"):
     # ── /balance ──────────────────────────────────────────────────────────
     @app_commands.command(name="balance", description="Check your coin balance.")
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def balance(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         bal = await eco.get_balance(interaction.guild.id, interaction.user.id)
@@ -238,14 +240,16 @@ class EconomyCog(commands.Cog, name="Economy"):
         em.add_field(name="Available coins", value=f"**{config.CURRENCY_SYMBOL} {format_number(bal)}**", inline=False)
         if isinstance(interaction.user, discord.Member):
             add_member_context(em, interaction.user)
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        await respond(interaction, embed=em, ephemeral=True)
 
     # ── /daily ────────────────────────────────────────────────────────────
     @app_commands.command(name="daily", description="Claim your daily reward.")
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def daily(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        await interaction.response.defer(ephemeral=True)
+        await defer_response(interaction, ephemeral=True)
         claimed, new_bal, ready = await eco.claim_reward(interaction.guild.id, interaction.user.id, "daily", config.DAILY_REWARD)
         if not claimed:
             return await interaction.edit_original_response(embed=info_embed("Daily reward claimed", f"Your next reward is available <t:{int(ready.timestamp())}:R>."))
@@ -255,9 +259,11 @@ class EconomyCog(commands.Cog, name="Economy"):
     # ── /work ─────────────────────────────────────────────────────────────
     @app_commands.command(name="work", description="Work for a random reward.")
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def work(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        await interaction.response.defer(ephemeral=True)
+        await defer_response(interaction, ephemeral=True)
         amount = random.randint(config.WORK_MIN, config.WORK_MAX)
         claimed, new_bal, ready = await eco.claim_reward(interaction.guild.id, interaction.user.id, "work", amount)
         if not claimed:
@@ -272,18 +278,20 @@ class EconomyCog(commands.Cog, name="Economy"):
     @app_commands.command(name="pay", description="Transfer coins to another user.")
     @app_commands.describe(user="User to pay", amount="Amount to send")
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
     async def pay(self, interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1]) -> None:
         assert interaction.guild is not None
         if user.id == interaction.user.id:
-            return await interaction.response.send_message(embed=error_embed("Error", "You can't pay yourself."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "You can't pay yourself."), ephemeral=True)
         if user.bot:
-            return await interaction.response.send_message(embed=error_embed("Error", "You can't pay a bot."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "You can't pay a bot."), ephemeral=True)
 
         ok = await eco.transfer(interaction.guild.id, interaction.user.id, user.id, amount)
         if not ok:
-            return await interaction.response.send_message(embed=error_embed("Insufficient Funds", "You don't have enough coins."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Insufficient Funds", "You don't have enough coins."), ephemeral=True)
         em = success_embed("Transfer Complete", f"Sent {config.CURRENCY_SYMBOL} **{format_number(amount)}** to {user.mention}.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /leaderboard (economy) ──────────────────────────────────────────────
     @app_commands.command(name="leaderboard", description="View the server leaderboard.")
@@ -293,6 +301,8 @@ class EconomyCog(commands.Cog, name="Economy"):
         app_commands.Choice(name="XP", value="xp"),
     ])
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
     async def leaderboard(self, interaction: discord.Interaction, type: app_commands.Choice[str] = None) -> None:  # type: ignore[assignment]
         assert interaction.guild is not None
         lb_type = type.value if type else "coins"
@@ -316,14 +326,16 @@ class EconomyCog(commands.Cog, name="Economy"):
                 place = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"**#{i}**")
                 lines.append(f"{place} **{discord.utils.escape_markdown(name)}** · {config.CURRENCY_SYMBOL} {format_number(bal)}")
             em = info_embed("🏆 Coin Leaderboard", "\n".join(lines) or "No data yet.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /shop ─────────────────────────────────────────────────────────────
     @app_commands.command(name="shop", description="Browse and purchase items from the server shop.")
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def shop(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await defer_response(interaction, ephemeral=True, thinking=True)
         items = await eco.get_shop_items()
         if not items:
             return await interaction.edit_original_response(
@@ -342,6 +354,8 @@ class EconomyCog(commands.Cog, name="Economy"):
     @app_commands.command(name="buy", description="Purchase an item from the shop.")
     @app_commands.describe(item="Name of the item to buy")
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def buy(self, interaction: discord.Interaction, item: str) -> None:
         assert interaction.guild is not None
         ok, msg = await eco.buy_item(interaction.guild.id, interaction.user.id, item)
@@ -349,11 +363,13 @@ class EconomyCog(commands.Cog, name="Economy"):
             em = success_embed("Purchase", msg)
         else:
             em = error_embed("Purchase Failed", msg)
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        await respond(interaction, embed=em, ephemeral=True)
 
     # ── /inventory ─────────────────────────────────────────────────────────
     @app_commands.command(name="inventory", description="View your purchased items.")
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def inventory(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         inv = await eco.get_inventory(interaction.guild.id, interaction.user.id)
@@ -364,7 +380,7 @@ class EconomyCog(commands.Cog, name="Economy"):
             counts = Counter(inv)
             lines = [f"• **{name}** ×{count}" for name, count in counts.items()]
             em = info_embed("🎒 Inventory", "\n".join(lines))
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        await respond(interaction, embed=em, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

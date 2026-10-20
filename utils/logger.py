@@ -1,5 +1,6 @@
 """Logging setup \u2014 rotating file handler + coloured console output."""
 
+import copy
 import logging
 import os
 import sys
@@ -20,6 +21,7 @@ class ColouredFormatter(logging.Formatter):
     """Formatter that prepends an ANSI colour code based on log level."""
 
     def format(self, record: logging.LogRecord) -> str:
+        record = copy.copy(record)
         colour = _COLOURS.get(record.levelno, _RESET)
         record.msg = f"{colour}{record.msg}{_RESET}"
         return super().format(record)

@@ -4,23 +4,23 @@
 
 from __future__ import annotations
 
+from utils.interactions import acknowledged, respond, defer_response
+
 import asyncio
 import io
 import logging
-import os
 from functools import wraps
 from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Optional
 
 import discord
-import motor.motor_asyncio
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
 from services.error_service import SafeView, SafeModal, report_error
-from services.embed_service import add_usage_footer, error_embed, info_embed, success_embed, warning_embed
+from services.embed_service import add_usage_footer, info_embed, success_embed, warning_embed
 
 load_dotenv()
 
@@ -40,9 +40,9 @@ def ticket_transaction(function):
     @wraps(function)
     async def wrapped(self, interaction, *args, **kwargs):
         if not interaction.guild:
-            return await interaction.response.send_message("Use tickets inside a server.", ephemeral=True)
+            return await respond(interaction, "Use tickets inside a server.", ephemeral=True)
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await defer_response(interaction, ephemeral=True, thinking=True)
         cog = getattr(self, "cog", self)
         if not hasattr(cog, "ticket_locks"):
             cog = interaction.client.get_cog("TicketSystem")
@@ -54,46 +54,7 @@ def ticket_transaction(function):
 
 
 # ── Config Manager (MongoDB via motor) ────────────────────────────────────────
-class ConfigManager:
-    """Handles all config persistence for the ticket system using MongoDB Atlas."""
-
-    def __init__(self) -> None:
-        import config as _config
-        if not _config.MONGO_URI.strip():
-            raise RuntimeError("Tickets require MONGO_URI. Configure MongoDB and restart the bot.")
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(_config.MONGO_URI, serverSelectionTimeoutMS=5000)
-        self.db = self.client["ticket_bot"]
-        self.col = self.db["guild_configs"]
-
-    async def get_guild(self, guild_id: int) -> dict:
-        doc = await self.col.find_one({"_id": str(guild_id)})
-        return doc or {}
-
-    async def save_guild(self, guild_id: int, data: dict) -> None:
-        data.pop("_id", None)  # avoid overwriting the document key
-        await self.col.update_one(
-            {"_id": str(guild_id)},
-            {"$set": data},
-            upsert=True,
-        )
-
-    async def get_key(self, guild_id: int, key: str, default=None):
-        doc = await self.get_guild(guild_id)
-        return doc.get(key, default)
-
-    async def set_key(self, guild_id: int, key: str, value) -> None:
-        await self.col.update_one(
-            {"_id": str(guild_id)},
-            {"$set": {key: value}},
-            upsert=True,
-        )
-
-    async def delete_key(self, guild_id: int, key: str) -> None:
-        await self.col.update_one(
-            {"_id": str(guild_id)},
-            {"$unset": {key: ""}},
-            upsert=False,
-        )
+from services.ticket_store import TicketStore as ConfigManager
 
 
 # ── Auto-Delete Manager ──────────────────────────────────────────────────────
@@ -380,7 +341,7 @@ class TicketControlView(SafeView):
 
         cog: Optional[TicketSystem] = interaction.client.get_cog("TicketSystem")  # type: ignore[assignment]
         if cog is None:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "Ticket system is not loaded.", ephemeral=True
             )
 
@@ -446,6 +407,7 @@ class TicketBlacklist(app_commands.Group):
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(user="The user to blacklist")
     @ticket_transaction
+    @acknowledged(ephemeral=True)
     async def blacklist_add(
         self, interaction: discord.Interaction, user: discord.Member
     ) -> None:
@@ -475,6 +437,7 @@ class TicketBlacklist(app_commands.Group):
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.describe(user="The user to remove from the blacklist")
     @ticket_transaction
+    @acknowledged(ephemeral=True)
     async def blacklist_remove(
         self, interaction: discord.Interaction, user: discord.Member
     ) -> None:
@@ -503,6 +466,7 @@ class TicketBlacklist(app_commands.Group):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     @ticket_transaction
+    @acknowledged(ephemeral=True)
     async def blacklist_list(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         config_data = await self.cog.config_manager.get_guild(interaction.guild.id)
@@ -550,7 +514,7 @@ class TicketSystem(commands.Cog):
             await asyncio.gather(*tasks, return_exceptions=True)
         if self.restore_task:
             await asyncio.gather(self.restore_task, return_exceptions=True)
-        self.config_manager.client.close()
+        self.config_manager.close()
 
     async def cog_load(self) -> None:
         # Register persistent views so buttons survive bot restarts
@@ -561,7 +525,7 @@ class TicketSystem(commands.Cog):
     async def _restore_deletions(self) -> None:
         await self.bot.wait_until_ready()
         try:
-            async for doc in self.config_manager.col.find({"pending_deletions": {"$exists": True}}):
+            async for doc in self.config_manager.pending_guilds():
                 guild = self.bot.get_guild(int(doc["_id"]))
                 if guild is None:
                     continue
@@ -618,6 +582,7 @@ class TicketSystem(commands.Cog):
         ticket_image="Custom image used as the ticket panel banner",
     )
     @ticket_transaction
+    @acknowledged(ephemeral=True)
     async def setup_tickets(
         self,
         interaction: discord.Interaction,
@@ -633,11 +598,14 @@ class TicketSystem(commands.Cog):
 
         # Validate bot permissions
         bot_member = interaction.guild.me
+        if bot_member is None:
+            return await respond(interaction, "Bot membership is unavailable. Retry after the bot reconnects.", ephemeral=True)
         required_perms = {
             "manage_channels": bot_member.guild_permissions.manage_channels,
-            "manage_threads": bot_member.guild_permissions.manage_threads,
             "send_messages": bot_member.guild_permissions.send_messages,
             "attach_files": bot_member.guild_permissions.attach_files,
+            "embed_links": bot_member.guild_permissions.embed_links,
+            "read_message_history": bot_member.guild_permissions.read_message_history,
         }
         missing = [name for name, has in required_perms.items() if not has]
         if missing:
@@ -994,6 +962,7 @@ class TicketSystem(commands.Cog):
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     @ticket_transaction
+    @acknowledged(ephemeral=True)
     async def cancel_delete(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         assert interaction.channel is not None

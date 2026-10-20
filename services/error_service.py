@@ -23,13 +23,21 @@ def report_error(error: Exception, *, context: str, guild_id: int | None = None)
 
 async def respond_error(interaction: discord.Interaction, error: Exception, *, context: str) -> None:
     reference = report_error(error, context=context, guild_id=interaction.guild_id)
-    embed = error_embed(
-        "Something needs attention",
-        "The action could not finish. Ask an administrator to check `/diagnostics` "
-        f"and the bot logs.\n**Error reference:** `{reference}`",
-    )
+    if isinstance(error, discord.app_commands.MissingPermissions):
+        description = 'You no longer have the permissions required for this action. Open a new result after your permissions are restored.'
+    elif isinstance(error, discord.Forbidden):
+        description = "Discord denied the action. Check the bot's channel permissions and role position."
+    elif isinstance(error, discord.NotFound):
+        description = "The channel, member, message, or interaction no longer exists. Refresh or run the command again."
+    elif isinstance(error, (TimeoutError, ConnectionError)):
+        description = "A service timed out or disconnected. Try again shortly; repeated failures need an administrator."
+    else:
+        description = "The action could not finish. Ask an administrator to check /diagnostics and the bot logs."
+    embed = error_embed("Action needs attention", f"{description}\n**Error reference:** `{reference}`")
     try:
         if interaction.response.is_done():
+            if interaction.response.type == discord.InteractionResponseType.deferred_channel_message:
+                await interaction.edit_original_response(content="The action could not finish. Private error details are below.", embed=None, view=None)
             await interaction.followup.send(embed=embed, ephemeral=True)
         else:
             await interaction.response.send_message(embed=embed, ephemeral=True)

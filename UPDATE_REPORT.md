@@ -1,5 +1,7 @@
 # Discord UI and reliability update — v2.1.0
 
+Historical report: the newer [v2.2 command audit](COMMAND_AUDIT.md) supersedes ticket-storage, reminder, shop-boost, and command-flow limitations described here.
+
 Reviewed base: `8e4fdc321958e1aba8b42820407def12aa3f6b5d` on `main`.
 
 This report covers the problems identified during this review and the implemented fixes. It is not a claim that every possible defect has been found or that the changes have been deployed.

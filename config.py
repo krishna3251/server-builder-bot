@@ -22,7 +22,7 @@ DEV_IDS: list[int] = [
 
 # ── AI Settings ───────────────────────────────────────────────────────────
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/chat/completions"
-AI_MODEL: str = "nvidia/nemotron-nano-9b-v2:free"
+AI_MODEL: str = os.getenv("AI_MODEL", "nvidia/nemotron-nano-9b-v2:free")
 AI_FALLBACK_MODELS: list[str] = [
     "nvidia/nemotron-nano-9b-v2:free",     # NVIDIA 9B — fast & reliable
     "arcee-ai/trinity-large-preview:free", # Arcee 400B MoE — smart
@@ -64,5 +64,5 @@ SHOP_FILE: str = f"{DATA_DIR}/economy/shop.json"
 
 # ── Bot Meta ──────────────────────────────────────────────────────────────
 BOT_NAME: str = "ServerBot"
-BOT_VERSION: str = "2.1.0"
+BOT_VERSION: str = "2.2.0"
 BOT_COLOR: int = 0x5865F2       # blurple

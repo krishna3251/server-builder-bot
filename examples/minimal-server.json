@@ -1,0 +1,41 @@
+{
+  "server_name": "My Community",
+  "roles": [
+    {
+      "name": "Member",
+      "color": "blue",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "read_messages",
+        "send_messages",
+        "read_message_history",
+        "attach_files",
+        "embed_links",
+        "connect",
+        "speak"
+      ]
+    }
+  ],
+  "categories": [
+    {
+      "name": "COMMUNITY",
+      "channels": [
+        {
+          "name": "general",
+          "type": "text",
+          "topic": "Community discussion",
+          "slowmode": 3,
+          "nsfw": false
+        },
+        {
+          "name": "Lounge",
+          "type": "voice",
+          "bitrate": 64000,
+          "user_limit": 8
+        }
+      ]
+    }
+  ],
+  "auto_assign": "Member"
+}

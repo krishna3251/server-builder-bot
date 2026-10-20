@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import discord
-from services.error_service import SafeView, SafeModal
+from services.error_service import SafeView
 
 
 class Paginator(SafeView):

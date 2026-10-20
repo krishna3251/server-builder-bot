@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
+from asyncio import TimeoutError
+
+from utils.interactions import acknowledged, respond, defer_response
+
 import json
 import logging
 
@@ -10,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from services import ai_service
+from services.template_service import parse_plan, generate_plan
 from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from services.json_builder import build_server, _validate_schema, preflight_build
@@ -34,7 +37,7 @@ class BuilderQuickstartView(SafeView):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
+            await respond(interaction,
                 "This builder panel belongs to the administrator who opened it.",
                 ephemeral=True,
             )
@@ -74,19 +77,16 @@ class BuilderQuickstartView(SafeView):
 
     @discord.ui.button(label="JSON format", emoji="📄", style=discord.ButtonStyle.secondary, row=1)
     async def json_builder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message(
-            embed=info_embed(
-                "JSON builder",
-                "Use the Custom JSON button to paste a schema up to 4,000 characters. "
-                "For larger templates, use /server_json to export a file and /setup_custom to upload it. "
-                "Custom and preset builds show a preview and require confirmation. AI generation previews are enabled by default.",
-            ),
-            ephemeral=True,
-        )
+        from cogs.json_tools import JsonReferenceView, plan_card
+        from services.template_service import example_plan
+        schema = example_plan()
+        view = JsonReferenceView(schema, interaction.user.id)
+        await respond(interaction, embed=plan_card(schema), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
     @discord.ui.button(label="Channel guide", emoji="📚", style=discord.ButtonStyle.secondary, row=1)
     async def channel_guide(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_message(
+        await respond(interaction,
             embed=info_embed(
                 "Channel guide",
                 "Use /channel_summaries to get suggested purposes for your server's text channels. "
@@ -134,26 +134,26 @@ class PresetSelect(discord.ui.Select):
         if not isinstance(view, PresetPickerView):
             return
         if interaction.user.id != view.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "Only the person who opened this panel can choose a preset.",
                 ephemeral=True,
             )
         if interaction.guild is None:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Server required", "Use this menu inside a Discord server."),
                 ephemeral=True,
             )
 
         schema = TEMPLATES.get(self.values[0])
         if not schema:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Preset unavailable", "That preset could not be loaded."),
                 ephemeral=True,
             )
         try:
             _validate_schema(schema)
         except ValueError as exc:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Invalid preset", str(exc)),
                 ephemeral=True,
             )
@@ -187,7 +187,7 @@ class PresetPickerView(SafeView):
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("This menu belongs to the administrator who opened it.", ephemeral=True)
+            await respond(interaction, "This menu belongs to the administrator who opened it.", ephemeral=True)
             return False
         return True
 
@@ -234,24 +234,16 @@ class CustomSchemaModal(SafeModal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "Only the person who opened this builder can submit the schema.",
                 ephemeral=True,
             )
         try:
             raw = self.schema_input.value
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            if start < 0 or end == 0:
-                raise ValueError("No JSON object found. Paste a complete server schema.")
-            schema = json.loads(raw[start:end])
-            if not isinstance(schema, dict):
-                raise ValueError("The JSON root must be an object.")
-            if not schema.get("roles") and not schema.get("categories"):
-                raise ValueError("Add at least one role or category before building.")
+            schema = parse_plan(raw)
             _validate_schema(schema)
         except (json.JSONDecodeError, ValueError) as exc:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Invalid server schema", str(exc)),
                 ephemeral=True,
             )
@@ -268,7 +260,7 @@ class CustomSchemaModal(SafeModal):
             command_channel_id=self.command_channel_id,
             build_label=self.build_label,
         )
-        await interaction.response.send_message(embed=preview, view=view, ephemeral=True)
+        await respond(interaction, embed=preview, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -293,37 +285,20 @@ class AIThemeModal(SafeModal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "Only the person who opened this builder can submit the theme.",
                 ephemeral=True,
             )
 
+        from cogs.ai import _rate_limited
+        if _rate_limited(interaction.user.id):
+            return await respond(interaction, "AI limit reached. Try again in a minute.", ephemeral=True)
         theme = self.theme_input.value.strip()
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        raw = await ai_service.get_ai_response(
-            _GENERATION_PROMPT.format(theme=theme),
-            interaction.user.id, use_history=False,
-        )
-        if raw.startswith("\u26a0\ufe0f"):
-            return await interaction.edit_original_response(
-                embed=error_embed("AI generation failed", raw)
-            )
-
+        await defer_response(interaction, ephemeral=True, thinking=True)
         try:
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            if start < 0 or end == 0:
-                raise ValueError("No JSON object found in the AI response.")
-            schema = json.loads(raw[start:end])
-            if not isinstance(schema, dict):
-                raise ValueError("The AI response root must be a JSON object.")
-            if not schema.get("roles") and not schema.get("categories"):
-                raise ValueError("The generated plan contains no roles or categories.")
-            _validate_schema(schema)
-        except (json.JSONDecodeError, ValueError) as exc:
-            return await interaction.edit_original_response(
-                embed=error_embed("Invalid generated plan", str(exc)[:900])
-            )
+            schema = await generate_plan(theme, interaction.user.id)
+        except (ValueError, TimeoutError) as exc:
+            return await interaction.edit_original_response(embed=error_embed("AI draft unavailable", str(exc) or "AI timed out. Try again."))
 
         preview = self.cog._schema_preview_embed(
             schema,
@@ -435,16 +410,16 @@ class CustomBuildConfirmView(SafeView):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
+            await respond(interaction,
                 "Only the administrator who started this build can confirm it.",
                 ephemeral=True,
             )
             return False
         if self.started:
-            await interaction.response.send_message("This build has already started.", ephemeral=True)
+            await respond(interaction, "This build has already started.", ephemeral=True)
             return False
         if not interaction.guild or not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Administrator permission is required to use this plan.", ephemeral=True)
+            await respond(interaction, "Administrator permission is required to use this plan.", ephemeral=True)
             return False
         return True
 
@@ -457,13 +432,13 @@ class CustomBuildConfirmView(SafeView):
     )
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.started:
-            return await interaction.response.send_message("This build has already started.", ephemeral=True)
+            return await respond(interaction, "This build has already started.", ephemeral=True)
         if not interaction.guild or not interaction.user.guild_permissions.administrator:
-            return await interaction.response.send_message("Administrator permission is required to confirm this build.", ephemeral=True)
+            return await respond(interaction, "Administrator permission is required to confirm this build.", ephemeral=True)
         try:
             preflight_build(interaction.guild, self.schema, clean_existing=self.clean_existing)
         except ValueError as exc:
-            return await interaction.response.send_message(embed=error_embed("Build needs attention", str(exc)), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Build needs attention", str(exc)), ephemeral=True)
         self.started = True
         self.stop()
         for child in self.children:
@@ -501,7 +476,7 @@ class CustomBuildConfirmView(SafeView):
     async def export(self, interaction: discord.Interaction, button: discord.ui.Button):
         import io
         data = json.dumps(self.schema, ensure_ascii=False, indent=2).encode("utf-8")
-        await interaction.response.send_message(file=discord.File(io.BytesIO(data), filename="server-plan.json"), ephemeral=True)
+        await respond(interaction, file=discord.File(io.BytesIO(data), filename="server-plan.json"), ephemeral=True)
 
     async def on_timeout(self) -> None:
         for child in self.children:
@@ -867,44 +842,6 @@ TEMPLATES: dict[str, dict] = {
     },
 }
 
-_GENERATION_PROMPT = (
-    "Generate a structured JSON object for a Discord server with the theme: '{theme}'.\n"
-    "The JSON MUST follow this exact schema:\n"
-    '{{\n'
-    '  "server_name": "string",\n'
-    '  "roles": [\n'
-    '    {{ "name": "string", "color": "named_color_or_#HEX", "hoist": bool, "mentionable": bool, '
-    '"permissions": ["permission_name"] }}\n'
-    '  ],\n'
-    '  "categories": [\n'
-    '    {{\n'
-    '      "name": "string",\n'
-    '      "permission_overwrites": [\n'
-    '        {{ "role": "RoleName_or_@everyone", "allow": ["perm"], "deny": ["perm"] }}\n'
-    '      ],\n'
-    '      "channels": [\n'
-    '        {{ "type": "text", "name": "string", "topic": "string", "slowmode": 0, "nsfw": false,\n'
-    '           "permission_overwrites": [\n'
-    '             {{ "role": "RoleName", "allow": ["send_messages"], "deny": [] }}\n'
-    '           ]\n'
-    '        }},\n'
-    '        {{ "type": "voice", "name": "string", "bitrate": 64000, "user_limit": 0 }}\n'
-    '      ]\n'
-    '    }}\n'
-    '  ],\n'
-    '  "auto_assign": "Member"\n'
-    '}}\n'
-    "IMPORTANT RULES:\n"
-    "- For role colors use named colors: red, gold, blue, green, purple, magenta, crimson, emerald, teal, orange, pink, grey, blurple (or #HEX)\n"
-    "- Both categories AND individual channels can have permission_overwrites\n"
-    "- Use '@everyone' as role name in overwrites to target the default role\n"
-    "- INFO/announcement channels: deny send_messages for @everyone, allow only for Admin/Mod\n"
-    "- Staff categories: deny read_messages for @everyone, allow only for staff roles\n"
-    "- Keep bitrate at 64000-96000 (no higher)\n"
-    "Return ONLY valid JSON, no explanation."
-)
-
-
 class ServerBuilderCog(commands.Cog, name="Server Builder"):
     """Server generation — AI-powered or from preset templates."""
 
@@ -961,6 +898,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     )
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
+    @acknowledged(ephemeral=True)
     async def builder_panel(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         em = info_embed("🧱 Build your community", "**Step 1 of 3 · Choose your starting point**\nPick a preset, paste your own plan, or describe your server to AI.")
@@ -978,7 +916,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             owner_id=interaction.user.id,
             command_channel_id=self._safe_command_channel_id(interaction),
         )
-        await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+        await respond(interaction, embed=em, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -1097,6 +1035,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         ]
     )
     @app_commands.checks.has_permissions(administrator=True)
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def setup_server(
         self,
         interaction: discord.Interaction,
@@ -1108,14 +1048,14 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
 
         schema = TEMPLATES.get(template.value)
         if not schema:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Template not found", "Choose one of the available presets and retry."),
                 ephemeral=True,
             )
         try:
             _validate_schema(schema)
         except ValueError as exc:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Invalid preset", str(exc)),
                 ephemeral=True,
             )
@@ -1132,7 +1072,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             clean_existing=clean_existing,
             build_label=f"{template.name} preset",
         )
-        await interaction.response.send_message(embed=preview, view=view, ephemeral=True)
+        await respond(interaction, embed=preview, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -1149,165 +1089,26 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     )
     @app_commands.choices(
         template=[
-            app_commands.Choice(name="Blank Schema (empty)", value="blank"),
+            app_commands.Choice(name="Minimal JSON example", value="blank"),
             app_commands.Choice(name="Gaming Server", value="gaming"),
             app_commands.Choice(name="Community Server", value="community"),
             app_commands.Choice(name="Study Group", value="study"),
             app_commands.Choice(name="Business / Team", value="business"),
         ]
     )
+    @acknowledged(ephemeral=True)
     async def server_json(
         self,
         interaction: discord.Interaction,
         template: app_commands.Choice[str] | None = None,
     ) -> None:
-        choice = template.value if template else "blank"
-
-        if choice == "blank":
-            schema = {
-                "server_name": "My Awesome Server",
-                "roles": [
-                    {
-                        "name": "Admin",
-                        "color": "red",
-                        "hoist": True,
-                        "mentionable": False,
-                        "permissions": ["administrator"],
-                    },
-                    {
-                        "name": "Moderator",
-                        "color": "green",
-                        "hoist": True,
-                        "mentionable": True,
-                        "permissions": [
-                            "kick_members",
-                            "ban_members",
-                            "manage_messages",
-                            "manage_channels",
-                        ],
-                    },
-                    {
-                        "name": "Member",
-                        "color": "blue",
-                        "hoist": False,
-                        "mentionable": False,
-                        "permissions": ["send_messages", "read_messages"],
-                    },
-                ],
-                "categories": [
-                    {
-                        "name": "INFO",
-                        "permission_overwrites": [
-                            {
-                                "role": "@everyone",
-                                "allow": ["read_messages"],
-                                "deny": ["send_messages"],
-                            },
-                            {
-                                "role": "Admin",
-                                "allow": ["send_messages"],
-                                "deny": [],
-                            },
-                        ],
-                        "channels": [
-                            {
-                                "type": "text",
-                                "name": "rules",
-                                "topic": "Server rules",
-                                "slowmode": 0,
-                                "nsfw": False,
-                            },
-                            {
-                                "type": "text",
-                                "name": "announcements",
-                                "topic": "Important updates",
-                                "permission_overwrites": [
-                                    {
-                                        "role": "Admin",
-                                        "allow": ["send_messages", "mention_everyone"],
-                                        "deny": [],
-                                    },
-                                    {
-                                        "role": "Moderator",
-                                        "allow": ["send_messages"],
-                                        "deny": [],
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "name": "GENERAL",
-                        "channels": [
-                            {
-                                "type": "text",
-                                "name": "general-chat",
-                                "topic": "Main chat",
-                            },
-                            {
-                                "type": "voice",
-                                "name": "Voice Chat",
-                                "bitrate": 96000,
-                                "user_limit": 0,
-                            },
-                        ],
-                    },
-                    {
-                        "name": "STAFF ONLY",
-                        "permission_overwrites": [
-                            {
-                                "role": "@everyone",
-                                "allow": [],
-                                "deny": ["read_messages"],
-                            },
-                            {
-                                "role": "Moderator",
-                                "allow": ["read_messages", "send_messages"],
-                                "deny": [],
-                            },
-                            {
-                                "role": "Admin",
-                                "allow": ["read_messages", "send_messages"],
-                                "deny": [],
-                            },
-                        ],
-                        "channels": [
-                            {
-                                "type": "text",
-                                "name": "staff-chat",
-                                "topic": "Staff only",
-                            },
-                        ],
-                    },
-                ],
-                "auto_assign": "Member",
-            }
-            title = "Server JSON Schema"
-        else:
-            schema = TEMPLATES.get(choice)
-            if not schema:
-                return await interaction.response.send_message(
-                    embed=error_embed("Error", "Template not found."), ephemeral=True
-                )
-            title = f"{template.name} Template JSON"  # type: ignore[union-attr]
-
-        text = json.dumps(schema, indent=2, ensure_ascii=False)
-
-        # If it fits in an embed, send it; otherwise send as a .json file
-        if len(text) <= 4000:
-            em = info_embed(title, f"```json\n{text}\n```")
-            em.set_footer(text="Copy this JSON, edit it, and use /setup_custom to build!")
-            await interaction.response.send_message(embed=em, ephemeral=True)
-        else:
-            # Send as attachment
-            import io
-
-            file = discord.File(
-                io.BytesIO(text.encode("utf-8")),
-                filename=f"server_template_{choice}.json",
-            )
-            em = info_embed(title, "Template is too large for embed \u2014 attached as file.\nEdit and use `/setup_custom` to build!")
-            await interaction.response.send_message(embed=em, file=file, ephemeral=True)
+        from cogs.json_tools import JsonReferenceView, plan_card, plan_file
+        from services.template_service import example_plan
+        kind = template.value if template and template.value != "blank" else "minimal"
+        schema = example_plan(kind)
+        view = JsonReferenceView(schema, interaction.user.id)
+        await respond(interaction, embed=plan_card(schema), file=plan_file(schema), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
     # \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
     # /setup_custom \u2014 build from user-provided JSON
@@ -1322,6 +1123,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         clean_existing="Delete ALL existing channels/roles first (keeps command channel)",
     )
     @app_commands.checks.has_permissions(administrator=True)
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def setup_custom(
         self,
         interaction: discord.Interaction,
@@ -1332,7 +1135,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         if not interaction.guild:
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await defer_response(interaction, ephemeral=True, thinking=True)
         # Get JSON from either text or file
         raw_json: str | None = None
         if json_file:
@@ -1358,11 +1161,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
 
         # Parse JSON
         try:
-            start = raw_json.find("{")
-            end = raw_json.rfind("}") + 1
-            if start == -1 or end == 0:
-                raise ValueError("No JSON object found.")
-            schema = json.loads(raw_json[start:end])
+            schema = parse_plan(raw_json)
         except (json.JSONDecodeError, ValueError) as exc:
             return await interaction.edit_original_response(
                 embed=error_embed("Invalid JSON", f"Could not parse your JSON:\n`{exc}`"),
@@ -1511,16 +1310,18 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         description="Post a small summary of channel purposes in this chat.",
     )
     @app_commands.checks.has_permissions(administrator=True)
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def channel_summaries(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=error_embed("Error", "This command can only be used in a server."),
                 ephemeral=True,
             )
 
         lines = self._build_server_summary_lines(interaction.guild)
         if not lines:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=info_embed("Channel Summaries", "No text channels found to summarize."),
                 ephemeral=True,
             )
@@ -1531,7 +1332,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
 
         em = info_embed("Channel Summaries", content)
         em.set_footer(text="These summaries are generated from channel topics/names.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
     # /generate_server \u2014 AI-powered server builder
@@ -1545,41 +1346,22 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         preview="Show a preview and require confirmation before building",
     )
     @app_commands.checks.has_permissions(administrator=True)
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def generate_server(
         self, interaction: discord.Interaction, theme: str, preview: bool = True
     ) -> None:
         if not interaction.guild:
             return
-        await interaction.response.defer(thinking=True, ephemeral=preview)
+        await defer_response(interaction, thinking=True, ephemeral=preview)
 
-        # Ask AI for a server schema
-        raw = await ai_service.get_ai_response(
-            _GENERATION_PROMPT.format(theme=theme), interaction.user.id, use_history=False
-        )
-
-        if raw.startswith("\u26a0\ufe0f"):
-            await interaction.edit_original_response(embed=error_embed("AI Error", raw))
-            return
-
+        from cogs.ai import _rate_limited
+        if _rate_limited(interaction.user.id):
+            return await respond(interaction, embed=error_embed("AI limit", "Try again in a minute."), ephemeral=True)
         try:
-            start = raw.find("{")
-            end = raw.rfind("}") + 1
-            if start == -1 or end == 0:
-                raise ValueError("No JSON object found in response.")
-            schema = json.loads(raw[start:end])
-            if not isinstance(schema, dict):
-                raise ValueError("The generated template root must be a JSON object.")
-            if not schema.get("roles") and not schema.get("categories"):
-                raise ValueError("The generated plan contains no roles or categories.")
-            _validate_schema(schema)
-        except (json.JSONDecodeError, ValueError) as exc:
-            await interaction.edit_original_response(
-                embed=error_embed(
-                    "Invalid generated template",
-                    f"The AI response could not be used as a server plan.\n`{str(exc)[:500]}`",
-                )
-            )
-            return
+            schema = await generate_plan(theme, interaction.user.id)
+        except (ValueError, TimeoutError) as exc:
+            return await interaction.edit_original_response(embed=error_embed("AI draft unavailable", str(exc) or "AI timed out. Try again."))
 
         if preview:
             em = self._schema_preview_embed(schema, title="✨ AI server preview", description="Step 2 of 3 · Review the generated plan before creating anything.")

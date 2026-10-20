@@ -1,0 +1,303 @@
+{
+  "server_name": null,
+  "roles": [
+    {
+      "name": "CEO",
+      "color": "gold",
+      "hoist": true,
+      "mentionable": false,
+      "permissions": [
+        "administrator"
+      ]
+    },
+    {
+      "name": "Manager",
+      "color": "crimson",
+      "hoist": true,
+      "mentionable": true,
+      "permissions": [
+        "manage_channels",
+        "manage_messages",
+        "kick_members"
+      ]
+    },
+    {
+      "name": "Team Lead",
+      "color": "emerald",
+      "hoist": true,
+      "mentionable": true,
+      "permissions": [
+        "manage_messages"
+      ]
+    },
+    {
+      "name": "Employee",
+      "color": "blue",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "send_messages",
+        "read_messages",
+        "connect",
+        "speak"
+      ]
+    },
+    {
+      "name": "Intern",
+      "color": "grey",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "send_messages",
+        "read_messages"
+      ]
+    }
+  ],
+  "categories": [
+    {
+      "name": "📋 COMPANY",
+      "permission_overwrites": [
+        {
+          "role": "@everyone",
+          "allow": [
+            "read_messages"
+          ],
+          "deny": [
+            "send_messages"
+          ]
+        },
+        {
+          "role": "CEO",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "Manager",
+          "allow": [
+            "send_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "📜guidelines",
+          "topic": "Company rules & policies"
+        },
+        {
+          "type": "text",
+          "name": "📣announcements",
+          "topic": "Company announcements",
+          "permission_overwrites": [
+            {
+              "role": "CEO",
+              "allow": [
+                "send_messages",
+                "mention_everyone"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Manager",
+              "allow": [
+                "send_messages"
+              ],
+              "deny": []
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "🗓schedule",
+          "topic": "Meeting schedules"
+        }
+      ]
+    },
+    {
+      "name": "💼 WORK",
+      "channels": [
+        {
+          "type": "text",
+          "name": "💬general-work",
+          "topic": "General work discussion"
+        },
+        {
+          "type": "text",
+          "name": "📋tasks",
+          "topic": "Task assignments & tracking",
+          "permission_overwrites": [
+            {
+              "role": "Team Lead",
+              "allow": [
+                "send_messages",
+                "manage_messages"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Employee",
+              "allow": [
+                "send_messages"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Intern",
+              "allow": [
+                "read_messages"
+              ],
+              "deny": [
+                "send_messages"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "📈reports",
+          "topic": "Weekly reports"
+        },
+        {
+          "type": "text",
+          "name": "💡ideas",
+          "topic": "Brainstorming & ideas"
+        }
+      ]
+    },
+    {
+      "name": "🏢 DEPARTMENTS",
+      "permission_overwrites": [
+        {
+          "role": "Employee",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "Team Lead",
+          "allow": [
+            "read_messages",
+            "send_messages",
+            "manage_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "💻dev-team",
+          "topic": "Development team"
+        },
+        {
+          "type": "text",
+          "name": "🎨design-team",
+          "topic": "Design team"
+        },
+        {
+          "type": "text",
+          "name": "📊marketing",
+          "topic": "Marketing team"
+        },
+        {
+          "type": "text",
+          "name": "🤝hr",
+          "topic": "Human resources"
+        }
+      ]
+    },
+    {
+      "name": "🔊 MEETINGS",
+      "channels": [
+        {
+          "type": "voice",
+          "name": "📞 Meeting Room 1",
+          "bitrate": 96000,
+          "user_limit": 10
+        },
+        {
+          "type": "voice",
+          "name": "📞 Meeting Room 2",
+          "bitrate": 96000,
+          "user_limit": 10
+        },
+        {
+          "type": "voice",
+          "name": "☕ Break Room",
+          "bitrate": 64000,
+          "user_limit": 0,
+          "permission_overwrites": [
+            {
+              "role": "Employee",
+              "allow": [
+                "connect",
+                "speak"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Intern",
+              "allow": [
+                "connect",
+                "speak"
+              ],
+              "deny": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "🔒 MANAGEMENT",
+      "permission_overwrites": [
+        {
+          "role": "@everyone",
+          "allow": [],
+          "deny": [
+            "read_messages"
+          ]
+        },
+        {
+          "role": "Manager",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "CEO",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "📋management-log",
+          "topic": "Management logs"
+        },
+        {
+          "type": "text",
+          "name": "💬private-chat",
+          "topic": "Management only"
+        },
+        {
+          "type": "voice",
+          "name": "🔒 Private Office",
+          "bitrate": 64000
+        }
+      ]
+    }
+  ],
+  "auto_assign": "Employee"
+}
