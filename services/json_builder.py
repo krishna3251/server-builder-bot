@@ -183,6 +183,8 @@ async def _build_server_unlocked(
                     deny = _resolve_permissions(ow.get("deny", []))
                     overwrites[target_role] = discord.PermissionOverwrite.from_pair(allow, deny)
 
+            if guild.me is not None:
+                overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
             category = await guild.create_category(name=cat_data["name"], overwrites=overwrites)
             created_channels.append(category)
             logs.append(f"Created category: **{cat_data['name']}**")

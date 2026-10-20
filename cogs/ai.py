@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from utils.interactions import acknowledged, respond, defer_response
+
 import logging
 import time
 from collections import defaultdict
@@ -43,15 +45,16 @@ class AICog(commands.Cog, name="AI"):
     # ── /ai ───────────────────────────────────────────────────────────────
     @app_commands.command(name="ai", description="Chat with the AI assistant.")
     @app_commands.describe(prompt="Your message to the AI")
+    @acknowledged(ephemeral=True)
     async def ai_chat(self, interaction: discord.Interaction, prompt: str) -> None:
         if _rate_limited(interaction.user.id):
             em = error_embed("Rate Limited", "You're sending messages too fast. Please wait a moment.")
-            await interaction.response.send_message(embed=em, ephemeral=True)
+            await respond(interaction, embed=em, ephemeral=True)
             return
 
-        await interaction.response.defer(thinking=True)
+        await defer_response(interaction, thinking=True, ephemeral=True)
 
-        reply = await ai_service.get_ai_response(prompt, interaction.user.id)
+        reply = await ai_service.get_ai_response(prompt, interaction.user.id, scope=str(interaction.guild_id or "dm"))
 
         chunks = chunk_text(reply)
         if not chunks or not any(chunk.strip() for chunk in chunks):
@@ -62,17 +65,18 @@ class AICog(commands.Cog, name="AI"):
 
         first = info_embed("✨ AI Assistant", chunks[0] or " ")
         add_usage_footer(first, "AI response")
-        await interaction.followup.send(embed=first)
+        await respond(interaction, embed=first, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
         for chunk in chunks[1:]:
             if chunk.strip():
-                await interaction.followup.send(content=chunk)
+                await interaction.followup.send(content=chunk, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     # ── /ai_reset ─────────────────────────────────────────────────────────
     @app_commands.command(name="ai_reset", description="Clear your AI conversation memory.")
+    @acknowledged(ephemeral=True)
     async def ai_reset(self, interaction: discord.Interaction) -> None:
-        await ai_service.reset_user_memory(interaction.user.id)
-        em = success_embed("Memory Cleared", "Your conversation history has been reset.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        await ai_service.reset_user_memory(interaction.user.id, scope=str(interaction.guild_id or "dm"))
+        em = success_embed("Memory Cleared", "Your conversation history in this server (or DM) has been reset.")
+        await respond(interaction, embed=em, ephemeral=True)
 
     # ── /ai_persona ───────────────────────────────────────────────────────
     @app_commands.command(name="ai_persona", description="Switch the AI's personality.")
@@ -86,10 +90,11 @@ class AICog(commands.Cog, name="AI"):
             app_commands.Choice(name="Coder (software engineer)", value="coder"),
         ]
     )
+    @acknowledged(ephemeral=True)
     async def ai_persona(self, interaction: discord.Interaction, set: app_commands.Choice[str]) -> None:
-        await ai_service.set_user_persona(interaction.user.id, set.value)
+        await ai_service.set_user_persona(interaction.user.id, set.value, scope=str(interaction.guild_id or "dm"))
         em = success_embed("Persona Updated", f"AI persona set to **{set.name}**.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        await respond(interaction, embed=em, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

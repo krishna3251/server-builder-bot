@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from utils.interactions import acknowledged, respond
+
 import asyncio
 import json
 import logging
 import os
-from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,6 +18,8 @@ from discord.ext import commands
 
 import config
 from services.embed_service import info_embed
+from services.error_service import report_error
+from utils.storage import write_json_atomic
 from utils.decorators import guild_only
 
 log = logging.getLogger("cogs.analytics")
@@ -39,14 +42,12 @@ async def _ensure_loaded() -> None:
                 _data = json.loads(raw) if raw.strip() else {}
         except Exception as exc:
             log.warning("Could not load analytics: %s", exc)
-            _data = {}
+            raise RuntimeError("Analytics could not be read; refusing to overwrite it.") from exc
     _loaded = True
 
 
 async def _save() -> None:
-    os.makedirs(os.path.dirname(config.ANALYTICS_FILE), exist_ok=True)
-    async with aiofiles.open(config.ANALYTICS_FILE, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(_data, indent=2))
+    await write_json_atomic(config.ANALYTICS_FILE, _data)
 
 
 def _today() -> str:
@@ -84,7 +85,10 @@ async def _periodic_writer() -> None:
     try:
         while True:
             await asyncio.sleep(15)
-            await _flush_if_dirty()
+            try:
+                await _flush_if_dirty()
+            except Exception as exc:
+                report_error(exc, context="Analytics flush; will retry")
     except asyncio.CancelledError:
         await _flush_if_dirty()
         raise
@@ -146,6 +150,8 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
 
     @analytics_group.command(name="messages", description="Messages sent per day (last 7 days).")
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
     async def analytics_messages(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         await _ensure_loaded()
@@ -175,10 +181,12 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         em.add_field(name="7-day total", value=f"**{sum(values):,}**", inline=True)
         em.add_field(name="Daily average", value=f"**{sum(values) // max(len(values), 1):,}**", inline=True)
         em.add_field(name="Peak day", value=f"**{max(values) if values else 0:,}**", inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     @analytics_group.command(name="members", description="Join/leave trend (last 7 days).")
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
     async def analytics_members(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         await _ensure_loaded()
@@ -204,10 +212,12 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         em.add_field(name="Joined", value=f"**+{total_joins:,}**", inline=True)
         em.add_field(name="Left", value=f"**−{total_leaves:,}**", inline=True)
         em.add_field(name="Net change", value=f"**{total_joins - total_leaves:+,}**", inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     @analytics_group.command(name="commands", description="Most used commands.")
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
     async def analytics_commands(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         await _ensure_loaded()
@@ -216,7 +226,7 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
 
         if not cmds:
             em = info_embed("📊 Command usage", "No command usage has been recorded yet.")
-            return await interaction.response.send_message(embed=em)
+            return await respond(interaction, embed=em)
 
         sorted_cmds = sorted(cmds.items(), key=lambda item: item[1], reverse=True)[:10]
         max_val = max(sorted_cmds[0][1], 1)
@@ -230,7 +240,7 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
         )
         em.add_field(name="Tracked commands", value=str(len(cmds)), inline=True)
         em.add_field(name="Total uses", value=f"{sum(cmds.values()):,}", inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AnalyticsCog(bot))

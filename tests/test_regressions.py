@@ -107,7 +107,8 @@ class BuildTests(unittest.IsolatedAsyncioTestCase):
         await builder.build_server(guild, schema)
         overwrites = guild.create_text_channel.call_args.kwargs['overwrites']
         self.assertFalse(overwrites[guild.default_role].view_channel)
-        self.assertEqual(len(overwrites), 2)
+        self.assertEqual(len(overwrites), 3)
+        self.assertTrue(overwrites[guild.me].view_channel)
 
     async def test_partial_creation_rolls_back(self):
         guild = self.guild()
@@ -237,9 +238,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         bot = commands.Bot(command_prefix='!', intents=discord.Intents.none())
         await bot._async_setup_hook()
         with patch.object(config, 'MONGO_URI', 'mongodb://localhost:27017'):
-            for extension in ('ai', 'analytics', 'economy', 'leveling', 'moderation', 'server_builder', 'ticket_system', 'utility'):
+            for extension in ('ai', 'analytics', 'economy', 'leveling', 'moderation', 'server_builder', 'ticket_system', 'utility', 'json_tools'):
                 await bot.load_extension('cogs.' + extension)
-        self.assertEqual(len(bot.extensions), 8)
+        self.assertEqual(len(bot.extensions), 9)
         self.assertIsNotNone(bot.tree.get_command('diagnostics'))
         await bot.close()
 
@@ -356,7 +357,7 @@ class TicketTests(unittest.IsolatedAsyncioTestCase):
         doc = {'_id': '1', 'pending_deletions': {'10': (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()}}
         async def cursor():
             yield doc
-        cog.config_manager = SimpleNamespace(col=SimpleNamespace(find=lambda _: cursor()))
+        cog.config_manager = SimpleNamespace(pending_guilds=cursor)
         cog._schedule_deletion = MagicMock()
         await cog._restore_deletions()
         cog._schedule_deletion.assert_called_once()

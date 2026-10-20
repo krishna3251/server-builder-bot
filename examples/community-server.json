@@ -1,0 +1,281 @@
+{
+  "server_name": null,
+  "roles": [
+    {
+      "name": "Owner",
+      "color": "gold",
+      "hoist": true,
+      "mentionable": false,
+      "permissions": [
+        "administrator"
+      ]
+    },
+    {
+      "name": "Admin",
+      "color": "crimson",
+      "hoist": true,
+      "mentionable": false,
+      "permissions": [
+        "administrator"
+      ]
+    },
+    {
+      "name": "Moderator",
+      "color": "emerald",
+      "hoist": true,
+      "mentionable": true,
+      "permissions": [
+        "kick_members",
+        "ban_members",
+        "manage_messages",
+        "manage_channels"
+      ]
+    },
+    {
+      "name": "Helper",
+      "color": "amber",
+      "hoist": true,
+      "mentionable": true,
+      "permissions": [
+        "manage_messages"
+      ]
+    },
+    {
+      "name": "Active Member",
+      "color": "magenta",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "send_messages",
+        "read_messages",
+        "embed_links",
+        "attach_files"
+      ]
+    },
+    {
+      "name": "Member",
+      "color": "blue",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "send_messages",
+        "read_messages"
+      ]
+    }
+  ],
+  "categories": [
+    {
+      "name": "📋 INFORMATION",
+      "permission_overwrites": [
+        {
+          "role": "@everyone",
+          "allow": [
+            "read_messages"
+          ],
+          "deny": [
+            "send_messages"
+          ]
+        },
+        {
+          "role": "Admin",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "📜rules",
+          "topic": "Server rules"
+        },
+        {
+          "type": "text",
+          "name": "📣announcements",
+          "topic": "Important updates",
+          "permission_overwrites": [
+            {
+              "role": "Admin",
+              "allow": [
+                "send_messages",
+                "mention_everyone"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Moderator",
+              "allow": [
+                "send_messages"
+              ],
+              "deny": []
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "📌roles-info",
+          "topic": "Get your roles here"
+        },
+        {
+          "type": "text",
+          "name": "👋introductions",
+          "topic": "Introduce yourself!"
+        }
+      ]
+    },
+    {
+      "name": "💬 COMMUNITY",
+      "channels": [
+        {
+          "type": "text",
+          "name": "💬general",
+          "topic": "Main chat"
+        },
+        {
+          "type": "text",
+          "name": "🤖bot-cmds",
+          "topic": "Bot commands"
+        },
+        {
+          "type": "text",
+          "name": "🖼media-share",
+          "topic": "Share media",
+          "permission_overwrites": [
+            {
+              "role": "Active Member",
+              "allow": [
+                "attach_files",
+                "embed_links"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Member",
+              "allow": [
+                "read_messages"
+              ],
+              "deny": [
+                "attach_files"
+              ]
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "💡suggestions",
+          "topic": "Suggest improvements"
+        },
+        {
+          "type": "text",
+          "name": "📊polls",
+          "topic": "Community polls"
+        }
+      ]
+    },
+    {
+      "name": "🎨 CREATIVE",
+      "channels": [
+        {
+          "type": "text",
+          "name": "🎨art-gallery",
+          "topic": "Share your creations"
+        },
+        {
+          "type": "text",
+          "name": "✍writing",
+          "topic": "Stories, poems, ideas"
+        },
+        {
+          "type": "text",
+          "name": "📸photography",
+          "topic": "Share your photos"
+        }
+      ]
+    },
+    {
+      "name": "🔊 VOICE",
+      "channels": [
+        {
+          "type": "voice",
+          "name": "🔊 General Voice",
+          "bitrate": 96000,
+          "user_limit": 0
+        },
+        {
+          "type": "voice",
+          "name": "🎵 Music",
+          "bitrate": 96000,
+          "user_limit": 0
+        },
+        {
+          "type": "voice",
+          "name": "☕ Chill Lounge",
+          "bitrate": 64000,
+          "user_limit": 10
+        },
+        {
+          "type": "voice",
+          "name": "📚 Study Room",
+          "bitrate": 64000,
+          "user_limit": 5
+        }
+      ]
+    },
+    {
+      "name": "🔒 STAFF AREA",
+      "permission_overwrites": [
+        {
+          "role": "@everyone",
+          "allow": [],
+          "deny": [
+            "read_messages"
+          ]
+        },
+        {
+          "role": "Moderator",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "Admin",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "Helper",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "📋mod-log",
+          "topic": "Moderation logs"
+        },
+        {
+          "type": "text",
+          "name": "💬staff-chat",
+          "topic": "Staff only"
+        },
+        {
+          "type": "voice",
+          "name": "🔒 Staff Voice",
+          "bitrate": 64000
+        }
+      ]
+    }
+  ],
+  "auto_assign": "Member"
+}

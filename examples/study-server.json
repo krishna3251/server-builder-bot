@@ -1,0 +1,268 @@
+{
+  "server_name": null,
+  "roles": [
+    {
+      "name": "Owner",
+      "color": "gold",
+      "hoist": true,
+      "mentionable": false,
+      "permissions": [
+        "administrator"
+      ]
+    },
+    {
+      "name": "Admin",
+      "color": "crimson",
+      "hoist": true,
+      "mentionable": false,
+      "permissions": [
+        "administrator"
+      ]
+    },
+    {
+      "name": "Tutor",
+      "color": "emerald",
+      "hoist": true,
+      "mentionable": true,
+      "permissions": [
+        "manage_messages",
+        "kick_members"
+      ]
+    },
+    {
+      "name": "Student",
+      "color": "blue",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "send_messages",
+        "read_messages"
+      ]
+    }
+  ],
+  "categories": [
+    {
+      "name": "📋 INFO",
+      "permission_overwrites": [
+        {
+          "role": "@everyone",
+          "allow": [
+            "read_messages"
+          ],
+          "deny": [
+            "send_messages"
+          ]
+        },
+        {
+          "role": "Admin",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "📜rules",
+          "topic": "Read before participating"
+        },
+        {
+          "type": "text",
+          "name": "📣announcements",
+          "topic": "Updates & schedules",
+          "permission_overwrites": [
+            {
+              "role": "Admin",
+              "allow": [
+                "send_messages"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Tutor",
+              "allow": [
+                "send_messages"
+              ],
+              "deny": []
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "📚resources",
+          "topic": "Helpful links & materials"
+        }
+      ]
+    },
+    {
+      "name": "💬 DISCUSSION",
+      "channels": [
+        {
+          "type": "text",
+          "name": "💬general",
+          "topic": "Off-topic chat"
+        },
+        {
+          "type": "text",
+          "name": "❓questions",
+          "topic": "Ask for help here",
+          "permission_overwrites": [
+            {
+              "role": "Student",
+              "allow": [
+                "send_messages",
+                "attach_files"
+              ],
+              "deny": []
+            },
+            {
+              "role": "Tutor",
+              "allow": [
+                "send_messages",
+                "manage_messages"
+              ],
+              "deny": []
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "name": "📝homework-help",
+          "topic": "Get homework assistance"
+        },
+        {
+          "type": "text",
+          "name": "🤖bot-commands",
+          "topic": "Bot commands"
+        }
+      ]
+    },
+    {
+      "name": "📖 SUBJECTS",
+      "permission_overwrites": [
+        {
+          "role": "Student",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "Tutor",
+          "allow": [
+            "read_messages",
+            "send_messages",
+            "manage_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "🔢math",
+          "topic": "Mathematics discussion"
+        },
+        {
+          "type": "text",
+          "name": "🔬science",
+          "topic": "Science discussion"
+        },
+        {
+          "type": "text",
+          "name": "💻coding",
+          "topic": "Programming help"
+        },
+        {
+          "type": "text",
+          "name": "📝english",
+          "topic": "English & writing"
+        }
+      ]
+    },
+    {
+      "name": "🔊 STUDY ROOMS",
+      "channels": [
+        {
+          "type": "voice",
+          "name": "📚 Study Room 1",
+          "bitrate": 64000,
+          "user_limit": 5
+        },
+        {
+          "type": "voice",
+          "name": "📚 Study Room 2",
+          "bitrate": 64000,
+          "user_limit": 5
+        },
+        {
+          "type": "voice",
+          "name": "👥 Group Session",
+          "bitrate": 96000,
+          "user_limit": 10,
+          "permission_overwrites": [
+            {
+              "role": "Tutor",
+              "allow": [
+                "connect",
+                "speak",
+                "mute_members"
+              ],
+              "deny": []
+            }
+          ]
+        },
+        {
+          "type": "voice",
+          "name": "🎵 Lo-Fi Study",
+          "bitrate": 96000,
+          "user_limit": 0
+        }
+      ]
+    },
+    {
+      "name": "🔒 STAFF",
+      "permission_overwrites": [
+        {
+          "role": "@everyone",
+          "allow": [],
+          "deny": [
+            "read_messages"
+          ]
+        },
+        {
+          "role": "Tutor",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        },
+        {
+          "role": "Admin",
+          "allow": [
+            "read_messages",
+            "send_messages"
+          ],
+          "deny": []
+        }
+      ],
+      "channels": [
+        {
+          "type": "text",
+          "name": "📋staff-log",
+          "topic": "Staff logs"
+        },
+        {
+          "type": "text",
+          "name": "💬tutor-chat",
+          "topic": "Tutor discussions"
+        }
+      ]
+    }
+  ],
+  "auto_assign": "Student"
+}

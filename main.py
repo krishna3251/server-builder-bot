@@ -24,7 +24,7 @@ def _health_check():
     active_bot = globals().get("bot")
     ready = bool(active_bot and active_bot.is_ready())
     failures = sorted(getattr(active_bot, "extension_errors", {}))
-    return {"ready": ready, "failed_extensions": failures}, 200 if ready and not failures else 503
+    return {"ready": ready, "failed_extensions": failures}, 200 if ready and not failures and not getattr(active_bot, "command_sync_error", None) else 503
 
 
 def _run_keep_alive():
@@ -71,6 +71,7 @@ class ServerBot(commands.Bot):
             ),
         )
         self.extension_errors: dict[str, str] = {}
+        self.command_sync_error: str | None = None
         self.start_time: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
 
     async def setup_hook(self) -> None:
@@ -90,9 +91,10 @@ class ServerBot(commands.Bot):
         # connection/startup error by crashing setup_hook without a traceback.
         try:
             synced = await self.tree.sync()
+            self.command_sync_error = None
             log.info("Synced %d slash commands globally.", len(synced))
-        except Exception:
-            log.exception("Failed to sync application commands globally")
+        except Exception as exc:
+            self.command_sync_error = report_error(exc, context="Synchronizing application commands")
 
     async def on_error(self, event_method, *args, **kwargs):
         import sys

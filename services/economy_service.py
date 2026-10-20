@@ -69,13 +69,15 @@ async def _ensure_loaded() -> None:
         _shop = _default_shop()
         await _save_shop()
 
+    if not isinstance(_shop, list) or any(not isinstance(i, dict) or not isinstance(i.get('name'), str) or not i['name'].strip() or type(i.get('price')) is not int or i['price'] < 0 for i in _shop):
+        raise ValueError('Shop items must have names and non-negative integer prices.')
     _loaded = True
 
 
 def _default_shop() -> list[dict[str, Any]]:
     return [
-        {"name": "VIP Role Badge", "price": 1000, "description": "Cosmetic VIP badge."},
-        {"name": "Custom Colour", "price": 2500, "description": "Pick a custom name colour."},
+        {"name": "VIP Role Badge", "price": 1000, "description": "Inventory collectible; no server role is assigned."},
+        {"name": "Custom Colour", "price": 2500, "description": "Inventory voucher; contact staff to arrange a colour."},
         {"name": "XP Boost", "price": 5000, "description": "2\u00d7 XP for 1 hour."},
     ]
 
@@ -209,6 +211,10 @@ async def buy_item(guild_id: int, user_id: int, item_name: str) -> tuple[bool, s
         return False, f"Not enough coins. You need **{item['price']}** but have **{w['balance']}**."
     w["balance"] -= item["price"]
     w["inventory"].append(item["name"])
+    if item['name'].casefold() == 'xp boost':
+        now = datetime.now(timezone.utc)
+        existing = datetime.fromisoformat(w['boost_until']) if w.get('boost_until') else now
+        w['boost_until'] = (max(now, existing) + timedelta(hours=1)).isoformat()
     await _save_wallets()
     return True, f"Purchased **{item['name']}**!"
 
@@ -239,3 +245,9 @@ async def claim_reward(guild_id: int, user_id: int, kind: str, amount: int) -> t
     wallet[field] = now.isoformat()
     await _save_wallets()
     return True, wallet["balance"], None
+
+
+@serialized
+async def get_xp_multiplier(guild_id: int, user_id: int) -> int:
+    wallet = _ensure_wallet(_key(guild_id, user_id))
+    return 2 if wallet.get('boost_until') and datetime.fromisoformat(wallet['boost_until']) > datetime.now(timezone.utc) else 1

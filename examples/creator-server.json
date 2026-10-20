@@ -1,0 +1,71 @@
+{
+  "server_name": "My Creator Studio",
+  "roles": [
+    {
+      "name": "Member",
+      "color": "blue",
+      "hoist": false,
+      "mentionable": false,
+      "permissions": [
+        "read_messages",
+        "send_messages",
+        "read_message_history",
+        "attach_files",
+        "embed_links",
+        "connect",
+        "speak"
+      ]
+    }
+  ],
+  "categories": [
+    {
+      "name": "COMMUNITY",
+      "channels": [
+        {
+          "name": "general",
+          "type": "text",
+          "topic": "Community discussion",
+          "slowmode": 3,
+          "nsfw": false
+        },
+        {
+          "name": "Lounge",
+          "type": "voice",
+          "bitrate": 64000,
+          "user_limit": 8
+        }
+      ]
+    },
+    {
+      "name": "THUMBNAIL STUDIO",
+      "channels": [
+        {
+          "name": "thumbnail-showcase",
+          "type": "text",
+          "topic": "Share finished designs with asset credits."
+        },
+        {
+          "name": "thumbnail-feedback",
+          "type": "text",
+          "topic": "Post a brief and request focused design feedback."
+        }
+      ]
+    },
+    {
+      "name": "VIDEO STUDIO",
+      "channels": [
+        {
+          "name": "video-showcase",
+          "type": "text",
+          "topic": "Finished edits, montages, and reels."
+        },
+        {
+          "name": "editing-help",
+          "type": "text",
+          "topic": "Editing, sound, and export troubleshooting."
+        }
+      ]
+    }
+  ],
+  "auto_assign": "Member"
+}

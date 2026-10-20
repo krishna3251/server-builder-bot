@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
+from utils.interactions import acknowledged, respond
+
 import datetime
 import logging
 import platform
+import math
+from services.reminder_service import ReminderService
+from utils.polls import PollView
 
 import discord
-from services.error_service import SafeView, SafeModal
+from services.error_service import SafeView
 from discord import app_commands
 from discord.ext import commands
 
 import config
 from services.embed_service import add_member_context, add_usage_footer, info_embed, success_embed, error_embed
 from utils.decorators import guild_only
-from utils.helpers import format_number, parse_duration, time_until
+from utils.helpers import format_number, parse_duration
 
 _HELP_PAGES: dict[str, tuple[str, str]] = {
     "overview": (
@@ -25,8 +29,8 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
     ),
     "builder": (
         "🧱 Server builder",
-        "**Quick start:** `/builder_panel`\n"
-        "**Commands:** `/setup_server`, `/setup_custom`, `/server_json`, `/generate_server`, `/channel_summaries`\n\n"
+        "**Quick start:** `/builder_panel` · **JSON reference:** `/json_example`\n"
+        "**Commands:** `/setup_server`, `/setup_custom`, `/server_json`, `/json_example`, `/json_validate`, `/generate_server`, `/channel_summaries`\n\n"
         "Review previews before applying changes. Cleaning an existing server is destructive.",
     ),
     "tickets": (
@@ -52,7 +56,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
     ),
     "ai": (
         "✨ AI assistant",
-        "`/ai` — chat with the assistant\n"
+        "`/ai` — private chat, with separate memory per server\n"
         "`/ai_persona` — choose its response style\n"
         "`/ai_reset` — clear your conversation memory",
     ),
@@ -60,7 +64,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "🔧 Utility & analytics",
         "`/ping` · `/serverinfo` · `/userinfo` · `/roleinfo`\n"
         "`/avatar` · `/banner` · `/invite` · `/uptime` · `/botinfo`\n"
-        "`/poll` · `/remind`\n"
+        "`/poll` · `/remind` · `/reminders` · `/reminder_cancel`\n"
         "`/analytics messages` · `/analytics members` · `/analytics commands`",
     ),
 }
@@ -90,7 +94,7 @@ class HelpCategorySelect(discord.ui.Select):
         if not isinstance(view, CommandHelpView):
             return
         if interaction.user.id != view.owner_id:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 "This command guide belongs to the person who opened it.",
                 ephemeral=True,
             )
@@ -130,8 +134,16 @@ class UtilityCog(commands.Cog, name="Utility"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.reminders_service = ReminderService(bot)
+
+    async def cog_load(self):
+        self.reminders_service.start()
+
+    async def cog_unload(self):
+        await self.reminders_service.close()
 
     @app_commands.command(name="help", description="Open the interactive command guide.")
+    @acknowledged(ephemeral=True)
     async def help(self, interaction: discord.Interaction) -> None:
         title, description = _HELP_PAGES["overview"]
         em = info_embed(title, description)
@@ -142,7 +154,7 @@ class UtilityCog(commands.Cog, name="Utility"):
         )
         add_usage_footer(em, "Select a category below")
         view = CommandHelpView(interaction.user.id)
-        await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+        await respond(interaction, embed=em, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -151,13 +163,16 @@ class UtilityCog(commands.Cog, name="Utility"):
     @app_commands.command(name="diagnostics", description="Check modules, server permissions, and recent error references.")
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
+    @acknowledged(ephemeral=True)
     async def diagnostics(self, interaction: discord.Interaction):
         from services.error_service import recent_errors
         guild = interaction.guild
         em = info_embed("🩺 Bot diagnostics", "Configuration and runtime checks for administrators. Error references match the bot logs.")
-        em.add_field(name="Connection", value=f"{'✅ Ready' if self.bot.is_ready() else '⏳ Connecting'} · {round(self.bot.latency * 1000)} ms", inline=True)
+        em.add_field(name="Connection", value=f"{'✅ Ready' if self.bot.is_ready() else '⏳ Connecting'} · {round(self.bot.latency * 1000) if math.isfinite(self.bot.latency) else 'N/A'} ms", inline=True)
         em.add_field(name="AI configuration", value="✅ Key configured" if config.OPENROUTER_API_KEY else "⚠️ Set OPENROUTER_API_KEY", inline=True)
-        em.add_field(name="Ticket configuration", value="✅ MongoDB URI configured" if config.MONGO_URI else "⚠️ Set MONGO_URI", inline=True)
+        em.add_field(name="Ticket configuration", value="MongoDB configured (connection not verified)" if config.MONGO_URI else "Local JSON mode (persistent storage required)", inline=True)
+        sync_error = getattr(self.bot, 'command_sync_error', None)
+        em.add_field(name='Slash command sync', value=f'⚠️ Failed: `{sync_error}` · developer can run /sync_commands' if sync_error else 'No sync failure recorded (check hosting logs for startup details)', inline=False)
         loaded = sorted(self.bot.extensions)
         em.add_field(name="Loaded modules", value="\n".join(f"✅ {name.removeprefix('cogs.')}" for name in loaded) or "None", inline=True)
         failed = getattr(self.bot, "extension_errors", {})
@@ -167,16 +182,26 @@ class UtilityCog(commands.Cog, name="Utility"):
         em.add_field(name="Server permissions", value=", ".join(missing) if missing else "✅ Core permissions available", inline=False)
         current_errors = [item for item in recent_errors if item.get("guild_id") in (None, guild.id)]
         em.add_field(name="Recent errors · this process", value="\n".join(f"`{item['reference']}` · {item['type']}" for item in current_errors[-5:]) or "✅ No captured errors", inline=False)
-        em.add_field(name="Data storage", value="Economy, XP, analytics, and AI memory use local JSON. Keep the data directory on persistent storage and run one bot process. Tickets use MongoDB.", inline=False)
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        em.add_field(name="Data storage", value="Economy, XP, analytics, and AI memory use local JSON. Keep the data directory on persistent storage and run one bot process. Tickets use MongoDB when configured, otherwise local JSON. Reminder deadlines use local JSON.", inline=False)
+        await respond(interaction, embed=em, ephemeral=True)
+
+    @app_commands.command(name="sync_commands", description="Retry global slash-command sync (bot developer/owner only).")
+    @acknowledged(ephemeral=True)
+    async def sync_commands(self, interaction: discord.Interaction):
+        if interaction.user.id not in config.DEV_IDS and not await self.bot.is_owner(interaction.user):
+            return await respond(interaction, embed=error_embed("Developer access required", "Only the bot owner or configured DEV_IDS can sync commands."), ephemeral=True)
+        synced = await self.bot.tree.sync()
+        self.bot.command_sync_error = None
+        await respond(interaction, embed=success_embed("Commands synchronized", f"Published {len(synced)} top-level commands. Refresh Discord if a new command is not visible yet."), ephemeral=True)
 
     # ── /ping ─────────────────────────────────────────────────────────────
     @app_commands.command(name="ping", description="Check bot latency.")
+    @acknowledged(ephemeral=False)
     async def ping(self, interaction: discord.Interaction) -> None:
         ws_latency = round(self.bot.latency * 1000, 1)
         em = info_embed("🏓 Pong!", f"WebSocket: **{ws_latency}ms**")
         start = datetime.datetime.now(datetime.timezone.utc)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
         end = datetime.datetime.now(datetime.timezone.utc)
         api_latency = round((end - start).total_seconds() * 1000, 1)
         em.description += f"\nAPI: **{api_latency}ms**"
@@ -185,6 +210,7 @@ class UtilityCog(commands.Cog, name="Utility"):
     # ── /serverinfo ───────────────────────────────────────────────────────
     @app_commands.command(name="serverinfo", description="Display server information.")
     @guild_only()
+    @acknowledged(ephemeral=False)
     async def serverinfo(self, interaction: discord.Interaction) -> None:
         g = interaction.guild
         assert g is not None
@@ -199,12 +225,13 @@ class UtilityCog(commands.Cog, name="Utility"):
         em.add_field(name="BOOSTS", value=format_number(g.premium_subscription_count or 0), inline=True)
         em.add_field(name="CREATED", value=f"<t:{int(g.created_at.timestamp())}:D>", inline=True)
         em.add_field(name="SERVER ID", value=f"`{g.id}`", inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /userinfo ─────────────────────────────────────────────────────────
     @app_commands.command(name="userinfo", description="Display information about a user.")
     @app_commands.describe(user="User to inspect")
     @guild_only()
+    @acknowledged(ephemeral=False)
     async def userinfo(self, interaction: discord.Interaction, user: discord.Member | None = None) -> None:
         target = user or interaction.user
         assert isinstance(target, discord.Member)
@@ -216,12 +243,13 @@ class UtilityCog(commands.Cog, name="Utility"):
         em.add_field(name="JOINED SERVER", value=f"<t:{int(target.joined_at.timestamp())}:R>" if target.joined_at else "Unknown", inline=True)
         em.add_field(name="ACCOUNT CREATED", value=f"<t:{int(target.created_at.timestamp())}:D>", inline=True)
         em.add_field(name="ROLE COUNT", value=format_number(max(0, len(target.roles) - 1)), inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /roleinfo ─────────────────────────────────────────────────────────
     @app_commands.command(name="roleinfo", description="Display information about a role.")
     @app_commands.describe(role="Role to inspect")
     @guild_only()
+    @acknowledged(ephemeral=False)
     async def roleinfo(self, interaction: discord.Interaction, role: discord.Role) -> None:
         em = info_embed(role.name, "")
         em.colour = role.colour
@@ -232,32 +260,35 @@ class UtilityCog(commands.Cog, name="Utility"):
         em.add_field(name="Mentionable", value=str(role.mentionable), inline=True)
         em.add_field(name="Position", value=str(role.position), inline=True)
         em.add_field(name="Created", value=f"<t:{int(role.created_at.timestamp())}:R>", inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /avatar ───────────────────────────────────────────────────────────
     @app_commands.command(name="avatar", description="Get a user's avatar.")
     @app_commands.describe(user="User whose avatar to show")
+    @acknowledged(ephemeral=False)
     async def avatar(self, interaction: discord.Interaction, user: discord.User | None = None) -> None:
         target = user or interaction.user
         em = info_embed(f"{target}'s Avatar", "")
         em.set_image(url=target.display_avatar.with_size(1024).url)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /banner ───────────────────────────────────────────────────────────
     @app_commands.command(name="banner", description="Get a user's banner.")
     @app_commands.describe(user="User whose banner to show")
+    @acknowledged(ephemeral=False)
     async def banner(self, interaction: discord.Interaction, user: discord.User | None = None) -> None:
         target = user or interaction.user
         fetched = await self.bot.fetch_user(target.id)
         if fetched.banner:
             em = info_embed(f"{target}'s Banner", "")
             em.set_image(url=fetched.banner.with_size(1024).url)
-            await interaction.response.send_message(embed=em)
+            await respond(interaction, embed=em)
         else:
-            await interaction.response.send_message(embed=error_embed("No Banner", "This user has no banner."), ephemeral=True)
+            await respond(interaction, embed=error_embed("No Banner", "This user has no banner."), ephemeral=True)
 
     # ── /invite ───────────────────────────────────────────────────────────
     @app_commands.command(name="invite", description="Get the bot's invite link.")
+    @acknowledged(ephemeral=True)
     async def invite(self, interaction: discord.Interaction) -> None:
         assert self.bot.user is not None
         permissions = discord.Permissions(
@@ -283,19 +314,21 @@ class UtilityCog(commands.Cog, name="Utility"):
             "Review the permission list on Discord before approving it; Administrator is not requested.",
         )
         em.add_field(name="Requested access", value="Channels · Roles · Messages · Moderation · Application commands", inline=False)
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        await respond(interaction, embed=em, ephemeral=True)
 
     # ── /uptime ───────────────────────────────────────────────────────────
     @app_commands.command(name="uptime", description="Show how long the bot has been running.")
+    @acknowledged(ephemeral=False)
     async def uptime(self, interaction: discord.Interaction) -> None:
         delta = datetime.datetime.now(datetime.timezone.utc) - self.bot.start_time  # type: ignore
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes, seconds = divmod(remainder, 60)
         em = info_embed("Uptime", f"**{delta.days}d {hours % 24}h {minutes}m {seconds}s**")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /botinfo ──────────────────────────────────────────────────────────
     @app_commands.command(name="botinfo", description="Show bot statistics.")
+    @acknowledged(ephemeral=False)
     async def botinfo(self, interaction: discord.Interaction) -> None:
         em = info_embed(config.BOT_NAME, "")
         em.add_field(name="Version", value=config.BOT_VERSION, inline=True)
@@ -304,46 +337,55 @@ class UtilityCog(commands.Cog, name="Utility"):
         em.add_field(name="Commands", value=str(cmd_count), inline=True)
         em.add_field(name="Python", value=platform.python_version(), inline=True)
         em.add_field(name="discord.py", value=discord.__version__, inline=True)
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /poll ─────────────────────────────────────────────────────────────
     @app_commands.command(name="poll", description="Create a reaction poll.")
     @app_commands.describe(question="The poll question", options="Comma-separated options (max 10)")
+    @acknowledged(ephemeral=False)
     async def poll(self, interaction: discord.Interaction, question: str, options: str) -> None:
         items = [o.strip() for o in options.split(",") if o.strip()]
         if len(items) < 2:
-            return await interaction.response.send_message(embed=error_embed("Error", "Provide at least 2 options."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "Provide at least 2 options."), ephemeral=True)
         if len(items) > 10:
-            return await interaction.response.send_message(embed=error_embed("Error", "Maximum 10 options."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "Maximum 10 options."), ephemeral=True)
 
-        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-        desc = "\n".join(f"{number_emojis[i]} {item}" for i, item in enumerate(items))
-        em = info_embed(f"📊 {question}", desc)
-        add_usage_footer(em, f"Poll by {interaction.user}")
-        await interaction.response.send_message(embed=em)
-        msg = await interaction.original_response()
-        for i in range(len(items)):
-            await msg.add_reaction(number_emojis[i])
+        if len(question) > 220 or any(len(item) > 100 for item in items) or len(set(item.casefold() for item in items)) != len(items):
+            return await respond(interaction, embed=error_embed("Poll needs an edit", "Use a question up to 220 characters, unique options, and at most 100 characters per option."), ephemeral=True)
+        view = PollView(question, items, interaction.user.id)
+        await respond(interaction, embed=view.card(), view=view)
+        view.message = await interaction.original_response()
 
     # ── /remind ───────────────────────────────────────────────────────────
     @app_commands.command(name="remind", description="Set a DM reminder.")
     @app_commands.describe(time="When to remind (e.g. 10m, 2h, 1d)", message="Reminder message")
+    @acknowledged(ephemeral=True)
     async def remind(self, interaction: discord.Interaction, time: str, message: str) -> None:
         try:
             td = parse_duration(time)
         except ValueError:
-            return await interaction.response.send_message(embed=error_embed("Error", "Invalid time format."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "Invalid time format."), ephemeral=True)
 
         target_dt = datetime.datetime.now(datetime.timezone.utc) + td
-        em = success_embed("Reminder Set", f"I'll remind you <t:{int(target_dt.timestamp())}:R>.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
-
-        await asyncio.sleep(td.total_seconds())
         try:
-            reminder_em = info_embed("⏰ Reminder", message)
-            await interaction.user.send(embed=reminder_em)
-        except discord.HTTPException:
-            pass
+            identifier = await self.reminders_service.add(interaction.user.id, target_dt, message)
+        except ValueError as exc:
+            return await respond(interaction, embed=error_embed("Reminder limit", str(exc)), ephemeral=True)
+        em = success_embed("Reminder saved", f"I'll DM you <t:{int(target_dt.timestamp())}:R>.\nReference: `{identifier}` · Cancel using `/reminder_cancel`.\nDM delivery requires your DMs to be open.")
+        await respond(interaction, embed=em, ephemeral=True)
+
+    @app_commands.command(name="reminders", description="List your saved reminders and delivery status.")
+    @acknowledged(ephemeral=True)
+    async def reminders(self, interaction: discord.Interaction):
+        items = await self.reminders_service.list_for(interaction.user.id)
+        lines = [f"`{key}` · {'Delivery failed; check DMs' if value.get('status') == 'failed' else '<t:' + str(int(value['due'])) + ':R>'} · {discord.utils.escape_markdown(value['message'][:100])}" for key, value in items.items()]
+        await respond(interaction, embed=info_embed("⏰ Your reminders", "\n\n".join(lines) or "No saved reminders. Use /remind to create one."), ephemeral=True)
+
+    @app_commands.command(name="reminder_cancel", description="Cancel one of your saved reminders by reference ID.")
+    @acknowledged(ephemeral=True)
+    async def reminder_cancel(self, interaction: discord.Interaction, reference: str):
+        deleted = await self.reminders_service.cancel(interaction.user.id, reference.strip())
+        await respond(interaction, embed=success_embed("Reminder cancelled", "The reminder was removed.") if deleted else error_embed("Reminder not found", "Use /reminders to find your own reminder IDs."), ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

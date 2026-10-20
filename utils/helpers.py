@@ -16,13 +16,14 @@ def parse_duration(text: str) -> timedelta:
     Supports compounding: ``1d12h30m``.
     Raises ``ValueError`` if nothing matches.
     """
-    matches = _DURATION_RE.findall(text)
-    if not matches:
-        raise ValueError(f"Cannot parse duration from '{text}'.")
-    kwargs: dict[str, int] = {}
-    for amount, unit in matches:
-        kwargs[_UNIT_MAP[unit.lower()]] = kwargs.get(_UNIT_MAP[unit.lower()], 0) + int(amount)
-    return timedelta(**kwargs)
+    cleaned = text.strip()
+    matches = list(_DURATION_RE.finditer(cleaned))
+    if not matches or _DURATION_RE.sub('', cleaned).strip():
+        raise ValueError('Use a complete duration such as 10m, 2h, or 1d12h.')
+    seconds = sum(int(m.group(1)) * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[m.group(2).lower()] for m in matches)
+    if not 0 < seconds <= 365 * 86400:
+        raise ValueError('Duration must be greater than zero and no longer than 365 days.')
+    return timedelta(seconds=seconds)
 
 
 def chunk_text(text: str, limit: int = 2000) -> list[str]:

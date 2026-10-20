@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from functools import wraps
 from typing import Any
 
@@ -98,21 +99,23 @@ async def _save_memory() -> None:
         await write_json_atomic(config.MEMORY_FILE, _memory)
 
 
-def _user_key(user_id: int) -> str:
-    return str(user_id)
+def _user_key(user_id: int, scope: str | None = None) -> str:
+    return f"{scope}:{user_id}" if scope is not None else str(user_id)
 
 
 @user_session(1)
-async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *, use_history: bool = True) -> str:
+async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *, use_history: bool = True, scope: str | None = None) -> str:
     """Send *prompt* to OpenRouter and return the assistant reply.
 
     Maintains per-user conversation history (max ``config.AI_MAX_HISTORY`` exchanges).
     """
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 24000:
+        return "⚠️ Send a non-empty prompt up to 24,000 characters."
     if not config.OPENROUTER_API_KEY:
         return "⚠️ AI is unavailable. Ask an administrator to configure OPENROUTER_API_KEY."
     if use_history:
         await _ensure_loaded()
-    key = _user_key(user_id)
+    key = _user_key(user_id, scope)
 
     # Initialise user entry if missing
     if use_history and key not in _memory:
@@ -120,7 +123,12 @@ async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *
 
     user_data = _memory[key] if use_history else {"persona": persona, "history": []}
     active_persona = user_data.get("persona", persona)
-    system_prompt = PERSONAS.get(active_persona, PERSONAS["default"])
+    system_prompt = PERSONAS.get(active_persona, PERSONAS["default"]) + (
+        " You are a conversational assistant without action tools or live access to server state. "
+        "Never claim you changed roles, channels, settings, or completed a real-world action. "
+        "Distinguish verified facts from assumptions; ask for missing details. "
+        "Never invent sources, current facts, credentials, or command results."
+    )
 
     # Build message list
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -146,15 +154,24 @@ async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *
     reply: str = ""
     last_error: str = "Unknown error"
 
+    deadline = time.monotonic() + 85
     async with aiohttp.ClientSession() as session:
         for model in models_to_try:
-            payload = {"model": model, "messages": messages}
+            if time.monotonic() >= deadline:
+                break
+            payload = {"model": model, "messages": messages, "max_tokens": 4096}
             for attempt in range(config.AI_MAX_RETRIES):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
                     async with session.post(
                         config.OPENROUTER_BASE_URL, headers=headers, json=payload,
-                        timeout=aiohttp.ClientTimeout(total=30)
+                        timeout=aiohttp.ClientTimeout(total=min(30, max(0.1, remaining)))
                     ) as resp:
+                        if resp.status in (401, 403):
+                            log.error("OpenRouter rejected authentication/access (%d)", resp.status)
+                            return "⚠️ AI access was rejected. Ask an administrator to check the configured key and model access."
                         data = await resp.json()
                         if resp.status == 200:
                             choice = data.get("choices", [{}])[0]
@@ -204,20 +221,20 @@ async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *
 
 
 @user_session(0)
-async def reset_user_memory(user_id: int) -> None:
+async def reset_user_memory(user_id: int, *, scope: str | None = None) -> None:
     """Clear conversation history for a user."""
     await _ensure_loaded()
-    key = _user_key(user_id)
+    key = _user_key(user_id, scope)
     if key in _memory:
         _memory[key]["history"] = []
         await _save_memory()
 
 
 @user_session(0)
-async def set_user_persona(user_id: int, persona: str) -> None:
+async def set_user_persona(user_id: int, persona: str, *, scope: str | None = None) -> None:
     """Switch the active persona for a user."""
     await _ensure_loaded()
-    key = _user_key(user_id)
+    key = _user_key(user_id, scope)
     if key not in _memory:
         _memory[key] = {"persona": persona, "history": []}
     else:

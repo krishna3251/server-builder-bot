@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from utils.interactions import acknowledged, respond, defer_response
+
+import asyncio
+import copy
 import json
 import logging
 import os
@@ -10,12 +14,13 @@ from typing import Any
 
 import aiofiles
 import discord
-from services.error_service import SafeView, SafeModal
+from services.error_service import SafeView
 from discord import app_commands
 from discord.ext import commands
 
 import config
-from services.embed_service import error_embed, success_embed, warning_embed
+from services.embed_service import error_embed, info_embed, success_embed, warning_embed
+from utils.storage import write_json_atomic
 from utils.paginator import Paginator
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
@@ -26,6 +31,7 @@ log = logging.getLogger("cogs.moderation")
 # ── Persistent warnings store ───────────────────────────────────────────────
 _warnings: dict[str, list[dict[str, Any]]] = {}
 _warnings_loaded: bool = False
+_warnings_lock = asyncio.Lock()
 
 
 async def _load_warnings() -> None:
@@ -37,15 +43,13 @@ async def _load_warnings() -> None:
             async with aiofiles.open(config.WARNINGS_FILE, "r", encoding="utf-8") as f:
                 raw = await f.read()
                 _warnings = json.loads(raw) if raw.strip() else {}
-        except Exception:
-            _warnings = {}
+        except Exception as exc:
+            raise RuntimeError("Warning data could not be read; refusing to overwrite it.") from exc
     _warnings_loaded = True
 
 
 async def _save_warnings() -> None:
-    os.makedirs(os.path.dirname(config.WARNINGS_FILE), exist_ok=True)
-    async with aiofiles.open(config.WARNINGS_FILE, "w", encoding="utf-8") as f:
-        await f.write(json.dumps(_warnings, indent=2))
+    await write_json_atomic(config.WARNINGS_FILE, _warnings)
 
 
 def _warn_key(guild_id: int, user_id: int) -> str:
@@ -83,20 +87,31 @@ class ClearWarningsConfirmView(SafeView):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
+            await respond(interaction,
                 "Only the moderator who started this action can confirm it.",
                 ephemeral=True,
             )
+            return False
+        perms = interaction.user.guild_permissions
+        if not (perms.kick_members or perms.ban_members or perms.manage_messages):
+            await respond(interaction, "Your moderation permission is no longer available.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Clear warnings", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         # Defer the component update before loading and saving the warning store.
-        await interaction.response.defer()
-        await _load_warnings()
-        _warnings.pop(_warn_key(self.guild_id, self.member.id), None)
-        await _save_warnings()
+        await defer_response(interaction, )
+        async with _warnings_lock:
+            await _load_warnings()
+            key = _warn_key(self.guild_id, self.member.id)
+            previous = _warnings.pop(key, None)
+            try:
+                await _save_warnings()
+            except Exception:
+                if previous is not None:
+                    _warnings[key] = previous
+                raise
         for child in self.children:
             child.disabled = True
         em = success_embed(
@@ -140,19 +155,22 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to kick", reason="Reason for kick")
     @app_commands.checks.has_permissions(kick_members=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(kick_members=True)
     async def kick(self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided") -> None:
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
         if not is_above(interaction.user, user):
-            return await interaction.response.send_message(embed=error_embed("Error", "You cannot kick someone with a higher role."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "You cannot kick someone with a higher role."), ephemeral=True)
         if not bot_can_act(interaction.guild, user):
-            return await interaction.response.send_message(embed=error_embed("Error", "I cannot kick this user (role hierarchy)."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "I cannot kick this user (role hierarchy)."), ephemeral=True)
 
         dm_em = warning_embed("Kicked", f"You were kicked from **{interaction.guild.name}**.\nReason: {reason}")
         await _dm_user(user, dm_em)
         await user.kick(reason=reason)
 
         em = success_embed("Kicked", f"**{user}** has been kicked.\nReason: {reason}")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
         log_em = warning_embed("Member Kicked", f"**{user}** by {interaction.user.mention}\nReason: {reason}")
         await _mod_log(interaction.guild, log_em)
 
@@ -161,21 +179,24 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to ban", reason="Reason for ban", delete_days="Days of messages to delete (0-7)")
     @app_commands.checks.has_permissions(ban_members=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(ban_members=True)
     async def ban(
         self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided", delete_days: app_commands.Range[int, 0, 7] = 0
     ) -> None:
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
         if not is_above(interaction.user, user):
-            return await interaction.response.send_message(embed=error_embed("Error", "You cannot ban someone with a higher role."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "You cannot ban someone with a higher role."), ephemeral=True)
         if not bot_can_act(interaction.guild, user):
-            return await interaction.response.send_message(embed=error_embed("Error", "I cannot ban this user (role hierarchy)."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "I cannot ban this user (role hierarchy)."), ephemeral=True)
 
         dm_em = warning_embed("Banned", f"You were banned from **{interaction.guild.name}**.\nReason: {reason}")
         await _dm_user(user, dm_em)
         await interaction.guild.ban(user, reason=reason, delete_message_days=min(delete_days, 7))
 
         em = success_embed("Banned", f"**{user}** has been banned.\nReason: {reason}")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
         log_em = warning_embed("Member Banned", f"**{user}** by {interaction.user.mention}\nReason: {reason}")
         await _mod_log(interaction.guild, log_em)
 
@@ -184,45 +205,51 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user_id="The user ID to unban")
     @app_commands.checks.has_permissions(ban_members=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(ban_members=True)
     async def unban(self, interaction: discord.Interaction, user_id: str) -> None:
         assert interaction.guild is not None
         try:
             user = await self.bot.fetch_user(int(user_id))
             await interaction.guild.unban(user, reason=f"Unbanned by {interaction.user}")
             em = success_embed("Unbanned", f"**{user}** has been unbanned.")
-            await interaction.response.send_message(embed=em)
+            await respond(interaction, embed=em)
         except discord.NotFound:
-            await interaction.response.send_message(embed=error_embed("Error", "User not found or not banned."), ephemeral=True)
+            await respond(interaction, embed=error_embed("Error", "User not found or not banned."), ephemeral=True)
         except ValueError:
-            await interaction.response.send_message(embed=error_embed("Invalid user ID", "Enter a numeric Discord user ID."), ephemeral=True)
+            await respond(interaction, embed=error_embed("Invalid user ID", "Enter a numeric Discord user ID."), ephemeral=True)
 
     # ── /mute ─────────────────────────────────────────────────────────────
     @app_commands.command(name="mute", description="Timeout a member.")
     @app_commands.describe(user="Member to mute", duration="Duration (e.g. 10m, 2h, 1d)", reason="Reason")
     @app_commands.checks.has_permissions(moderate_members=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(moderate_members=True)
     async def mute(
         self, interaction: discord.Interaction, user: discord.Member, duration: str, reason: str = "No reason provided"
     ) -> None:
         assert interaction.guild is not None and isinstance(interaction.user, discord.Member)
         if not is_above(interaction.user, user):
-            return await interaction.response.send_message(embed=error_embed("Error", "You cannot mute someone with a higher role."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "You cannot mute someone with a higher role."), ephemeral=True)
         if not bot_can_act(interaction.guild, user):
-            return await interaction.response.send_message(embed=error_embed("Error", "I cannot mute this user."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "I cannot mute this user."), ephemeral=True)
 
         try:
             td = parse_duration(duration)
         except ValueError:
-            return await interaction.response.send_message(embed=error_embed("Error", "Invalid duration format. Use e.g. `10m`, `2h`, `1d`."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Error", "Invalid duration format. Use e.g. `10m`, `2h`, `1d`."), ephemeral=True)
 
         if td.total_seconds() <= 0 or td.total_seconds() > 28 * 86400:
-            return await interaction.response.send_message(embed=error_embed("Invalid timeout", "Choose a duration greater than zero and no longer than 28 days."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Invalid timeout", "Choose a duration greater than zero and no longer than 28 days."), ephemeral=True)
         await user.timeout(td, reason=reason)
         dm_em = warning_embed("Muted", f"You were muted in **{interaction.guild.name}** for {duration}.\nReason: {reason}")
         await _dm_user(user, dm_em)
 
         em = success_embed("Muted", f"**{user}** muted for **{duration}**.\nReason: {reason}")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
         log_em = warning_embed("Member Muted", f"**{user}** by {interaction.user.mention} for {duration}\nReason: {reason}")
         await _mod_log(interaction.guild, log_em)
 
@@ -231,24 +258,30 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to unmute")
     @app_commands.checks.has_permissions(moderate_members=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(moderate_members=True)
     async def unmute(self, interaction: discord.Interaction, user: discord.Member) -> None:
         assert interaction.guild is not None
         if not is_above(interaction.user, user) or not bot_can_act(interaction.guild, user):
-            return await interaction.response.send_message(embed=error_embed("Role hierarchy", "You and the bot must outrank this member."), ephemeral=True)
+            return await respond(interaction, embed=error_embed("Role hierarchy", "You and the bot must outrank this member."), ephemeral=True)
         await user.timeout(None, reason=f"Unmuted by {interaction.user}")
         em = success_embed("Unmuted", f"**{user}** has been unmuted.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /clear ────────────────────────────────────────────────────────────
     @app_commands.command(name="clear", description="Bulk delete messages.")
     @app_commands.describe(amount="Number of messages to delete (1-100)", user="Only delete messages from this user")
     @app_commands.checks.has_permissions(manage_messages=True)
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(manage_messages=True)
     async def clear(
         self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100], user: discord.Member | None = None
     ) -> None:
-        assert interaction.guild is not None and isinstance(interaction.channel, discord.TextChannel)
-        await interaction.response.defer(ephemeral=True)
+        assert interaction.guild is not None and isinstance(interaction.channel, (discord.TextChannel, discord.Thread))
+        await defer_response(interaction, ephemeral=True)
 
         def check(m: discord.Message) -> bool:
             return user is None or m.author.id == user.id
@@ -262,25 +295,31 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to warn", reason="Reason for warning")
     @mod_only()
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
     async def warn(self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided") -> None:
         assert interaction.guild is not None
-        await _load_warnings()
-        k = _warn_key(interaction.guild.id, user.id)
-        if k not in _warnings:
-            _warnings[k] = []
-        _warnings[k].append({
-            "reason": reason,
-            "moderator": interaction.user.id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        await _save_warnings()
-
-        count = len(_warnings[k])
+        if not is_above(interaction.user, user):
+            return await respond(interaction, embed=error_embed("Role hierarchy", "You must outrank the member you warn."), ephemeral=True)
+        async with _warnings_lock:
+            await _load_warnings()
+            k = _warn_key(interaction.guild.id, user.id)
+            previous = copy.deepcopy(_warnings.get(k))
+            _warnings.setdefault(k, []).append({"reason": reason[:2000], "moderator": interaction.user.id, "timestamp": datetime.now(timezone.utc).isoformat()})
+            try:
+                await _save_warnings()
+            except Exception:
+                if previous is None:
+                    _warnings.pop(k, None)
+                else:
+                    _warnings[k] = previous
+                raise
+            count = len(_warnings[k])
         dm_em = warning_embed("Warning", f"You received a warning in **{interaction.guild.name}**.\nReason: {reason}\nTotal warnings: {count}")
         await _dm_user(user, dm_em)
 
         em = success_embed("Warned", f"**{user}** warned (#{count}).\nReason: {reason}")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
         log_em = warning_embed("Member Warned", f"**{user}** by {interaction.user.mention}\nReason: {reason}\nTotal: {count}")
         await _mod_log(interaction.guild, log_em)
@@ -300,13 +339,15 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to check")
     @mod_only()
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def warnings(self, interaction: discord.Interaction, user: discord.Member) -> None:
         assert interaction.guild is not None
         await _load_warnings()
         k = _warn_key(interaction.guild.id, user.id)
-        warns = _warnings.get(k, [])
+        warns = copy.deepcopy(_warnings.get(k, []))
         if not warns:
-            return await interaction.response.send_message(embed=success_embed("No Warnings", f"**{user}** has no warnings."), ephemeral=True)
+            return await respond(interaction, embed=success_embed("No Warnings", f"**{user}** has no warnings."), ephemeral=True)
 
         pages: list[discord.Embed] = []
         for offset in range(0, len(warns), 5):
@@ -327,9 +368,9 @@ class ModerationCog(commands.Cog, name="Moderation"):
             pages.append(page)
 
         if len(pages) == 1:
-            return await interaction.response.send_message(embed=pages[0], ephemeral=True)
+            return await respond(interaction, embed=pages[0], ephemeral=True)
         view = Paginator(pages, author_id=interaction.user.id)
-        await interaction.response.send_message(embed=pages[0], view=view, ephemeral=True)
+        await respond(interaction, embed=pages[0], view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -340,13 +381,15 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to clear warnings for")
     @mod_only()
     @guild_only()
+    @acknowledged(ephemeral=True)
+    @app_commands.guild_only()
     async def clearwarnings(self, interaction: discord.Interaction, user: discord.Member) -> None:
         assert interaction.guild is not None
         await _load_warnings()
         k = _warn_key(interaction.guild.id, user.id)
         count = len(_warnings.get(k, []))
         if count == 0:
-            return await interaction.response.send_message(
+            return await respond(interaction,
                 embed=success_embed("No warnings to clear", f"**{user.display_name}** has no recorded warnings."),
                 ephemeral=True,
             )
@@ -361,7 +404,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
             f"This will permanently remove **{count}** warning(s) recorded for {user.mention}. "
             "This action cannot be undone.",
         )
-        await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+        await respond(interaction, embed=em, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -372,36 +415,45 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(channel="Target channel", seconds="Slowmode delay in seconds (0 to disable)")
     @app_commands.checks.has_permissions(manage_channels=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(manage_channels=True)
     async def slowmode(self, interaction: discord.Interaction, channel: discord.TextChannel, seconds: app_commands.Range[int, 0, 21600]) -> None:
         await channel.edit(slowmode_delay=seconds)
         em = success_embed("Slowmode", f"Slowmode for {channel.mention} set to **{seconds}s**.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /lock ─────────────────────────────────────────────────────────────
     @app_commands.command(name="lock", description="Lock a channel (prevent sending messages).")
     @app_commands.describe(channel="Channel to lock")
     @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def lock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = False
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
         em = success_embed("Locked", f"{channel.mention} has been locked.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
     # ── /unlock ───────────────────────────────────────────────────────────
     @app_commands.command(name="unlock", description="Unlock a channel.")
     @app_commands.describe(channel="Channel to unlock")
     @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def unlock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = None
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
         em = success_embed("Unlocked", f"{channel.mention} has been unlocked.")
-        await interaction.response.send_message(embed=em)
+        await respond(interaction, embed=em)
 
 
 async def setup(bot: commands.Bot) -> None:
