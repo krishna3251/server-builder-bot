@@ -1,5 +1,7 @@
 # Environment secrets
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -22,3 +24,7 @@ ticket_config.json
 
 # Runtime data files (ephemeral on Render)
 data/
+
+# Project-local development environments
+.venv/
+venv/

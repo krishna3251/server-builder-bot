@@ -94,7 +94,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the current issue register, all 57 executable commands, verified checks, and remaining limitations. [UPDATE_REPORT.md](UPDATE_REPORT.md) preserves the earlier review.
+See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the original 57-command audit, verified checks and limitations; the server butler adds two commands documented below. [UPDATE_REPORT.md](UPDATE_REPORT.md) preserves the earlier review.
 
 
 ### JSON examples and command recovery
@@ -106,3 +106,19 @@ Commands acknowledge before slow work. Read-only results provide Refresh/Command
 `/ai` replies privately and keeps memory separate per server; `/ai_reset` affects the current scope. AI cannot inspect live state or execute bot actions. `/poll` uses single-choice dropdown votes for one hour (or until restart). `/remind` persists its deadline, `/reminders` lists saved reminders, and `/reminder_cancel` removes one of your own references. Reminder DMs may fail if blocked; delivery retries are bounded and may repeat after a crash between delivery and recording completion.
 
 Shop XP Boost purchases now enable double message XP for one hour, stacking time on repeat purchases. Badge/colour entries remain collectibles or staff-fulfilled vouchers, not automatic Discord role grants.
+
+## Server butler
+
+Repeat `@everyone`/`@here` messages within three hours are removed, with a polite,
+rate-limited DM asking the sender to stop. Administrators and the server owner
+follow the same rule. The bot owner receives private incident/audit notices,
+today's first-start snapshot and a daily ledger of joins, departures and each
+person's observed voice joins/time. Ordinary message text and voice audio are
+not collected. Missing historical activity is clearly marked as unknown.
+
+Use `/butler status` (administrator/owner) and `/butler report` (bot owner).
+Reports default to **00:05 Asia/Kolkata** for the previous day. Keep `data/`
+persistent, allow owner DMs, and grant Manage Messages and View Audit Log.
+See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) and [.env.example](.env.example) for
+setup, retention, first-report behavior and limitations. The first real report
+requires the updated bot to be deployed and connected to Discord.

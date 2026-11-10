@@ -60,6 +60,14 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "`/ai_persona` — choose its response style\n"
         "`/ai_reset` — clear your conversation memory",
     ),
+    "butler": (
+        "🎩 Server butler",
+        "`/butler status` — administrators: check collection and permissions\n"
+        "`/butler report [date]` — bot owner: private daily activity ledger\n\n"
+        "Repeat @everyone/@here messages within three hours are removed, including those from administrators and the server owner. "
+        "Courtesy DMs are throttled. The bot owner receives private incident, audit and daily reports. "
+        "Voice reports track presence, not audio; unobserved history is marked incomplete.",
+    ),
     "utility": (
         "🔧 Utility & analytics",
         "`/ping` · `/serverinfo` · `/userinfo` · `/roleinfo`\n"
@@ -79,6 +87,7 @@ class HelpCategorySelect(discord.ui.Select):
             discord.SelectOption(label="Moderation", value="moderation", emoji="🛡️"),
             discord.SelectOption(label="Economy & Leveling", value="economy", emoji="💰"),
             discord.SelectOption(label="AI Assistant", value="ai", emoji="✨"),
+            discord.SelectOption(label="Server Butler", value="butler", emoji="🎩"),
             discord.SelectOption(label="Utilities & Analytics", value="utility", emoji="🔧"),
         ]
         super().__init__(
