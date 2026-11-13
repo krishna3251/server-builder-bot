@@ -30,6 +30,14 @@ A full-featured Discord bot built with **discord.py 2.x** featuring:
    ```
    Or use `start_bot.bat` on Windows.
 
+## Admin and owner spam protection
+
+The moderation cog automatically watches new messages from the server owner and human members with Administrator. It checks each account across channels and threads in the same server. It selects three copies of the same nonempty text within 30 seconds (ignoring case and extra whitespace), three actual `@everyone` or `@here` pings within 15 seconds, or eight messages within eight seconds. It deletes messages matching those windows, including the first copies. Fast legitimate conversations can also meet the flood threshold.
+
+Grant the bot **View Channel** and **Manage Messages** wherever cleanup is needed, and enable the Message Content Intent. Its role can stay in its current position. Detection uses recent events in memory and starts fresh on restart. The bot can only clean up while connected and permitted to delete messages. Already delivered notifications may still be visible.
+
+The bot alerts the affected account and the server owner by DM, and posts incident counts to the configured `MOD_LOG_CHANNEL_ID`. Alerts are limited to one per account per server per minute. Failed removals appear in the hosting logs even when DMs are closed.
+
 ## Requirements
 
 - Python 3.10+
