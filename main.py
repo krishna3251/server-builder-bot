@@ -55,6 +55,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.presences = False
+intents.moderation = True
+intents.voice_states = True
 
 
 class ServerBot(commands.Bot):

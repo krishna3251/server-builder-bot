@@ -102,7 +102,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the current issue register, all 57 executable commands, verified checks, and remaining limitations. [UPDATE_REPORT.md](UPDATE_REPORT.md) preserves the earlier review.
+See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the original 57-command audit, verified checks and limitations; the server butler adds two commands documented below. [UPDATE_REPORT.md](UPDATE_REPORT.md) preserves the earlier review.
 
 
 ### JSON examples and command recovery
@@ -114,3 +114,48 @@ Commands acknowledge before slow work. Read-only results provide Refresh/Command
 `/ai` replies privately and keeps memory separate per server; `/ai_reset` affects the current scope. AI cannot inspect live state or execute bot actions. `/poll` uses single-choice dropdown votes for one hour (or until restart). `/remind` persists its deadline, `/reminders` lists saved reminders, and `/reminder_cancel` removes one of your own references. Reminder DMs may fail if blocked; delivery retries are bounded and may repeat after a crash between delivery and recording completion.
 
 Shop XP Boost purchases now enable double message XP for one hour, stacking time on repeat purchases. Badge/colour entries remain collectibles or staff-fulfilled vouchers, not automatic Discord role grants.
+
+## Server butler
+
+Repeat `@everyone`/`@here` messages within three hours are removed, with a polite,
+rate-limited DM asking the sender to stop. Administrators and the server owner
+follow the same rule. The bot owner receives private incident/audit notices,
+today's first-start snapshot and a daily ledger of joins, departures and each
+person's observed voice joins/time. Ordinary message text and voice audio are
+not collected. Missing historical activity is clearly marked as unknown.
+
+Use `/butler status` (administrator/owner) and `/butler report` (bot owner).
+Reports default to **00:05 Asia/Kolkata** for the previous day. Keep `data/`
+persistent, allow owner DMs, and grant Manage Messages and View Audit Log.
+See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) and [.env.example](.env.example) for
+setup, retention, first-report behavior and limitations. The first real report
+requires the updated bot to be deployed and connected to Discord.
+
+## Private security and quarantine
+
+The bot uses Discord Components V2 for the command center, main builder panel, security console and compact command results. Existing ticket, shop, JSON and detailed build controls keep their specialized workflows. Install `discord.py>=2.6.0,<3.0` from `requirements.txt`.
+
+| Command | Purpose |
+| --- | --- |
+| `/create_channel name kind category private` | Create a text channel, voice channel or category. A private channel initially admits its creator, the bot and administrators. |
+| `/builder_panel` | Open the new builder panel, including channel creation. |
+| `/security` | Open the administrator's private permission and recovery status. |
+| `/quarantine_setup staff_role` | Create a hidden category, review channel and marker role, then add restrictions to existing channels. The staff role is optional. Repeat to repair a partial setup. |
+| `/quarantine member reason` | Suspend editable roles and channel access, saving a durable recovery record. |
+| `/sudo_ban member reason` | Apply the same reversible quarantine. The member stays in the guild. |
+| `/quarantine_release member` | Restore saved roles and channel access. Repeat after fixing permissions if release is partial. |
+| `/butler status` | Check private reporting and activity collection. |
+| `/butler report [date]` | Bot owner only, privately open the activity ledger. |
+| `/bot_profile` | Bot application owner only, refresh the dynamic public description and presence. |
+
+Quarantine setup requires Administrator on the caller. Apply/release requires Moderate Members and Manage Roles on the caller, plus the normal actor/target hierarchy checks. The bot needs View Channel, Send Messages, Read Message History, Manage Channels and Manage Roles and must outrank every role it suspends or restores. Existing role order is preserved. The owner is protected. Targets with privileged everyone/managed/uneditable roles are refused. The quarantine marker has zero guild permissions and is neither hoisted nor mentionable. Deleted resources can be recreated by rerunning setup.
+
+Per-member channel overwrites enforce quarantine even where other roles explicitly allow access. Channels created during quarantine and members who leave/rejoin are reconciled. Voice disconnection additionally needs Move Members. Failed restrictions produce a partial result, which can be retried. Roles that gained permissions during quarantine require staff review before restoration. Changes to overwrite fields made independently by staff are preserved on release when they differ from the bot's last applied values.
+
+Timeouts, automatic warning timeouts, kicks, bans, quarantines and releases generate private receipts to both the bot application owner and the server owner. Successful bot actions are recorded in the daily ledger. The original `/ban` remains available for an actual Discord ban. Use `/sudo_ban` for quarantine. Daily bot-owner reports run at **00:05 Asia/Kolkata** by default, with retryable delivery and the first available today's report on startup. Configure `BUTLER_OWNER_ID` for the report recipient and `BUTLER_REPORT_HOUR`/`BUTLER_REPORT_MINUTE` for another local time. DMs must be open.
+
+Moderation command replies are ephemeral. The configured moderation log is skipped when ordinary members can view it. Quarantine spaces are hidden from ordinary members. Server owners and Administrators retain Discord's visibility bypass, and members can still observe role/profile changes. The bot cannot guarantee invisible moderation or stop an owner removing its permissions. New channels created by other clients are protected when Discord delivers their creation events.
+
+`BOT_CREATOR_NAME=luffyanna` supplies the public creator credit. The application description and presence refresh every 15 minutes with the version and server count. Private incident counts stay in private reports. These updates use the application description API, and require a running bot with a valid token.
+
+Keep `data/quarantine.json` and `data/butler.sqlite3` on persistent storage and run one bot process for these local stores. After restart, active records and channel restrictions are reconciled. Partial releases remain recorded for explicit staff completion. Hidden channels are marked incomplete and never used for permission snapshots. Discord API writes span multiple requests, so an interruption can leave a partial operation. Review `/security`, `/butler status` and hosting logs before treating a partial result as complete.

@@ -22,6 +22,7 @@ import config
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from utils.storage import write_json_atomic
 from utils.paginator import Paginator
+from services.moderation_notices import notify_action
 from services.spam_guard import PrivilegedSpamGuard
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
@@ -63,6 +64,18 @@ async def _mod_log(guild: discord.Guild, embed: discord.Embed) -> None:
         return
     ch = guild.get_channel(config.MOD_LOG_CHANNEL_ID)
     if ch and isinstance(ch, discord.TextChannel):
+        if ch.permissions_for(guild.default_role).view_channel:
+            log.warning("Public moderation log skipped: guild=%s channel=%s", guild.id, ch.id)
+            return
+        for target, overwrite in ch.overwrites.items():
+            if overwrite.view_channel is not True:
+                continue
+            permissions = getattr(target, 'guild_permissions', getattr(target, 'permissions', discord.Permissions.none()))
+            if target.id not in (guild.owner_id, guild.me.id) and not (
+                permissions.administrator or permissions.manage_guild or permissions.moderate_members
+            ):
+                log.warning("Moderation log with nonstaff access skipped: guild=%s channel=%s", guild.id, ch.id)
+                return
         try:
             await ch.send(embed=embed)
         except discord.HTTPException:
@@ -205,7 +218,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to kick", reason="Reason for kick")
     @app_commands.checks.has_permissions(kick_members=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(kick_members=True)
     async def kick(self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided") -> None:
@@ -216,8 +229,9 @@ class ModerationCog(commands.Cog, name="Moderation"):
             return await respond(interaction, embed=error_embed("Error", "I cannot kick this user (role hierarchy)."), ephemeral=True)
 
         dm_em = warning_embed("Kicked", f"You were kicked from **{interaction.guild.name}**.\nReason: {reason}")
-        await _dm_user(user, dm_em)
         await user.kick(reason=reason)
+        await _dm_user(user, dm_em)
+        await notify_action(self.bot, interaction.guild, interaction.user, user, "kick", reason, interaction.id)
 
         em = success_embed("Kicked", f"**{user}** has been kicked.\nReason: {reason}")
         await respond(interaction, embed=em)
@@ -229,7 +243,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to ban", reason="Reason for ban", delete_days="Days of messages to delete (0-7)")
     @app_commands.checks.has_permissions(ban_members=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(ban_members=True)
     async def ban(
@@ -242,8 +256,9 @@ class ModerationCog(commands.Cog, name="Moderation"):
             return await respond(interaction, embed=error_embed("Error", "I cannot ban this user (role hierarchy)."), ephemeral=True)
 
         dm_em = warning_embed("Banned", f"You were banned from **{interaction.guild.name}**.\nReason: {reason}")
-        await _dm_user(user, dm_em)
         await interaction.guild.ban(user, reason=reason, delete_message_days=min(delete_days, 7))
+        await _dm_user(user, dm_em)
+        await notify_action(self.bot, interaction.guild, interaction.user, user, "ban", reason, interaction.id)
 
         em = success_embed("Banned", f"**{user}** has been banned.\nReason: {reason}")
         await respond(interaction, embed=em)
@@ -255,7 +270,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user_id="The user ID to unban")
     @app_commands.checks.has_permissions(ban_members=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(ban_members=True)
     async def unban(self, interaction: discord.Interaction, user_id: str) -> None:
@@ -275,7 +290,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to mute", duration="Duration (e.g. 10m, 2h, 1d)", reason="Reason")
     @app_commands.checks.has_permissions(moderate_members=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(moderate_members=True)
     async def mute(
@@ -287,6 +302,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
         if not bot_can_act(interaction.guild, user):
             return await respond(interaction, embed=error_embed("Error", "I cannot mute this user."), ephemeral=True)
 
+        if user.guild_permissions.administrator:
+            return await respond(interaction, embed=error_embed("Timeout unavailable", "Discord exempts Administrator accounts from timeouts."), ephemeral=True)
         try:
             td = parse_duration(duration)
         except ValueError:
@@ -295,6 +312,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
         if td.total_seconds() <= 0 or td.total_seconds() > 28 * 86400:
             return await respond(interaction, embed=error_embed("Invalid timeout", "Choose a duration greater than zero and no longer than 28 days."), ephemeral=True)
         await user.timeout(td, reason=reason)
+        await notify_action(self.bot, interaction.guild, interaction.user, user, "timeout", f"{duration} • {reason}", interaction.id)
         dm_em = warning_embed("Muted", f"You were muted in **{interaction.guild.name}** for {duration}.\nReason: {reason}")
         await _dm_user(user, dm_em)
 
@@ -308,7 +326,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to unmute")
     @app_commands.checks.has_permissions(moderate_members=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(moderate_members=True)
     async def unmute(self, interaction: discord.Interaction, user: discord.Member) -> None:
@@ -345,7 +363,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(user="Member to warn", reason="Reason for warning")
     @mod_only()
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     async def warn(self, interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided") -> None:
         assert interaction.guild is not None
@@ -375,12 +393,13 @@ class ModerationCog(commands.Cog, name="Moderation"):
         await _mod_log(interaction.guild, log_em)
 
         # Auto-mute on 3rd warning
-        if count >= 3 and count % 3 == 0 and interaction.user.guild_permissions.moderate_members and bot_can_act(interaction.guild, user) and is_above(interaction.user, user):
+        if count >= 3 and count % 3 == 0 and interaction.guild.me.guild_permissions.moderate_members and not user.guild_permissions.administrator and interaction.user.guild_permissions.moderate_members and bot_can_act(interaction.guild, user) and is_above(interaction.user, user):
             try:
                 td = parse_duration("1h")
                 await user.timeout(td, reason=f"Auto-mute: {count} warnings reached")
+                await notify_action(self.bot, interaction.guild, interaction.user, user, "automatic timeout", f"1 hour after {count} warnings", interaction.id)
                 auto_em = warning_embed("Auto-Muted", f"**{user}** auto-muted for 1h after reaching {count} warnings.")
-                await interaction.followup.send(embed=auto_em)
+                await interaction.followup.send(embed=auto_em, ephemeral=True)
             except Exception:
                 pass
 
@@ -465,7 +484,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(channel="Target channel", seconds="Slowmode delay in seconds (0 to disable)")
     @app_commands.checks.has_permissions(manage_channels=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(manage_channels=True)
     async def slowmode(self, interaction: discord.Interaction, channel: discord.TextChannel, seconds: app_commands.Range[int, 0, 21600]) -> None:
@@ -478,7 +497,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(channel="Channel to lock")
     @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def lock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
@@ -494,7 +513,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
     @app_commands.describe(channel="Channel to unlock")
     @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
-    @acknowledged(ephemeral=False)
+    @acknowledged(ephemeral=True)
     @app_commands.guild_only()
     @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def unlock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:

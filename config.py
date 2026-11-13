@@ -64,5 +64,8 @@ SHOP_FILE: str = f"{DATA_DIR}/economy/shop.json"
 
 # ── Bot Meta ──────────────────────────────────────────────────────────────
 BOT_NAME: str = "ServerBot"
-BOT_VERSION: str = "2.2.0"
+BOT_VERSION: str = "2.3.0"
 BOT_COLOR: int = 0x5865F2       # blurple
+
+# Public creator credit, shown in the dynamic application description/presence.
+BOT_CREATOR_NAME: str = os.getenv("BOT_CREATOR_NAME", "luffyanna").strip()[:80] or "luffyanna"
