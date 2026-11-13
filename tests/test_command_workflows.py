@@ -79,7 +79,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             for path in Path('cogs').glob('*.py'):
                 if not path.name.startswith('_'):
                     await bot.load_extension('cogs.' + path.stem)
-        self.assertEqual(len(bot.extensions), 9)
+        self.assertEqual(len(bot.extensions), 11)
         all_commands = list(bot.tree.walk_commands())
         for command in all_commands:
             with self.subTest(command=command.qualified_name):

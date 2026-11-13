@@ -29,7 +29,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
     ),
     "builder": (
         "🧱 Server builder",
-        "**Quick start:** `/builder_panel` · **JSON reference:** `/json_example`\n"
+        "**Create one channel:** `/create_channel`\n**Quick start:** `/builder_panel` · **JSON reference:** `/json_example`\n"
         "**Commands:** `/setup_server`, `/setup_custom`, `/server_json`, `/json_example`, `/json_validate`, `/generate_server`, `/channel_summaries`\n\n"
         "Review previews before applying changes. Cleaning an existing server is destructive.",
     ),
@@ -44,7 +44,8 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "🛡️ Moderation",
         "`/kick` · `/ban` · `/unban` · `/mute` · `/unmute`\n"
         "`/warn` · `/warnings` · `/clearwarnings` · `/clear`\n"
-        "`/slowmode` · `/lock` · `/unlock`\n\n"
+        "`/slowmode` · `/lock` · `/unlock`\n"
+        "`/security` · `/quarantine_setup` · `/quarantine` · `/sudo_ban` · `/quarantine_release`\n\n"
         "Moderation commands require the relevant server permissions and respect role hierarchy.",
     ),
     "economy": (
@@ -59,6 +60,14 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "`/ai` — private chat, with separate memory per server\n"
         "`/ai_persona` — choose its response style\n"
         "`/ai_reset` — clear your conversation memory",
+    ),
+    "butler": (
+        "🎩 Server butler",
+        "`/butler status` — administrators: check collection and permissions\n"
+        "`/butler report [date]` — bot owner: private daily activity ledger\n\n"
+        "Repeat @everyone/@here messages within three hours are removed, including those from administrators and the server owner. "
+        "Courtesy DMs are throttled. The bot owner receives private incident, audit and daily reports. "
+        "Voice reports track presence, not audio; unobserved history is marked incomplete.",
     ),
     "utility": (
         "🔧 Utility & analytics",
@@ -79,6 +88,7 @@ class HelpCategorySelect(discord.ui.Select):
             discord.SelectOption(label="Moderation", value="moderation", emoji="🛡️"),
             discord.SelectOption(label="Economy & Leveling", value="economy", emoji="💰"),
             discord.SelectOption(label="AI Assistant", value="ai", emoji="✨"),
+            discord.SelectOption(label="Server Butler", value="butler", emoji="🎩"),
             discord.SelectOption(label="Utilities & Analytics", value="utility", emoji="🔧"),
         ]
         super().__init__(
@@ -101,28 +111,47 @@ class HelpCategorySelect(discord.ui.Select):
         key = self.values[0]
         for option in self.options:
             option.default = option.value == key
-        title, description = _HELP_PAGES[key]
-        em = info_embed(title, description)
-        add_usage_footer(em, "Command guide")
-        await interaction.response.edit_message(embed=em, view=view)
+        view.show_page(key)
+        await interaction.response.edit_message(view=view)
 
 
-class CommandHelpView(SafeView):
-    """Private dropdown help navigation so the command list stays readable."""
+class CommandHelpView(discord.ui.LayoutView):
+    """Components V2 command center with private, owner-locked navigation."""
 
     def __init__(self, owner_id: int) -> None:
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.owner_id = owner_id
-        self.message: discord.Message | None = None
-        self.add_item(HelpCategorySelect())
+        self.message = None
+        self.card = discord.ui.Container(accent_colour=config.BOT_COLOR)
+        self.add_item(self.card)
+        self.add_item(discord.ui.ActionRow(HelpCategorySelect()))
+        self.show_page('overview')
 
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            child.disabled = True
+    def show_page(self, key):
+        title, description = _HELP_PAGES[key]
+        self.card.clear_items()
+        self.card.add_item(discord.ui.TextDisplay('## ' + title + '\n' + description))
+        self.card.add_item(discord.ui.Separator())
+        self.card.add_item(discord.ui.TextDisplay('-# Created by ' + config.BOT_CREATOR_NAME + ' • v' + config.BOT_VERSION))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message('This command center belongs to the person who opened it.', ephemeral=True)
+            return False
+        return True
+
+    async def on_error(self, interaction, error, item):
+        from services.error_service import respond_error
+        await respond_error(interaction, error, context='Command center')
+
+    async def on_timeout(self):
+        for child in self.walk_children():
+            if hasattr(child, 'disabled'):
+                child.disabled = True
         if self.message is not None:
             try:
                 await self.message.edit(view=self)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            except discord.HTTPException:
                 pass
 
 
@@ -145,16 +174,8 @@ class UtilityCog(commands.Cog, name="Utility"):
     @app_commands.command(name="help", description="Open the interactive command guide.")
     @acknowledged(ephemeral=True)
     async def help(self, interaction: discord.Interaction) -> None:
-        title, description = _HELP_PAGES["overview"]
-        em = info_embed(title, description)
-        em.add_field(
-            name="Featured commands",
-            value="`/builder_panel` · `/shop` · `/rank` · `/ai`",
-            inline=False,
-        )
-        add_usage_footer(em, "Select a category below")
         view = CommandHelpView(interaction.user.id)
-        await respond(interaction, embed=em, view=view, ephemeral=True)
+        await respond(interaction, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -302,6 +323,8 @@ class UtilityCog(commands.Cog, name="Utility"):
             manage_roles=True,
             manage_messages=True,
             manage_guild=True,
+            view_audit_log=True,
+            move_members=True,
             moderate_members=True,
             kick_members=True,
             ban_members=True,

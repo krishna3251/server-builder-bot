@@ -19,6 +19,70 @@ from services.embed_service import error_embed, info_embed, success_embed, warni
 from services.json_builder import build_server, _validate_schema, preflight_build
 
 
+class ModernBuilderPanel(discord.ui.LayoutView):
+    """Current Discord UI entry point for the existing guarded build workflows."""
+    def __init__(self, cog, owner_id, command_channel_id, guild):
+        super().__init__(timeout=180)
+        self.cog, self.owner_id, self.command_channel_id = cog, owner_id, command_channel_id
+        self.message = None
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay('## Build your community\nChoose a starting point, review the plan and apply it.'),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(f'**{len(guild.channels)}** channels • **{len(guild.roles)}** roles\n'
+                                   '`/create_channel` creates one channel. `/security` opens moderation setup.'),
+            accent_colour=0x5865F2))
+        presets = discord.ui.Button(label='Browse presets', style=discord.ButtonStyle.primary)
+        presets.callback = self.open_presets
+        custom = discord.ui.Button(label='Custom JSON', style=discord.ButtonStyle.secondary)
+        custom.callback = self.open_custom
+        ai = discord.ui.Button(label='Describe with AI', style=discord.ButtonStyle.secondary)
+        ai.callback = self.open_ai
+        channel = discord.ui.Button(label='Create a channel', style=discord.ButtonStyle.success)
+        channel.callback = self.open_channel
+        self.add_item(discord.ui.ActionRow(presets, custom, ai))
+        self.add_item(discord.ui.ActionRow(channel))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id or not interaction.guild or not interaction.user.guild_permissions.administrator:
+            await respond(interaction, 'The administrator who opened this panel must use its controls.', ephemeral=True, view=None)
+            return False
+        return True
+
+    async def open_presets(self, interaction):
+        view = PresetPickerView(self.cog, self.owner_id, self.command_channel_id)
+        await interaction.response.send_message(embed=info_embed('Choose a layout', 'Select a preset to review its roles, categories and channels.'), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
+
+    async def open_custom(self, interaction):
+        await interaction.response.send_modal(CustomSchemaModal(self.cog, owner_id=self.owner_id,
+                                              command_channel_id=self.command_channel_id, build_label='Custom build'))
+
+    async def open_ai(self, interaction):
+        await interaction.response.send_modal(AIThemeModal(self.cog, owner_id=self.owner_id,
+                                              command_channel_id=self.command_channel_id))
+
+    async def open_channel(self, interaction):
+        from cogs.security import ChannelCreateModal
+        security = self.cog.bot.get_cog('Security')
+        if security is None:
+            return await respond(interaction, 'The security module is unavailable. Check /diagnostics.', ephemeral=True, view=None)
+        await interaction.response.send_modal(ChannelCreateModal(security, self.owner_id))
+
+    async def on_error(self, interaction, error, item):
+        from services.error_service import respond_error
+        await respond_error(interaction, error, context='Builder panel')
+
+    async def on_timeout(self):
+        for child in self.walk_children():
+            if hasattr(child, 'disabled'):
+                child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 class BuilderQuickstartView(SafeView):
     """Interactive quick-start menu that opens the actual builder workflows."""
 
@@ -900,23 +964,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     @app_commands.checks.has_permissions(administrator=True)
     @acknowledged(ephemeral=True)
     async def builder_panel(self, interaction: discord.Interaction) -> None:
-        guild = interaction.guild
-        em = info_embed("🧱 Build your community", "**Step 1 of 3 · Choose your starting point**\nPick a preset, paste your own plan, or describe your server to AI.")
-        em.set_author(name=guild.name, **({"icon_url": guild.icon.url} if guild.icon else {}))
-        em.add_field(name="🧩 Presets", value="Gaming · Community\nStudy · Business", inline=True)
-        em.add_field(name="🛠️ Custom JSON", value="Your structure, roles,\nand channel permissions", inline=True)
-        em.add_field(name="✨ AI generator", value="Describe a theme,\nthen review its plan", inline=True)
-        em.add_field(name="This server", value=f"**{len(guild.channels)}** channels · **{len(guild.roles)}** roles · **{guild.member_count or len(guild.members)}** members", inline=False)
-        required = ("manage_channels", "manage_roles")
-        missing = [p.replace("_", " ") for p in required if not getattr(guild.me.guild_permissions, p, False)]
-        em.add_field(name="Builder readiness", value="⚠️ Missing: " + ", ".join(missing) if missing else "✅ Channel and role permissions ready. Each plan gets a full check before building.", inline=False)
-        em.set_footer(text="Choose → Review → Build • Existing resources are kept by default")
-        view = BuilderQuickstartView(
-            self,
-            owner_id=interaction.user.id,
-            command_channel_id=self._safe_command_channel_id(interaction),
-        )
-        await respond(interaction, embed=em, view=view, ephemeral=True)
+        view = ModernBuilderPanel(self, interaction.user.id, self._safe_command_channel_id(interaction), interaction.guild)
+        await respond(interaction, view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:

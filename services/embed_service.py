@@ -25,7 +25,7 @@ def _base(title: str, description: str, colour: int) -> discord.Embed:
         colour=colour,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
-    em.set_footer(text=f"{config.BOT_NAME} • v{config.BOT_VERSION}")
+    em.set_footer(text=f"{config.BOT_NAME} • v{config.BOT_VERSION} • Created by {config.BOT_CREATOR_NAME}")
     return em
 
 

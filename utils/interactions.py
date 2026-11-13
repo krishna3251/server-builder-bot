@@ -8,6 +8,7 @@ import discord
 
 from services.embed_service import info_embed
 from services.error_service import SafeView
+from utils.modern_ui import ModernResultView, embed_text
 
 READ_COMMANDS = {
     'ping', 'serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'uptime',
@@ -31,9 +32,10 @@ def acknowledged(*, ephemeral=True):
             extras = getattr(interaction, 'extras', None)
             if not isinstance(extras, dict):
                 extras = interaction.extras = {}
-            command = getattr(interaction, 'command', None)
+            command = getattr(interaction, 'command', None) or extras.get('result_command')
             if getattr(command, 'name', '') in READ_COMMANDS:
                 async def refresh(current):
+                    current.extras['result_command'] = command
                     for predicate in command.checks:
                         if not await discord.utils.maybe_coroutine(predicate, current):
                             raise discord.app_commands.CheckFailure('Permission check failed.')
@@ -58,12 +60,23 @@ async def respond(interaction, content=None, **kwargs):
     extras = getattr(interaction, 'extras', {})
     if not isinstance(extras, dict):
         extras = {}
-    command = getattr(interaction, 'command', None)
+    command = getattr(interaction, 'command', None) or extras.get('result_command')
     if 'view' not in kwargs and 'file' not in kwargs and 'files' not in kwargs and command is not None:
         name = getattr(command, 'qualified_name', '')
         if isinstance(name, str) and name:
-            kwargs['view'] = ResultView(interaction.user.id, refresh=extras.get('result_refresh'))
+            embed = kwargs.get('embed')
+            if content is None and embed is not None and len(embed_text(embed)) <= 3900 and not embed.image.url and not embed.thumbnail.url:
+                kwargs.pop('embed')
+                kwargs['embeds'] = []
+                kwargs['view'] = ModernResultView(interaction.user.id, embed, refresh=extras.get('result_refresh'))
+            else:
+                kwargs['view'] = ResultView(interaction.user.id, refresh=extras.get('result_refresh'))
     view = kwargs.get('view')
+    if extras.get('result_modern') and not isinstance(view, discord.ui.LayoutView):
+        # Discord cannot remove the V2 flag. Large or image-bearing refreshed
+        # results therefore need a new message to retain every field and image.
+        extras['result_followup'] = True
+        return await interaction.followup.send(content=content, **kwargs)
     if not interaction.response.is_done():
         result = await interaction.response.send_message(content=content, **kwargs)
     elif interaction.response.type in (discord.InteractionResponseType.deferred_channel_message, discord.InteractionResponseType.deferred_message_update):
@@ -77,7 +90,7 @@ async def respond(interaction, content=None, **kwargs):
         result = await interaction.edit_original_response(content=content, **kwargs)
     else:
         result = await interaction.followup.send(content=content, **kwargs)
-    if isinstance(view, ResultView):
+    if isinstance(view, (ResultView, ModernResultView)):
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -109,15 +122,16 @@ class ResultView(SafeView):
         try:
             await defer_response(interaction)
             await self.refresh_callback(interaction)
+            if not interaction.extras.get('result_followup'):
+                self.stop()
         finally:
             self.busy = False
 
     @discord.ui.button(label='Command guide', emoji='📚', style=discord.ButtonStyle.secondary)
     async def guide(self, interaction, button):
-        from cogs.utility import CommandHelpView, _HELP_PAGES
-        title, description = _HELP_PAGES['overview']
+        from cogs.utility import CommandHelpView
         view = CommandHelpView(interaction.user.id)
-        await respond(interaction, embed=info_embed(title, description), view=view, ephemeral=True)
+        await respond(interaction, view=view, ephemeral=True)
         view.message = await interaction.original_response()
 
     @discord.ui.button(label='Close', style=discord.ButtonStyle.secondary)
