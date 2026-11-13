@@ -22,6 +22,7 @@ import config
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from utils.storage import write_json_atomic
 from utils.paginator import Paginator
+from services.spam_guard import PrivilegedSpamGuard
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
 from utils.helpers import parse_duration
@@ -149,6 +150,55 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.spam_guard = PrivilegedSpamGuard()
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        batch, alert = self.spam_guard.observe(message)
+        if not batch:
+            return
+        guild = message.guild
+        assert guild is not None
+        # Delete by captured ID, even in different channels or threads. A channel
+        # history purge could also pick up innocent messages between copies.
+        by_channel = {}
+        for item in batch:
+            by_channel.setdefault(item.channel, []).append(item)
+        missed = 0
+        for channel, items in by_channel.items():
+            if len(items) > 1 and isinstance(channel, (discord.TextChannel, discord.Thread)):
+                try:
+                    await channel.delete_messages(items)
+                    continue
+                except discord.Forbidden:
+                    missed += len(items)
+                    continue
+                except discord.HTTPException:
+                    # A concurrent delete or failed batch must not skip surviving copies.
+                    pass
+            for item in items:
+                try:
+                    await item.delete()
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    missed += 1
+        if missed:
+            log.warning("Spam cleanup incomplete: guild=%s author=%s unconfirmed=%s",
+                        guild.id, message.author.id, missed)
+        if alert:
+            log.warning("Privileged-account spam detected: guild=%s author=%s matched=%s",
+                        guild.id, message.author.id, len(batch))
+            details = (
+                f"Server ID: {guild.id} • Account ID: {message.author.id}\n"
+                f"Flagged messages: {len(batch)} • Removal unconfirmed: {missed}\n"
+                "If this activity was unexpected, secure the account and review its active sessions."
+            )
+            embed = warning_embed("Possible privileged-account spam", details)
+            await _mod_log(guild, embed)
+            await _dm_user(message.author, embed)
+            if guild.owner is not None and guild.owner_id != message.author.id:
+                await _dm_user(guild.owner, embed)
 
     # ── /kick ─────────────────────────────────────────────────────────────
     @app_commands.command(name="kick", description="Kick a member from the server.")
