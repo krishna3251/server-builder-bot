@@ -36,9 +36,10 @@ user_limit: 0–99; topic: at most 1024 characters. Thread auto_archive:
 
 JSON uses double quotes, lowercase true/false, no comments, and no trailing
 commas. Upload UTF-8 JSON up to 256 KB. Only administrators can build, and bot
-permissions/capacity are checked before changes. Keep clean_existing:false
-unless you intend to permanently delete existing content. AI produces a draft;
-validation does not guarantee a good design or replace permission review.
+permissions and capacity are checked before changes. Review the Channel access
+section and confirm the layout. Server owners can request cleanup after a
+replacement build and must approve the separate list of resources to delete.
+AI generates a draft for review before any server changes.
 '''
 
 
@@ -50,9 +51,22 @@ def parse_plan(raw: str) -> dict:
             raise ValueError('Close the JSON code block before submitting it.')
         text = '\n'.join(lines[1:-1])
     try:
-        schema = json.loads(text)
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f'Duplicate JSON field: {key[:100]}')
+                result[key] = value
+            return result
+
+        def invalid_constant(value):
+            raise ValueError(f'Invalid JSON number: {value}')
+
+        schema = json.loads(text, object_pairs_hook=unique_object, parse_constant=invalid_constant)
     except json.JSONDecodeError as exc:
         raise ValueError(f'Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}.') from None
+    except RecursionError:
+        raise ValueError('The JSON plan is nested too deeply.') from None
     _validate_schema(schema)
     if not schema.get('roles') and not schema.get('categories'):
         raise ValueError('Add at least one role or category.')
@@ -113,7 +127,11 @@ async def generate_plan(theme: str, user_id: int) -> dict:
         if raw.startswith('⚠'):
             raise ValueError(raw)
         try:
-            return parse_plan(raw)
+            plan = parse_plan(raw)
+            if any(permission.lower() == 'administrator' for role in plan.get('roles', [])
+                   for permission in role.get('permissions', [])):
+                raise ValueError('AI plans cannot grant Administrator.')
+            return plan
         except ValueError as exc:
             if attempt:
                 raise ValueError('The AI draft failed schema validation twice. Try a simpler theme or edit /json_example.') from None

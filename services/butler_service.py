@@ -399,8 +399,8 @@ class ButlerService:
                     else:
                         await self.store.postpone(job["id"])
                     continue
-                payload = json.loads(job["payload"])
                 try:
+                    payload = json.loads(job["payload"])
                     if job["kind"] == "moderation" and not job["recipient"]:
                         recipient = await self.resolve_application_owner()
                     else:

@@ -121,6 +121,56 @@ class BuildTests(unittest.IsolatedAsyncioTestCase):
         role.delete.assert_awaited_once()
         self.assertFalse(builder._BUILD_LOCKS)
 
+    async def test_replacement_resumes_and_cleanup_requires_separate_owner_approval(self):
+        guild = self.guild()
+        guild.owner_id = 10
+        guild.me.roles = []
+        safe = SimpleNamespace(id=90, name='builder', category_id=None, delete=AsyncMock())
+        old = SimpleNamespace(id=91, name='old-chat', category_id=None, delete=AsyncMock(),
+                              permissions_for=lambda member: discord.Permissions(manage_channels=True))
+        later = SimpleNamespace(id=92, name='new-staff-chat', category_id=None, delete=AsyncMock())
+        category = MagicMock(spec=discord.CategoryChannel)
+        category.id = 60
+        category.name = 'Replacement'
+        category.category_id = None
+        role = MagicMock(spec=discord.Role)
+        role.id = 70
+        role.name = 'Member'
+        guild.channels = [safe, old]
+        guild.get_channel.side_effect = lambda identifier: next((channel for channel in guild.channels if channel.id == identifier), None)
+        guild.get_channel_or_thread.side_effect = guild.get_channel.side_effect
+        guild.get_role.side_effect = lambda identifier: role if identifier == role.id else None
+        guild.create_role = AsyncMock(return_value=role)
+        async def create_category(**kwargs):
+            guild.channels.append(category)
+            return category
+        guild.create_category = AsyncMock(side_effect=create_category)
+        plan = {'roles': [{'name': 'Member'}], 'categories': [{'name': 'Replacement'}]}
+        finalize = AsyncMock(side_effect=[RuntimeError('summary failed'), None])
+
+        with tempfile.TemporaryDirectory() as data, patch.object(config, 'DATA_DIR', data):
+            with self.assertRaisesRegex(RuntimeError, 'summary failed'):
+                await builder.build_server(guild, plan, clean_existing=True, safe_channel_id=safe.id, finalize=finalize)
+            journal = await builder.BuildJournal.load(guild.id, plan)
+            snapshot = journal.state['cleanup']
+            owner = SimpleNamespace(id=guild.owner_id)
+            with self.assertRaisesRegex(ValueError, 'replacement build'):
+                await builder.apply_cleanup(guild, owner, journal.path, snapshot)
+
+            guild.channels.append(later)
+            await builder.build_server(guild, plan, clean_existing=True, safe_channel_id=safe.id, finalize=finalize)
+            old.delete.assert_not_awaited()
+            with self.assertRaisesRegex(ValueError, 'server owner'):
+                await builder.apply_cleanup(guild, SimpleNamespace(id=42), journal.path, snapshot)
+            removed, failures = await builder.apply_cleanup(guild, owner, journal.path, snapshot)
+            self.assertEqual((removed, failures), (1, []))
+
+        guild.create_role.assert_awaited_once()
+        guild.create_category.assert_awaited_once()
+        old.delete.assert_awaited_once()
+        safe.delete.assert_not_awaited()
+        later.delete.assert_not_awaited()
+
 
 class EconomyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -196,9 +246,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         interaction.user.id = 2
         self.assertFalse(await view.interaction_check(interaction))
         interaction.user.id = 1
-        with patch('cogs.server_builder.preflight_build'):
-            await view.confirm.callback(interaction)
-            await view.confirm.callback(interaction)
+        await view.confirm.callback(interaction)
+        await view.confirm.callback(interaction)
         cog._execute_custom_build.assert_awaited_once()
         self.assertTrue(view.is_finished())
 
@@ -376,6 +425,15 @@ class TicketTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError): await task
         manager.config_manager.delete_key.assert_not_awaited()
         self.assertNotIn(10, manager.pending_deletes)
+
+    async def test_pending_deletion_survives_failed_notice(self):
+        error = discord.Forbidden(SimpleNamespace(status=403, reason='Forbidden'), 'No posting permission')
+        store = SimpleNamespace(get_key=AsyncMock(return_value='deadline'), delete_key=AsyncMock())
+        manager = AutoDeleteManager(store)
+        channel = SimpleNamespace(id=10, guild=SimpleNamespace(id=1), send=AsyncMock(side_effect=error), delete=AsyncMock())
+        await manager.schedule_delete(channel, 0, None, b'', 'ticket')
+        channel.delete.assert_awaited_once()
+        store.delete_key.assert_awaited_once_with(1, 'pending_deletions.10')
 
 
 if __name__ == '__main__':

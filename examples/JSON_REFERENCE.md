@@ -28,6 +28,7 @@ user_limit: 0–99; topic: at most 1024 characters. Thread auto_archive:
 
 JSON uses double quotes, lowercase true/false, no comments, and no trailing
 commas. Upload UTF-8 JSON up to 256 KB. Only administrators can build, and bot
-permissions/capacity are checked before changes. Keep clean_existing:false
-unless you intend to permanently delete existing content. AI produces a draft;
-validation does not guarantee a good design or replace permission review.
+permissions and capacity are checked before changes. Review the Channel access
+section and confirm the layout. Server owners can request cleanup after a
+replacement build and must approve the separate list of resources to delete.
+AI generates a draft for review before any server changes.

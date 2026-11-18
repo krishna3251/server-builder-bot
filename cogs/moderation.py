@@ -165,6 +165,18 @@ class ModerationCog(commands.Cog, name="Moderation"):
         self.bot = bot
         self.spam_guard = PrivilegedSpamGuard()
 
+    @staticmethod
+    async def _can_edit_channel(interaction, channel, permission):
+        for member, label in ((interaction.user, "You"), (interaction.guild.me, "I")):
+            permissions = channel.permissions_for(member) if member is not None else discord.Permissions.none()
+            if not permissions.view_channel or not getattr(permissions, permission):
+                name = permission.replace('_', ' ').title()
+                await respond(interaction, embed=error_embed(
+                    "Permission required", f"{label} need View Channel and {name} in the selected channel."
+                ), ephemeral=True)
+                return False
+        return True
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         batch, alert = self.spam_guard.observe(message)
@@ -482,12 +494,12 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /slowmode ─────────────────────────────────────────────────────────
     @app_commands.command(name="slowmode", description="Set slowmode on a channel.")
     @app_commands.describe(channel="Target channel", seconds="Slowmode delay in seconds (0 to disable)")
-    @app_commands.checks.has_permissions(manage_channels=True)
     @guild_only()
     @acknowledged(ephemeral=True)
     @app_commands.guild_only()
-    @app_commands.checks.bot_has_permissions(manage_channels=True)
     async def slowmode(self, interaction: discord.Interaction, channel: discord.TextChannel, seconds: app_commands.Range[int, 0, 21600]) -> None:
+        if not await self._can_edit_channel(interaction, channel, "manage_channels"):
+            return
         await channel.edit(slowmode_delay=seconds)
         em = success_embed("Slowmode", f"Slowmode for {channel.mention} set to **{seconds}s**.")
         await respond(interaction, embed=em)
@@ -495,29 +507,29 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /lock ─────────────────────────────────────────────────────────────
     @app_commands.command(name="lock", description="Lock a channel (prevent sending messages).")
     @app_commands.describe(channel="Channel to lock")
-    @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
     @acknowledged(ephemeral=True)
     @app_commands.guild_only()
-    @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def lock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
+        if not await self._can_edit_channel(interaction, channel, "manage_roles"):
+            return
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = False
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
-        em = success_embed("Locked", f"{channel.mention} has been locked.")
+        em = success_embed("Default posting locked", f"{channel.mention} now denies Send Messages for @everyone. Explicit role and member permissions still apply.")
         await respond(interaction, embed=em)
 
     # ── /unlock ───────────────────────────────────────────────────────────
     @app_commands.command(name="unlock", description="Unlock a channel.")
     @app_commands.describe(channel="Channel to unlock")
-    @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
     @acknowledged(ephemeral=True)
     @app_commands.guild_only()
-    @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def unlock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
+        if not await self._can_edit_channel(interaction, channel, "manage_roles"):
+            return
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = None
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)

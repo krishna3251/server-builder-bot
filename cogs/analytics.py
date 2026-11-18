@@ -39,7 +39,10 @@ async def _ensure_loaded() -> None:
         try:
             async with aiofiles.open(config.ANALYTICS_FILE, "r", encoding="utf-8") as f:
                 raw = await f.read()
-                _data = json.loads(raw) if raw.strip() else {}
+                data = json.loads(raw) if raw.strip() else {}
+                if not isinstance(data, dict):
+                    raise ValueError("Analytics storage must contain a JSON object.")
+                _data = data
         except Exception as exc:
             log.warning("Could not load analytics: %s", exc)
             raise RuntimeError("Analytics could not be read; refusing to overwrite it.") from exc
@@ -48,6 +51,12 @@ async def _ensure_loaded() -> None:
 
 async def _save() -> None:
     await write_json_atomic(config.ANALYTICS_FILE, _data)
+
+
+async def _read_section(guild_id: int, section: str) -> dict[str, int]:
+    async with _data_lock:
+        await _ensure_loaded()
+        return _data.get(str(guild_id), {}).get(section, {}).copy()
 
 
 def _today() -> str:
@@ -154,9 +163,7 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
     @app_commands.guild_only()
     async def analytics_messages(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        await _ensure_loaded()
-        gk = _guild_key(interaction.guild.id)
-        msgs = _data.get(gk, {}).get("messages", {})
+        msgs = await _read_section(interaction.guild.id, "messages")
 
         # Last 7 days
         from datetime import timedelta
@@ -189,10 +196,8 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
     @app_commands.guild_only()
     async def analytics_members(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        await _ensure_loaded()
-        gk = _guild_key(interaction.guild.id)
-        joins = _data.get(gk, {}).get("joins", {})
-        leaves = _data.get(gk, {}).get("leaves", {})
+        joins = await _read_section(interaction.guild.id, "joins")
+        leaves = await _read_section(interaction.guild.id, "leaves")
 
         from datetime import timedelta
         today = datetime.now(timezone.utc).date()
@@ -220,9 +225,7 @@ class AnalyticsCog(commands.Cog, name="Analytics"):
     @app_commands.guild_only()
     async def analytics_commands(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
-        await _ensure_loaded()
-        gk = _guild_key(interaction.guild.id)
-        cmds: dict[str, int] = _data.get(gk, {}).get("commands", {})
+        cmds = await _read_section(interaction.guild.id, "commands")
 
         if not cmds:
             em = info_embed("📊 Command usage", "No command usage has been recorded yet.")

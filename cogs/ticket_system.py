@@ -7,7 +7,6 @@ from __future__ import annotations
 from utils.interactions import acknowledged, respond, defer_response
 
 import asyncio
-import io
 import logging
 from functools import wraps
 from datetime import timedelta
@@ -20,6 +19,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from services.error_service import SafeView, SafeModal, report_error
+from services.ticket_service import archive_ticket, staff_log_channel
 from services.embed_service import add_usage_footer, info_embed, success_embed, warning_embed
 
 load_dotenv()
@@ -30,6 +30,13 @@ TICKET_COOLDOWN_SECONDS: int = 300  # 5 minutes
 AUTO_DELETE_DELAY: int = 10  # seconds before ticket channel is deleted after close
 
 log = logging.getLogger("cogs.ticket_system")
+
+
+def ticket_staff_ids(guild, settings, channel_id=None):
+    saved_roles = settings.get("ticket_staff_roles", {}).get(str(channel_id))
+    if saved_roles is None:
+        saved_roles = (settings.get("support_role_id"), settings.get("mod_role_id"))
+    return {role_id for role_id in saved_roles if role_id is not None and role_id != guild.id}
 
 
 def ticket_transaction(function):
@@ -66,10 +73,6 @@ class AutoDeleteManager:
         self.locks = locks if locks is not None else {}
         self.pending_deletes: dict[int, asyncio.Task] = {}
 
-    async def remove_deadline(self, channel):
-        async with self.locks.setdefault(channel.guild.id, asyncio.Lock()):
-            await self.config_manager.delete_key(channel.guild.id, f"pending_deletions.{channel.id}")
-
     async def schedule_delete(
         self,
         channel: discord.TextChannel,
@@ -79,18 +82,21 @@ class AutoDeleteManager:
         ticket_name: str,
     ) -> None:
         try:
-            await channel.send(
-                f"\u23f3 This ticket channel will be automatically deleted in **{delay} seconds**."
-            )
+            try:
+                await channel.send(f"⏳ This ticket channel will be automatically deleted in **{delay:.0f} seconds**.")
+            except discord.HTTPException:
+                log.warning("Could not post deletion notice for ticket channel %s", channel.id)
             await asyncio.sleep(delay)
-            await channel.delete(reason="Ticket closed — auto-deleted by ticket system.")
-            await self.remove_deadline(channel)
-            log.info("Auto-deleted ticket channel: %s", ticket_name)
-            if channel.id in self.pending_deletes:
-                del self.pending_deletes[channel.id]
-        except discord.NotFound:
-            log.info("Channel %s was already deleted before auto-delete ran.", ticket_name)
-            await self.remove_deadline(channel)
+            async with self.locks.setdefault(channel.guild.id, asyncio.Lock()):
+                key = f"pending_deletions.{channel.id}"
+                if await self.config_manager.get_key(channel.guild.id, key) is None:
+                    return
+                try:
+                    await channel.delete(reason="Ticket closed — auto-deleted by ticket system.")
+                except discord.NotFound:
+                    pass
+                await self.config_manager.delete_key(channel.guild.id, key)
+                log.info("Auto-deleted ticket channel: %s", ticket_name)
         except discord.Forbidden:
             log.error("No permission to delete channel %s.", ticket_name)
         except asyncio.CancelledError:
@@ -141,7 +147,8 @@ class CloseTicketModal(SafeModal, title="Close Ticket"):
 
         member = interaction.user
         role_ids = {r.id for r in getattr(member, "roles", [])}
-        staff = bool(role_ids.intersection({config_data.get("support_role_id"), config_data.get("mod_role_id")})) or member.guild_permissions.manage_guild
+        staff_ids = ticket_staff_ids(interaction.guild, config_data, channel.id)
+        staff = bool(role_ids & staff_ids) or member.guild_permissions.administrator
         if opener_id is None:
             return await interaction.followup.send("This ticket is already closed or is no longer tracked.", ephemeral=True)
         if member.id != opener_id and not staff:
@@ -150,68 +157,59 @@ class CloseTicketModal(SafeModal, title="Close Ticket"):
         # Determine ticket counter from channel name
         ticket_counter_str = channel.name.split("-")[1] if "-" in channel.name else "????"
 
-        # Step 1 \u2014 Send closing embed in channel
+        delay = config_data.get("auto_delete_delay", AUTO_DELETE_DELAY)
+        log_channel = interaction.guild.get_channel(config_data.get("log_channel_id", 0))
+        if not staff_log_channel(log_channel, interaction.guild, staff_ids) or log_channel.id == channel.id:
+            return await interaction.followup.send(
+                "The ticket remains open. Configure a separate, staff-only ticket log channel before closing it.",
+                ephemeral=True,
+            )
+
         close_embed = warning_embed("Ticket closed", "")
         close_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
         close_embed.add_field(name="Reason", value=reason, inline=False)
         close_embed.add_field(
-            name="Closed at",
-            value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
-            inline=True,
+            name="Closed at", value=discord.utils.format_dt(discord.utils.utcnow(), style="F"), inline=True
         )
-        add_usage_footer(
-            close_embed,
-            f"This channel will be deleted in {AUTO_DELETE_DELAY} seconds.",
-        )
+        add_usage_footer(close_embed, f"This channel will be deleted in {delay} seconds.")
 
-        # Step 2 \u2014 Generate transcript
-        messages = [msg async for msg in channel.history(limit=200, oldest_first=True)]
-        transcript_lines: list[str] = []
-        for msg in messages:
-            transcript_lines.append(f"[{msg.created_at}] {msg.author}: {msg.content}")
-        transcript_text = "\n".join(transcript_lines)
-        transcript_bytes = transcript_text.encode("utf-8")
+        log_embed = close_embed.copy()
+        log_embed.title = f"Ticket closed • #{ticket_counter_str}"
+        log_embed.add_field(name="Ticket", value=channel.name, inline=True)
+        log_embed.add_field(name="Opened by", value=f"<@{opener_id}>", inline=True)
+        log_embed.remove_footer()
 
-        # Step 3 \u2014 Post to log channel
-        log_channel_id = config_data.get("log_channel_id")
-        log_channel: Optional[discord.TextChannel] = None
-        if log_channel_id:
-            log_channel = interaction.guild.get_channel(log_channel_id)  # type: ignore[assignment]
-
-        if log_channel:
-            opener_mention = f"<@{opener_id}>" if opener_id else "Unknown"
-            log_embed = warning_embed(f"Ticket closed • #{ticket_counter_str}", "")
-            log_embed.add_field(name="Ticket", value=channel.name, inline=True)
-            log_embed.add_field(name="Opened by", value=opener_mention, inline=True)
-            log_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
-            log_embed.add_field(name="Reason", value=reason, inline=False)
-            log_embed.add_field(
-                name="Closed at",
-                value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
-                inline=True,
-            )
-            transcript_file = discord.File(
-                io.BytesIO(transcript_bytes), filename=f"{channel.name}-transcript.txt"
-            )
-            try:
-                await log_channel.send(embed=log_embed, file=transcript_file)
-            except (discord.Forbidden, discord.HTTPException) as e:
-                reference = report_error(e, context="Saving ticket transcript", guild_id=interaction.guild.id)
-                return await interaction.followup.send(f"The transcript could not be saved. The ticket remains open. Fix log channel permissions and try again. Reference: `{reference}`", ephemeral=True)
-        else:
-            return await interaction.followup.send("The ticket log channel is unavailable. Ask an administrator to run /setup_tickets before closing this ticket.", ephemeral=True)
-
-        # Step 4 \u2014 Lock out the opener
-        if opener_id:
-            opener_member = interaction.guild.get_member(opener_id)
-            if opener_member:
+        opener = interaction.guild.get_member(opener_id)
+        previous = channel.overwrites_for(opener) if opener is not None else discord.PermissionOverwrite()
+        read_only = discord.PermissionOverwrite.from_pair(*previous.pair())
+        read_only.send_messages = False
+        read_only.send_messages_in_threads = False
+        locked = False
+        try:
+            if opener is not None:
+                await channel.set_permissions(opener, overwrite=read_only)
+                locked = True
+            with await archive_ticket(channel, interaction.guild.filesize_limit) as archive:
+                log_channel = interaction.guild.get_channel(log_channel.id)
+                if not staff_log_channel(log_channel, interaction.guild, staff_ids):
+                    raise ValueError("The ticket log channel is no longer staff-only.")
+                archive_file = discord.File(archive, filename=f"{channel.name}-archive.zip")
                 try:
-                    overwrites = channel.overwrites_for(opener_member)
-                    overwrites.send_messages = False
-                    overwrites.view_channel = True
-                    await channel.set_permissions(opener_member, overwrite=overwrites)
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.error("Failed to lock permissions for opener: %s", e)
+                    await log_channel.send(embed=log_embed, file=archive_file, allowed_mentions=discord.AllowedMentions.none())
+                finally:
+                    archive_file.close()
+        except (discord.HTTPException, ValueError) as exc:
+            if locked:
+                try:
+                    await channel.set_permissions(opener, overwrite=None if previous.is_empty() else previous)
+                except discord.HTTPException:
+                    log.exception("Could not restore posting permissions after failed ticket archive")
+            reference = report_error(exc, context="Saving ticket archive", guild_id=interaction.guild.id)
+            return await interaction.followup.send(
+                f"The full archive could not be saved. The ticket remains open. "
+                f"Check channel permissions and the upload limit. Reference: `{reference}`",
+                ephemeral=True,
+            )
 
         # Step 5 \u2014 Remove from config
         if opener_id and str(opener_id) in open_tickets:
@@ -221,12 +219,20 @@ class CloseTicketModal(SafeModal, title="Close Ticket"):
             del claimed_tickets[str(channel.id)]
         config_data["open_tickets"] = open_tickets
         config_data["claimed_tickets"] = claimed_tickets
-        delay = config_data.get("auto_delete_delay", AUTO_DELETE_DELAY)
         config_data.setdefault("pending_deletions", {})[str(channel.id)] = (
             datetime.now(timezone.utc) + timedelta(seconds=delay)
         ).isoformat()
         config_data.get("control_messages", {}).pop(str(channel.id), None)
-        await self.cog.config_manager.save_guild(interaction.guild.id, config_data)
+        config_data.get("ticket_staff_roles", {}).pop(str(channel.id), None)
+        try:
+            await self.cog.config_manager.save_guild(interaction.guild.id, config_data)
+        except Exception:
+            if locked:
+                try:
+                    await channel.set_permissions(opener, overwrite=None if previous.is_empty() else previous)
+                except discord.HTTPException:
+                    log.exception("Could not restore posting permissions after failed ticket save")
+            raise
 
         self.cog._schedule_deletion(channel, delay)
         await interaction.followup.send(embed=close_embed, ephemeral=True)
@@ -263,16 +269,10 @@ class TicketControlView(SafeView):
                 "No ticket config found.", ephemeral=True
             )
 
-        # Permission check \u2014 must have support_role or mod_role
-        support_role_id = config_data.get("support_role_id")
-        mod_role_id = config_data.get("mod_role_id")
         member = interaction.user
         assert isinstance(member, discord.Member)
-
-        has_support = any(r.id == support_role_id for r in member.roles)
-        has_mod = any(r.id == mod_role_id for r in member.roles)
-
-        if not has_support and not has_mod and not member.guild_permissions.manage_guild:
+        staff_ids = ticket_staff_ids(interaction.guild, config_data, interaction.channel.id)
+        if not any(role.id in staff_ids for role in member.roles) and not member.guild_permissions.administrator:
             return await interaction.followup.send(
                 "Only support staff can claim tickets.", ephemeral=True
             )
@@ -596,12 +596,21 @@ class TicketSystem(commands.Cog):
     ) -> None:
         assert interaction.guild is not None
 
+        guild = interaction.guild
+        if guild.id in (support_role.id, mod_role.id):
+            return await respond(interaction, "Select dedicated support and moderation roles. @everyone cannot be a ticket staff role.", ephemeral=True)
+        if not staff_log_channel(log_channel, guild, {support_role.id, mod_role.id}):
+            return await respond(interaction, "Select a log channel that only the designated staff and administrators can view.", ephemeral=True)
+        if not log_channel.permissions_for(interaction.user).view_channel or not ticket_category.permissions_for(interaction.user).view_channel:
+            return await respond(interaction, "You need View Channel in the selected log channel and ticket category.", ephemeral=True)
+
         # Validate bot permissions
         bot_member = interaction.guild.me
         if bot_member is None:
             return await respond(interaction, "Bot membership is unavailable. Retry after the bot reconnects.", ephemeral=True)
         required_perms = {
             "manage_channels": bot_member.guild_permissions.manage_channels,
+            "manage_roles": bot_member.guild_permissions.manage_roles,
             "send_messages": bot_member.guild_permissions.send_messages,
             "attach_files": bot_member.guild_permissions.attach_files,
             "embed_links": bot_member.guild_permissions.embed_links,
@@ -719,6 +728,12 @@ class TicketSystem(commands.Cog):
                 ephemeral=True,
             )
 
+        if interaction.guild.id in (config_data.get("support_role_id"), config_data.get("mod_role_id")):
+            return await interaction.followup.send(
+                "A staff role is misconfigured. Ask an administrator to update the ticket setup.",
+                ephemeral=True,
+            )
+
         # CHECK 2 \u2014 Blacklist
         blacklist: list = config_data.get("blacklisted_users", [])
         if interaction.user.id in blacklist:
@@ -786,7 +801,7 @@ class TicketSystem(commands.Cog):
                 manage_messages=True,
             ),
         }
-        if support_role:
+        if support_role and support_role.id != interaction.guild.id:
             overwrites[support_role] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
@@ -794,7 +809,7 @@ class TicketSystem(commands.Cog):
                 manage_messages=True,
                 attach_files=True,
             )
-        if mod_role:
+        if mod_role and mod_role.id != interaction.guild.id:
             overwrites[mod_role] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
@@ -848,6 +863,7 @@ class TicketSystem(commands.Cog):
                 content=mention_text,
                 embed=ticket_embed,
                 view=control_view,
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role for role in (support_role, mod_role) if role]),
             )
 
             # Save control message ID for later editing (claim)
@@ -859,6 +875,9 @@ class TicketSystem(commands.Cog):
             open_tickets[user_id_str] = ticket_channel.id
             config_data["open_tickets"] = open_tickets
             config_data["ticket_counter"] = counter
+            config_data.setdefault("ticket_staff_roles", {})[str(ticket_channel.id)] = sorted(
+                ticket_staff_ids(interaction.guild, config_data)
+            )
             await self.config_manager.save_guild(interaction.guild.id, config_data)
 
         except Exception:
@@ -945,13 +964,13 @@ class TicketSystem(commands.Cog):
         log_channel_id = config_data.get("log_channel_id")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
-            if log_channel and isinstance(log_channel, discord.TextChannel):
+            if staff_log_channel(log_channel, guild, ticket_staff_ids(guild, config_data, ticket_channel.id)):
                 try:
-                    await log_channel.send(embed=dm_embed)
+                    await log_channel.send(embed=dm_embed, allowed_mentions=discord.AllowedMentions.none())
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.error("Failed to send to log channel: %s", e)
             else:
-                log.warning("Log channel %s not found in guild %s.", log_channel_id, guild.id)
+                log.warning("Ticket log channel %s is unavailable or has nonstaff access in guild %s.", log_channel_id, guild.id)
 
     # ── /cancel_delete ────────────────────────────────────────────────────────
 

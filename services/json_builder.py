@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import discord
 
+import config
+from services.permission_service import AUTOMATIC_ROLE_RESTRICTED
+from utils.storage import write_json_atomic
+
 log = logging.getLogger("services.json_builder")
 _BUILD_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+class BuildInProgress(RuntimeError):
+    """A build or cleanup already owns this guild's reservation."""
 
 
 @asynccontextmanager
@@ -18,12 +29,146 @@ async def build_session(guild_id: int):
     """Cover cleanup and creation with one per-server reservation."""
     lock = _BUILD_LOCKS.setdefault(guild_id, asyncio.Lock())
     if lock.locked():
-        raise RuntimeError("A build is already running in this server. Wait for it to finish.")
+        raise BuildInProgress("A build or cleanup is already running in this server.")
     async with lock:
         try:
             yield
         finally:
             _BUILD_LOCKS.pop(guild_id, None)
+
+
+class BuildJournal:
+    """Remember the Discord resources created for one plan on one server."""
+
+    def __init__(self, path, state):
+        self.path = path
+        self.state = state
+        self.resources = {}
+
+    @classmethod
+    async def load(cls, guild_id, schema):
+        encoded = json.dumps(schema, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode()
+        digest = hashlib.sha256(encoded).hexdigest()
+        return await cls.read(Path(config.DATA_DIR) / 'builds' / str(guild_id) / f'{digest}.json')
+
+    @classmethod
+    async def read(cls, path):
+        try:
+            state = json.loads(await asyncio.to_thread(path.read_text, encoding='utf-8'))
+        except FileNotFoundError:
+            state = {'resources': {}, 'summaries': []}
+        return cls(path, state)
+
+    async def save(self):
+        await write_json_atomic(str(self.path), self.state)
+
+    async def load_resources(self, guild):
+        fetched_roles = None
+        for key, identifier in self.state['resources'].items():
+            if key.startswith('role:'):
+                resource = guild.get_role(identifier)
+                if resource is None:
+                    if fetched_roles is None:
+                        fetched_roles = {role.id: role for role in await guild.fetch_roles()}
+                    resource = fetched_roles.get(identifier)
+            else:
+                resource = guild.get_channel_or_thread(identifier)
+                if resource is None:
+                    try:
+                        resource = await guild.fetch_channel(identifier)
+                    except discord.NotFound:
+                        pass
+            if resource is not None:
+                self.resources[key] = resource
+
+    async def get_or_create(self, key, create, **kwargs):
+        if key in self.resources:
+            return self.resources[key]
+        resource = await create(**kwargs)
+        identifiers = self.state['resources']
+        before = identifiers.get(key)
+        identifiers[key] = resource.id
+        try:
+            await self.save()
+        except Exception:
+            if before is None:
+                identifiers.pop(key, None)
+            else:
+                identifiers[key] = before
+            try:
+                await resource.delete(reason='Could not record server builder resource')
+            except discord.HTTPException:
+                log.exception('Could not remove unrecorded builder resource %s', resource.id)
+            raise
+        self.resources[key] = resource
+        return resource
+
+    async def prepare_cleanup(self, guild, safe_channel_id, protected_channels, protected_roles):
+        safe_channel = guild.get_channel(safe_channel_id)
+        if safe_channel is None:
+            raise ValueError('The command channel must exist before cleanup can be prepared.')
+        resource_ids = set(self.state['resources'].values())
+        protected_channels = protected_channels | resource_ids | {safe_channel_id}
+        protected_channels |= {channel.category_id for channel in guild.channels if channel.id in protected_channels}
+        protected_roles = protected_roles | resource_ids | {role.id for role in guild.me.roles}
+        if 'cleanup' not in self.state:
+            channels = sorted(guild.channels, key=lambda channel: isinstance(channel, discord.CategoryChannel))
+            self.state['cleanup'] = {
+                'channels': [[channel.id, channel.name] for channel in channels],
+                'roles': [[role.id, role.name] for role in guild.roles
+                          if not role.is_default() and not role.managed and role < guild.me.top_role],
+                'completed': False,
+            }
+        plan = self.state['cleanup']
+        plan['channels'] = [item for item in plan['channels'] if item[0] not in protected_channels]
+        plan['roles'] = [item for item in plan['roles'] if item[0] not in protected_roles]
+        await self.save()
+
+
+async def apply_cleanup(guild, actor, journal_path, snapshot, protected_channels=frozenset(), protected_roles=frozenset()):
+    """Remove only the resources specifically listed for this owner's approval."""
+    if actor.id != guild.owner_id:
+        raise ValueError('Only the server owner can approve cleanup.')
+    async with build_session(guild.id):
+        journal = await BuildJournal.read(journal_path)
+        plan = journal.state.get('cleanup')
+        if not journal.state.get('complete') or plan is None:
+            raise ValueError('Finish the replacement build before approving cleanup.')
+        if plan['completed']:
+            return 0, []
+        if any(plan[key] != snapshot[key] for key in ('channels', 'roles')):
+            raise ValueError('The deletion list changed. Open a new cleanup preview before approving it.')
+        if protected_channels.intersection(item[0] for item in plan['channels']) or protected_roles.intersection(item[0] for item in plan['roles']):
+            raise ValueError('The deletion list contains resources now used by tickets or moderation. Reapply the plan to refresh the list.')
+        await journal.load_resources(guild)
+        if set(journal.resources) != set(journal.state['resources']):
+            raise ValueError('The replacement layout is missing resources. Reapply the same build plan first.')
+        me = guild.me
+        if me is None or not me.guild_permissions.manage_roles or not me.guild_permissions.manage_channels:
+            raise ValueError('The bot needs Manage Roles and Manage Channels before cleanup.')
+        channels = [(guild.get_channel(identifier), name) for identifier, name in plan['channels']]
+        roles = [(guild.get_role(identifier), name) for identifier, name in plan['roles']]
+        if any(channel and not channel.permissions_for(me).manage_channels for channel, _ in channels):
+            raise ValueError('The bot cannot manage every listed channel. Check its channel permissions before retrying.')
+        if any(role and (role in me.roles or role.is_default() or role.managed or role >= me.top_role) for role, _ in roles):
+            raise ValueError('The bot cannot manage every listed role. Check role order before retrying.')
+
+        deleted = 0
+        failures = []
+        for resource, name in channels + roles:
+            if resource is None:
+                continue
+            try:
+                await resource.delete(reason=f'Server builder cleanup approved by owner {actor.id}')
+                deleted += 1
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                failures.append(name)
+        if not failures:
+            plan['completed'] = True
+            await journal.save()
+        return deleted, failures
 
 # ── Permission name → discord.Permissions flag mapping ────────────────────
 _PERM_MAP: dict[str, int] = {
@@ -52,14 +197,6 @@ _PERM_MAP: dict[str, int] = {
     "create_public_threads": discord.Permissions.create_public_threads.flag,
     "send_messages_in_threads": discord.Permissions.send_messages_in_threads.flag,
 }
-
-_PRIVILEGED = {
-    "administrator", "manage_guild", "manage_channels", "manage_roles",
-    "manage_messages", "kick_members", "ban_members", "manage_webhooks",
-    "mute_members", "deafen_members", "move_members", "mention_everyone",
-    "view_audit_log",
-}
-
 
 def _resolve_permissions(perm_names: list[str]) -> discord.Permissions:
     """Convert a list of permission name strings to a ``discord.Permissions`` object."""
@@ -126,6 +263,7 @@ async def _build_server_unlocked(
     schema: dict[str, Any],
     progress_msg: discord.Message | None = None,
     created_channel_ids: set[int] | None = None,
+    journal: BuildJournal | None = None,
 ) -> tuple[list[str], dict[str, discord.Role]]:
     """Build roles, categories, and channels in *guild* from *schema*.
 
@@ -137,6 +275,12 @@ async def _build_server_unlocked(
     created_channels: list[discord.abc.GuildChannel] = []
     logs: list[str] = []
     original_guild_name = guild.name
+    renamed = False
+
+    async def create(key, method, **kwargs):
+        if journal is not None:
+            return await journal.get_or_create(key, method, **kwargs)
+        return await method(**kwargs)
 
     # Count total items for progress
     total = len(schema.get("roles", [])) + sum(
@@ -146,16 +290,17 @@ async def _build_server_unlocked(
 
     try:
         # ── Rename server ────────────────────────────────────────────────────
-        if schema.get("server_name"):
+        if journal is None and schema.get("server_name") and schema["server_name"] != guild.name:
             await guild.edit(name=schema["server_name"])
+            renamed = True
             logs.append(f"Renamed server to **{schema['server_name']}**")
 
         # ── Create roles ─────────────────────────────────────────────────────
         role_map: dict[str, discord.Role] = {}
-        for role_data in schema.get("roles", []):
+        for index, role_data in enumerate(schema.get("roles", [])):
             perms = _resolve_permissions(role_data.get("permissions", []))
             colour = _parse_colour(role_data.get("color"))
-            role = await guild.create_role(
+            role = await create(f"role:{index}", guild.create_role,
                 name=role_data["name"],
                 colour=colour,
                 hoist=role_data.get("hoist", False),
@@ -164,13 +309,13 @@ async def _build_server_unlocked(
             )
             created_roles.append(role)
             role_map[role_data["name"]] = role
-            logs.append(f"Created role: **{role.name}**")
+            logs.append(f"Role: **{role.name}**")
             progress.advance()
             if progress_msg:
                 await _update_progress(progress_msg, progress)
 
         # ── Create categories + channels ─────────────────────────────────────
-        for cat_data in schema.get("categories", []):
+        for cat_index, cat_data in enumerate(schema.get("categories", [])):
             # Build permission overwrites for category
             overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
             for ow in cat_data.get("permission_overwrites", []):
@@ -185,14 +330,15 @@ async def _build_server_unlocked(
 
             if guild.me is not None:
                 overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
-            category = await guild.create_category(name=cat_data["name"], overwrites=overwrites)
+            category = await create(f"category:{cat_index}", guild.create_category, name=cat_data["name"], overwrites=overwrites)
             created_channels.append(category)
-            logs.append(f"Created category: **{cat_data['name']}**")
+            logs.append(f"Category: **{cat_data['name']}**")
             progress.advance()
             if progress_msg:
                 await _update_progress(progress_msg, progress)
 
-            for ch_data in cat_data.get("channels", []):
+            for ch_index, ch_data in enumerate(cat_data.get("channels", [])):
+                channel_key = f"channel:{cat_index}:{ch_index}"
                 # ── Per-channel permission overwrites ────────────────────────
                 # Explicit channel overwrites must retain the category's privacy rules.
                 ch_overwrites = dict(overwrites)
@@ -224,10 +370,10 @@ async def _build_server_unlocked(
                     }
                     if ch_overwrites:
                         kwargs["overwrites"] = ch_overwrites
-                    vc = await guild.create_voice_channel(**kwargs)
+                    vc = await create(channel_key, guild.create_voice_channel, **kwargs)
                     created_channels.append(vc)
                     perm_note = f" (perms: {', '.join(o.get('role','') for o in ch_data.get('permission_overwrites', []))})" if ch_overwrites else ""
-                    logs.append(f"Created voice channel: **{ch_data['name']}**{perm_note}")
+                    logs.append(f"Voice channel: **{ch_data['name']}**{perm_note}")
                 else:
                     kwargs: dict[str, Any] = {
                         "name": ch_data["name"],
@@ -238,16 +384,16 @@ async def _build_server_unlocked(
                     }
                     if ch_overwrites:
                         kwargs["overwrites"] = ch_overwrites
-                    tc = await guild.create_text_channel(**kwargs)
+                    tc = await create(channel_key, guild.create_text_channel, **kwargs)
                     created_channels.append(tc)
                     if created_channel_ids is not None:
                         created_channel_ids.add(tc.id)
                     perm_note = f" (perms: {', '.join(o.get('role','') for o in ch_data.get('permission_overwrites', []))})" if ch_overwrites else ""
-                    logs.append(f"Created text channel: **#{ch_data['name']}**{perm_note}")
+                    logs.append(f"Text channel: **#{ch_data['name']}**{perm_note}")
 
                     # Optional thread creation
-                    for thread_data in ch_data.get("threads", []):
-                        await tc.create_thread(
+                    for thread_index, thread_data in enumerate(ch_data.get("threads", [])):
+                        await create(f"thread:{cat_index}:{ch_index}:{thread_index}", tc.create_thread,
                             name=thread_data["name"],
                             type=discord.ChannelType.public_thread,
                             auto_archive_duration=thread_data.get("auto_archive", 1440),
@@ -258,10 +404,19 @@ async def _build_server_unlocked(
                 if progress_msg:
                     await _update_progress(progress_msg, progress)
 
+        if journal is not None and schema.get("server_name") and not journal.state.get('renamed'):
+            if guild.name != schema["server_name"]:
+                await guild.edit(name=schema["server_name"])
+                logs.append(f"Renamed server to **{schema['server_name']}**")
+            journal.state['renamed'] = True
+            await journal.save()
+
     except (Exception, asyncio.CancelledError) as exc:
+        if journal is not None:
+            raise
         log.exception("Build failed; rolling back newly created resources: %s", exc)
         # Restore the server name if this build changed it.
-        if guild.name != original_guild_name:
+        if renamed:
             try:
                 await guild.edit(name=original_guild_name, reason="Server build rollback")
             except discord.HTTPException:
@@ -271,12 +426,12 @@ async def _build_server_unlocked(
             try:
                 await ch.delete(reason="Server build rollback")
             except Exception:
-                pass
+                log.exception("Could not roll back channel %s", ch.id)
         for role in reversed(created_roles):
             try:
                 await role.delete(reason="Server build rollback")
             except Exception:
-                pass
+                log.exception("Could not roll back role %s", role.id)
         raise
 
     return logs, role_map
@@ -336,7 +491,7 @@ def _validate_schema(schema: dict[str, Any]) -> None:
         if not isinstance(auto_assign, str) or auto_assign not in role_names:
             raise ValueError("auto_assign must name a role in this plan.")
         role = next(r for r in roles if r["name"] == auto_assign)
-        if _PRIVILEGED.intersection(p.lower() for p in role.get("permissions", [])):
+        if AUTOMATIC_ROLE_RESTRICTED.intersection(p.lower() for p in role.get("permissions", [])):
             raise ValueError("Privileged roles cannot be automatically assigned to members.")
 
     def overwrites(value):
@@ -349,12 +504,13 @@ def _validate_schema(schema: dict[str, Any]) -> None:
             target = ow["role"]
             if target.lower() != "@everyone" and target not in role_names:
                 raise ValueError(f"Unknown overwrite role: {target}")
-            if target in seen:
+            target_key = "@everyone" if target.lower() == "@everyone" else target
+            if target_key in seen:
                 raise ValueError(f"Duplicate overwrite for role: {target}")
-            seen.add(target)
+            seen.add(target_key)
             permissions(ow.get("allow", []), "Allowed permissions")
             permissions(ow.get("deny", []), "Denied permissions")
-            if (target == auto_assign or target.lower() == "@everyone") and _PRIVILEGED.intersection(p.lower() for p in ow.get("allow", [])):
+            if (target == auto_assign or target.lower() == "@everyone") and AUTOMATIC_ROLE_RESTRICTED.intersection(p.lower() for p in ow.get("allow", [])):
                 raise ValueError("Privileged channel permissions cannot be granted to everyone or the automatic member role.")
             if _resolve_permissions(ow.get("allow", [])).value & _resolve_permissions(ow.get("deny", [])).value:
                 raise ValueError("A permission cannot be both allowed and denied.")
@@ -399,8 +555,8 @@ def _validate_schema(schema: dict[str, Any]) -> None:
         raise ValueError("A build supports at most 100 channels and 100 threads.")
 
 
-def preflight_build(guild: discord.Guild, schema: dict, *, clean_existing: bool = False) -> None:
-    """Check permissions and remaining server capacity before cleanup starts."""
+def preflight_build(guild: discord.Guild, schema: dict, *, existing=()) -> None:
+    """Check permissions and capacity for resources still needed by this plan."""
     _validate_schema(schema)
     me = guild.me
     if me is None:
@@ -409,19 +565,21 @@ def preflight_build(guild: discord.Guild, schema: dict, *, clean_existing: bool 
     if schema.get("server_name"):
         required.add("manage_guild")
     if any(c.get("threads") for cat in schema.get("categories", []) for c in cat.get("channels", [])):
-        required.add("create_public_threads")
+        required.update(("create_public_threads", "send_messages"))
     missing = sorted(p for p in required if not getattr(me.guild_permissions, p, False))
     if missing:
         raise ValueError("Bot needs these server permissions: " + ", ".join(missing))
-    for role in schema.get("roles", []):
+    for index, role in enumerate(schema.get("roles", [])):
         requested = _resolve_permissions(role.get("permissions", []))
-        if requested.value & ~me.guild_permissions.value and not me.guild_permissions.administrator:
+        if f"role:{index}" not in existing and requested.value & ~me.guild_permissions.value and not me.guild_permissions.administrator:
             raise ValueError(f"Bot cannot grant all permissions requested by role {role['name']}.")
-    channels = len(schema.get("categories", [])) + sum(len(c.get("channels", [])) for c in schema.get("categories", []))
-    existing_channels = 1 if clean_existing else len(guild.channels)
-    existing_roles = sum(r.is_default() or r.managed or r >= me.top_role for r in guild.roles) if clean_existing else len(guild.roles)
-    if existing_channels + channels > 500 or existing_roles + len(schema.get("roles", [])) > 250:
-        raise ValueError("This plan exceeds the server's channel or role capacity.")
+    roles = sum(f"role:{i}" not in existing for i in range(len(schema.get("roles", []))))
+    channels = 0
+    for cat_index, category in enumerate(schema.get("categories", [])):
+        channels += f"category:{cat_index}" not in existing
+        channels += sum(f"channel:{cat_index}:{i}" not in existing for i in range(len(category.get("channels", []))))
+    if len(guild.channels) + channels > 500 or len(guild.roles) + roles > 250:
+        raise ValueError("The replacement must fit alongside existing channels and roles.")
 
 
 async def build_server(
@@ -432,23 +590,33 @@ async def build_server(
     clean_existing: bool = False,
     safe_channel_id: int | None = None,
     created_channel_ids: set[int] | None = None,
+    finalize=None,
+    protected_channels=frozenset(),
+    protected_roles=frozenset(),
 ) -> tuple[list[str], dict[str, discord.Role]]:
-    """Validate, reserve this server, then perform cleanup and creation."""
+    """Create the replacement, with optional durable progress and separate cleanup."""
     async with build_session(guild.id):
-        preflight_build(guild, schema, clean_existing=clean_existing)
-        cleanup_logs = []
+        journal = await BuildJournal.load(guild.id, schema) if finalize is not None else None
+        if journal is not None:
+            await journal.load_resources(guild)
+            missing = journal.state['resources'].keys() - journal.resources.keys()
+            has_saved_channels = any(key.startswith(('channel:', 'category:')) for key in journal.resources)
+            if has_saved_channels and any(key.startswith(('role:', 'category:')) for key in missing):
+                raise ValueError('A recorded role or category was deleted while other build resources still exist. Review the current layout and submit a revised plan.')
+        preflight_build(guild, schema, existing=() if journal is None else journal.resources)
+        if journal is not None and journal.state.get('complete'):
+            journal.state['complete'] = False
+            await journal.save()
         if clean_existing:
-            if safe_channel_id is None or guild.get_channel(safe_channel_id) is None:
-                raise ValueError("The command channel must exist before cleanup can start.")
-            for channel in list(guild.channels):
-                if channel.id != safe_channel_id:
-                    await channel.delete(reason="Confirmed server builder cleanup")
-            for role in list(guild.roles):
-                if not (role.is_default() or role.managed or role >= guild.me.top_role):
-                    await role.delete(reason="Confirmed server builder cleanup")
-            cleanup_logs.append("Removed existing channels and eligible roles as confirmed.")
-        logs, role_map = await _build_server_unlocked(guild, schema, progress_msg, created_channel_ids)
-        return cleanup_logs + logs, role_map
+            if journal is None:
+                raise ValueError('Cleanup requires a recorded replacement build and a separate owner approval.')
+            await journal.prepare_cleanup(guild, safe_channel_id, protected_channels, protected_roles)
+        logs, role_map = await _build_server_unlocked(guild, schema, progress_msg, created_channel_ids, journal)
+        if journal is not None:
+            await finalize(role_map, journal)
+            journal.state['complete'] = True
+            await journal.save()
+        return logs, role_map
 
 
 async def _update_progress(msg: discord.Message, progress: BuildProgress) -> None:

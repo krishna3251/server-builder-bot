@@ -16,6 +16,7 @@ from discord.ext import commands
 import config
 from services import level_service, economy_service
 from services.embed_service import add_member_context, info_embed, success_embed, progress_bar
+from services.permission_service import can_assign_reward_role
 from utils.decorators import admin_only, guild_only
 from utils.helpers import format_number
 
@@ -34,7 +35,7 @@ class LevelingCog(commands.Cog, name="Leveling"):
     # ── Passive XP on message ─────────────────────────────────────────────
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or not message.guild:
+        if message.author.bot or not message.guild or message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
 
         key = f"{message.guild.id}_{message.author.id}"
@@ -69,11 +70,11 @@ class LevelingCog(commands.Cog, name="Leveling"):
             role_id = config.LEVEL_ROLES.get(new_level)
             if role_id:
                 role = message.guild.get_role(role_id)
-                if role and isinstance(message.author, discord.Member):
+                if role and isinstance(message.author, discord.Member) and can_assign_reward_role(message.guild, role):
                     try:
                         await message.author.add_roles(role, reason=f"Reached level {new_level}")
                     except discord.HTTPException:
-                        pass
+                        log.warning("Could not assign level reward role %s in guild %s", role.id, message.guild.id)
 
     # ── /rank ─────────────────────────────────────────────────────────────
     @app_commands.command(name="rank", description="View your or another user's rank card.")

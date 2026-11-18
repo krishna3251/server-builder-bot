@@ -50,7 +50,7 @@ class SecurityConsole(discord.ui.LayoutView):
         self.add_item(discord.ui.Container(
             discord.ui.TextDisplay('## Security console\n' + text),
             discord.ui.Separator(),
-            discord.ui.TextDisplay('### Quarantine\n`/quarantine_setup` prepares the private review room.\n'
+            discord.ui.TextDisplay('### Quarantine\n`/quarantine_setup` prepares the private review category.\n'
                                    '`/sudo_ban` or `/quarantine` suspends access.\n'
                                    '`/quarantine_release` restores saved access.'),
             discord.ui.TextDisplay('### Server tools\n`/create_channel` creates a text channel, voice channel or category.\n'
@@ -160,7 +160,7 @@ class SecurityCog(commands.Cog, name='Security'):
         except ValueError as exc:
             return await respond(interaction, str(exc), ephemeral=True)
         failures = settings['failed_channels']
-        text = (f'Private room <#{settings["room"]}> and quarantine role are configured.\n'
+        text = (f'Private category <#{settings["category"]}> and quarantine role are configured.\n'
                 + (f'{len(failures)} channels need permission fixes. Run this command again to retry.' if failures else 'Channel restrictions are ready.'))
         await respond(interaction, embed=success_embed('Quarantine setup', text), ephemeral=True)
 
@@ -225,10 +225,16 @@ class SecurityCog(commands.Cog, name='Security'):
             return await respond(interaction, 'Private channel overwrites also require Manage Roles.', ephemeral=True)
         if not name.strip() or (category and category.guild.id != guild.id):
             return await respond(interaction, 'Enter a channel name and select a category from this server.', ephemeral=True)
-        if category and not category.permissions_for(interaction.user).manage_channels:
-            return await respond(interaction, 'You need Manage Channels in the selected category.', ephemeral=True)
         if kind == 'category' and category is not None:
             return await respond(interaction, 'Categories cannot be nested. Clear the category option.', ephemeral=True)
+        if category is None:
+            if not interaction.user.guild_permissions.manage_channels:
+                return await respond(interaction, 'Creating a top-level channel requires server-wide Manage Channels.', ephemeral=True)
+        else:
+            for member, label in ((interaction.user, 'You'), (guild.me, 'I')):
+                permissions = category.permissions_for(member)
+                if not permissions.view_channel or not permissions.manage_channels:
+                    return await respond(interaction, f'{label} need View Channel and Manage Channels in the selected category.', ephemeral=True)
         async with self.quarantine_service.lock:
             await self.quarantine_service.load()
             settings = self.quarantine_service.state.get(str(guild.id), {})
@@ -291,6 +297,10 @@ class SecurityCog(commands.Cog, name='Security'):
     async def on_guild_channel_update(self, before, after):
         if before.overwrites != after.overwrites or before.category_id != after.category_id:
             await self.on_guild_channel_create(after)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel):
+        await self.quarantine_service.channel_deleted(channel)
 
     @commands.Cog.listener()
     async def on_ready(self):

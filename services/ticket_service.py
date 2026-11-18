@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import io
 import logging
 import os
+import re
+import zipfile
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +18,65 @@ import discord
 import config
 
 log = logging.getLogger("services.ticket")
+
+
+def staff_log_channel(channel, guild, staff_role_ids: set[int]) -> bool:
+    """Verify the channel's visibility rules, including role and member grants."""
+    if not isinstance(channel, discord.TextChannel) or guild.me is None:
+        return False
+    if channel.permissions_for(guild.default_role).view_channel:
+        return False
+    for target, overwrite in channel.overwrites.items():
+        if overwrite.view_channel is not True:
+            continue
+        if target.id == guild.id:
+            return False
+        if target.id in (guild.me.id, guild.owner_id):
+            continue
+        if isinstance(target, discord.Role):
+            if target.id in staff_role_ids or target.permissions.administrator:
+                continue
+        elif isinstance(target, discord.Member):
+            if target.guild_permissions.administrator or any(role.id in staff_role_ids for role in target.roles):
+                continue
+        return False
+    return True
+
+
+async def archive_ticket(channel: discord.TextChannel, max_bytes: int) -> io.BytesIO:
+    """Collect the full channel history and copy attachments before deletion."""
+    archive = io.BytesIO()
+    size = 0
+    attachments = []
+    try:
+        with zipfile.ZipFile(archive, 'w') as output:
+            with output.open('transcript.txt', 'w') as transcript:
+                async for message in channel.history(limit=None, oldest_first=True):
+                    line = f'[{message.created_at.isoformat()}] {message.author} ({message.author.id}): {message.content}\n'
+                    for attachment in message.attachments:
+                        filename = re.sub(r'[^\w. -]', '_', attachment.filename)[-160:]
+                        path = f'attachments/{attachment.id}-{filename}'
+                        line += f'    Attachment: {path}\n'
+                        size += attachment.size + 128 + 2 * len(path.encode('utf-8'))
+                        attachments.append((path, attachment))
+                    data = line.encode('utf-8')
+                    size += len(data)
+                    if size > max_bytes:
+                        raise ValueError('The full ticket archive exceeds the upload limit.')
+                    transcript.write(data)
+            for path, attachment in attachments:
+                data = await attachment.read()
+                size += max(0, len(data) - attachment.size)
+                if size > max_bytes:
+                    raise ValueError('The full ticket archive exceeds the upload limit.')
+                output.writestr(path, data)
+        if archive.tell() > max_bytes:
+            raise ValueError('The full ticket archive exceeds the upload limit.')
+        archive.seek(0)
+        return archive
+    except (Exception, asyncio.CancelledError):
+        archive.close()
+        raise
 
 _tickets: dict[str, Any] = {}  # guild_user -> ticket data
 _loaded: bool = False

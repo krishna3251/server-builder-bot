@@ -24,9 +24,18 @@ class ReminderService:
     async def load(self):
         if self.data is None:
             raw = await asyncio.to_thread(self.path.read_text, encoding='utf-8') if self.path.exists() else '{}'
-            self.data = json.loads(raw)
-            if not isinstance(self.data, dict):
+            data = json.loads(raw)
+            if not isinstance(data, dict):
                 raise ValueError('Reminder storage is invalid.')
+            self.data = data
+
+    async def _commit(self, updated):
+        try:
+            await write_json_atomic(str(self.path), updated)
+        except asyncio.CancelledError:
+            self.data = None
+            raise
+        self.data = updated
 
     async def add(self, user_id, due, message):
         async with self.lock:
@@ -35,15 +44,20 @@ class ReminderService:
                 raise ValueError('You can have at most 10 pending reminders.')
             identifier = uuid.uuid4().hex[:10]
             updated = copy.deepcopy(self.data)
+            failed = [key for key, value in updated.items() if value['user_id'] == user_id and value.get('status') == 'failed']
+            for key in failed[:-10]:
+                del updated[key]
             updated[identifier] = {'user_id': user_id, 'due': due.timestamp(), 'message': message[:2000], 'attempts': 0}
-            await write_json_atomic(str(self.path), updated)
-            self.data = updated
+            await self._commit(updated)
             return identifier
 
     async def list_for(self, user_id):
         async with self.lock:
             await self.load()
-            return {key: copy.deepcopy(value) for key, value in self.data.items() if value['user_id'] == user_id}
+            items = [(key, value) for key, value in self.data.items() if value['user_id'] == user_id]
+            pending = [(key, value) for key, value in items if value.get('status') != 'failed']
+            failed = [(key, value) for key, value in items if value.get('status') == 'failed']
+            return copy.deepcopy(dict(pending + failed[-10:]))
 
     async def cancel(self, user_id, identifier):
         async with self.lock:
@@ -53,8 +67,7 @@ class ReminderService:
                 return False
             updated = copy.deepcopy(self.data)
             del updated[identifier]
-            await write_json_atomic(str(self.path), updated)
-            self.data = updated
+            await self._commit(updated)
             return True
 
     async def deliver_due(self):
@@ -75,8 +88,7 @@ class ReminderService:
                     if updated[key]['attempts'] >= 3:
                         updated[key]['status'] = 'failed'
                     report_error(exc, context='Reminder delivery')
-                await write_json_atomic(str(self.path), updated)
-                self.data = updated
+                await self._commit(updated)
 
     async def run(self):
         await self.bot.wait_until_ready()

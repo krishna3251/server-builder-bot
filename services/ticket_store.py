@@ -47,6 +47,14 @@ class TicketStore:
             await self._load()
             return copy.deepcopy(self._data.get(str(guild_id), {}))
 
+    async def _commit(self, updated):
+        try:
+            await write_json_atomic(str(self.path), updated)
+        except asyncio.CancelledError:
+            self._data = None
+            raise
+        self._data = updated
+
     async def save_guild(self, guild_id, data):
         snapshot = copy.deepcopy(data)
         snapshot.pop('_id', None)
@@ -57,8 +65,7 @@ class TicketStore:
             await self._load()
             updated = copy.deepcopy(self._data)
             updated[str(guild_id)] = snapshot
-            await write_json_atomic(str(self.path), updated)
-            self._data = updated
+            await self._commit(updated)
 
     async def get_key(self, guild_id, key, default=None):
         doc = await self.get_guild(guild_id)
@@ -83,8 +90,7 @@ class TicketStore:
                 doc.pop(parts[-1], None)
             else:
                 doc[parts[-1]] = value
-            await write_json_atomic(str(self.path), updated)
-            self._data = updated
+            await self._commit(updated)
 
     async def set_key(self, guild_id, key, value):
         await self._change_key(guild_id, key, value)

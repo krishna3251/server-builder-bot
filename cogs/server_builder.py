@@ -6,6 +6,7 @@ from asyncio import TimeoutError
 
 from utils.interactions import acknowledged, respond, defer_response
 
+import io
 import json
 import logging
 
@@ -13,10 +14,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from services.template_service import parse_plan, generate_plan
+from services.template_service import parse_plan, generate_plan, read_plan_attachment
 from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
-from services.json_builder import build_server, _validate_schema, preflight_build
+import config
+from services.json_builder import BuildInProgress, apply_cleanup, build_server, _validate_schema
+from services.permission_service import can_assign_reward_role
 
 
 class ModernBuilderPanel(discord.ui.LayoutView):
@@ -386,6 +389,7 @@ class PlanSectionSelect(discord.ui.Select):
             discord.SelectOption(label="Overview", value="overview", emoji="🧱"),
             discord.SelectOption(label="Channels & categories", value="channels", emoji="📁"),
             discord.SelectOption(label="Roles & permissions", value="roles", emoji="🛡️"),
+            discord.SelectOption(label="Channel access", value="access", emoji="🔒"),
         ])
 
     async def callback(self, interaction: discord.Interaction):
@@ -424,16 +428,26 @@ class CustomBuildConfirmView(SafeView):
         self.update_navigation()
         self.build_label = build_label
         self.message: discord.Message | None = None
-        if clean_existing:
-            for child in self.children:
-                if isinstance(child, discord.ui.Button) and child.custom_id == "server_builder_confirm":
-                    child.label = "Delete & build"
-                    child.style = discord.ButtonStyle.danger
+
+    def access_entries(self):
+        for category in self.schema.get("categories", []):
+            locations = [(category['name'], category)]
+            locations.extend((f"{category['name']} / {channel['name']}", channel)
+                             for channel in category.get('channels', []))
+            for location, entry in locations:
+                for overwrite in entry.get('permission_overwrites', []):
+                    allow = ', '.join(overwrite.get('allow', [])) or 'None'
+                    deny = ', '.join(overwrite.get('deny', [])) or 'None'
+                    yield f"{location} · {overwrite['role']}", f"Allow: {allow}\nDeny: {deny}"
+
+    def detail_entries(self):
+        if self.section == "access":
+            return list(self.access_entries())
+        return self.schema.get("categories" if self.section == "channels" else "roles", [])
 
     @property
     def detail_page_count(self):
-        entries = self.schema.get("categories" if self.section == "channels" else "roles", [])
-        return max(1, (len(entries) + 4) // 5) if self.section != "overview" else 1
+        return max(1, (len(self.detail_entries()) + 4) // 5) if self.section != "overview" else 1
 
     def update_navigation(self):
         self.previous.disabled = self.detail_page == 0
@@ -443,8 +457,12 @@ class CustomBuildConfirmView(SafeView):
         embed = self.cog._schema_preview_embed(self.schema, title="Review your server plan", description="Step 2 of 3 · Inspect the plan, then confirm when ready.")
         if self.section != "overview":
             embed.clear_fields()
-            entries = self.schema.get("categories" if self.section == "channels" else "roles", [])
+            entries = self.detail_entries()
             for entry in entries[self.detail_page * 5:(self.detail_page + 1) * 5]:
+                if self.section == "access":
+                    location, value = entry
+                    embed.add_field(name=discord.utils.escape_markdown(location)[:240], value=value[:850], inline=False)
+                    continue
                 if self.section == "channels":
                     lines = [f"{'🔊' if c.get('type') == 'voice' else '#'} {c['name']}" for c in entry.get("channels", [])]
                     value = "\n".join(lines) or "No channels"
@@ -453,11 +471,13 @@ class CustomBuildConfirmView(SafeView):
                 else:
                     value = ", ".join(entry.get("permissions", [])) or "No extra server permissions"
                 embed.add_field(name=entry['name'], value=value[:800], inline=False)
+            if self.section == "access":
+                embed.description += "\nChannel rules inherit the category unless that channel overrides the same permission."
             if not entries:
                 embed.description += "\nNo entries in this section."
             embed.set_footer(text=f"{self.section.title()} • Page {self.detail_page + 1}/{self.detail_page_count} • Export JSON for the complete plan")
         if self.clean_existing:
-            embed.description += "\n⚠️ **Cleanup enabled: existing channels and eligible roles will be deleted.**"
+            embed.description += "\nThe old layout stays in place during the build. Cleanup requires a separate owner approval."
         return embed
 
     @discord.ui.button(label="Previous", emoji="◀", style=discord.ButtonStyle.secondary, row=2)
@@ -495,14 +515,10 @@ class CustomBuildConfirmView(SafeView):
         row=1,
     )
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.started:
-            return await respond(interaction, "This build has already started.", ephemeral=True)
-        if not interaction.guild or not interaction.user.guild_permissions.administrator:
-            return await respond(interaction, "Administrator permission is required to confirm this build.", ephemeral=True)
-        try:
-            preflight_build(interaction.guild, self.schema, clean_existing=self.clean_existing)
-        except ValueError as exc:
-            return await respond(interaction, embed=error_embed("Build needs attention", str(exc)), ephemeral=True)
+        if not await self.interaction_check(interaction):
+            return
+        if self.clean_existing and interaction.user.id != interaction.guild.owner_id:
+            return await respond(interaction, "Only the server owner can prepare cleanup.", ephemeral=True)
         self.started = True
         self.stop()
         for child in self.children:
@@ -538,7 +554,6 @@ class CustomBuildConfirmView(SafeView):
 
     @discord.ui.button(label="Export JSON", emoji="📄", style=discord.ButtonStyle.secondary, row=1)
     async def export(self, interaction: discord.Interaction, button: discord.ui.Button):
-        import io
         data = json.dumps(self.schema, ensure_ascii=False, indent=2).encode("utf-8")
         await respond(interaction, file=discord.File(io.BytesIO(data), filename="server-plan.json"), ephemeral=True)
 
@@ -556,6 +571,51 @@ class CustomBuildConfirmView(SafeView):
 
 
 log = logging.getLogger("cogs.server_builder")
+
+
+class BuildFinalizationError(RuntimeError):
+    """The layout is ready, with remaining role assignments or welcome messages."""
+
+
+class CleanupConfirmView(SafeView):
+    """Apply the saved deletion list only on a separate owner confirmation."""
+
+    def __init__(self, cog, guild_id, owner_id, path, snapshot):
+        super().__init__(timeout=300)
+        self.cog, self.snapshot = cog, snapshot
+        self.guild_id, self.owner_id, self.path = guild_id, owner_id, path
+        self.running = False
+
+    async def interaction_check(self, interaction):
+        guild = interaction.guild
+        if guild is not None and guild.id == self.guild_id and interaction.user.id == self.owner_id == guild.owner_id:
+            return True
+        await respond(interaction, "Only the current server owner can approve this cleanup.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Delete listed resources", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        if not await self.interaction_check(interaction):
+            return
+        if self.running:
+            return await respond(interaction, "Cleanup is already in progress.", ephemeral=True)
+        self.running = True
+        try:
+            await defer_response(interaction, ephemeral=True, thinking=True)
+            channels, roles = await self.cog._cleanup_protections(interaction.guild)
+            deleted, failures = await apply_cleanup(interaction.guild, interaction.user, self.path, self.snapshot, channels, roles)
+            if failures:
+                await respond(interaction, f"Deleted {deleted} resources. {len(failures)} could not be removed. Check the bot’s permissions and click again to retry.", ephemeral=True)
+                return
+            await respond(interaction, f"Cleanup complete. Deleted {deleted} listed resources.", ephemeral=True)
+            button.disabled = True
+            self.stop()
+            await interaction.message.edit(view=self)
+        except (ValueError, BuildInProgress) as exc:
+            await respond(interaction, str(exc), ephemeral=True)
+        finally:
+            self.running = False
+
 
 # ── Preset server templates ──────────────────────────────────────────────────────
 TEMPLATES: dict[str, dict] = {
@@ -956,6 +1016,35 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             return channel.parent_id
         return interaction.channel_id
 
+    async def _cleanup_protections(self, guild):
+        channels = {config.MOD_LOG_CHANNEL_ID, config.TICKET_LOG_CHANNEL_ID}
+        roles = {config.SUPPORT_ROLE_ID}
+        tickets = self.bot.get_cog('TicketSystem')
+        if tickets is not None:
+            settings = await tickets.config_manager.get_guild(guild.id)
+            channels.update(settings.get('open_tickets', {}).values())
+            channels.update(int(identifier) for identifier in settings.get('pending_deletions', {}))
+            channels.update(settings.get(key) for key in ('panel_channel_id', 'log_channel_id', 'ticket_category_id'))
+            roles.update(settings.get(key) for key in ('support_role_id', 'mod_role_id'))
+            for case_roles in settings.get('ticket_staff_roles', {}).values():
+                roles.update(case_roles)
+        security = self.bot.get_cog('Security')
+        if security is not None:
+            async with security.quarantine_service.lock:
+                state = await security.quarantine_service.load()
+                settings = state.get(str(guild.id), {})
+                category = settings.get('category')
+                channels.update((category, settings.get('room')))
+                channels.update(settings.get('review_rooms', []))
+                if category:
+                    channels.update(channel.id for channel in guild.channels if channel.category_id == category)
+                roles.update((settings.get('role'), settings.get('staff')))
+                for record in settings.get('members', {}).values():
+                    channels.add(record.get('room'))
+                    roles.update(record.get('roles', []))
+        channels.update(channel.category_id for channel in guild.channels if channel.id in channels)
+        return channels, roles
+
     @app_commands.command(
         name="builder_panel",
         description="Open the interactive server builder quick-start panel.",
@@ -998,47 +1087,36 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
 
         return "Use this channel for discussions related to its name and category."
 
-    async def _post_created_channel_summaries(
-        self,
-        guild: discord.Guild,
-        schema: dict,
-        actor_mention: str,
-        created_channel_ids: set[int],
-    ) -> tuple[int, int]:
-        sent = 0
-        failed = 0
-
-        for cat in schema.get("categories", []):
-            for ch_data in cat.get("channels", []):
-                if ch_data.get("type", "text").lower() != "text":
+    async def _post_created_channel_summaries(self, guild, schema, actor_mention, journal):
+        sent = failed = 0
+        published = journal.state['summaries']
+        for cat_index, category in enumerate(schema.get("categories", [])):
+            for ch_index, channel_plan in enumerate(category.get("channels", [])):
+                if channel_plan.get("type", "text") != "text":
                     continue
-
-                channel_name = ch_data.get("name", "")
-                if not channel_name:
+                channel = journal.resources[f"channel:{cat_index}:{ch_index}"]
+                if channel.id in published:
                     continue
-
-                channel = next((c for c in guild.text_channels if c.id in created_channel_ids and c.name == channel_name), None)
-                if not channel:
-                    failed += 1
-                    continue
-
                 if not channel.permissions_for(guild.me).send_messages:
                     failed += 1
                     continue
-
-                summary = self._infer_channel_summary(channel_name, ch_data.get("topic"))
-                msg = (
-                    f"\U0001f44b Welcome to {channel.mention}!\n"
-                    f"\U0001f4dd {summary}\n"
-                    f"Created by {actor_mention}."
-                )
-
+                summary = self._infer_channel_summary(channel.name, channel_plan.get("topic"))
+                msg = f"👋 Welcome to {channel.mention}!\n📝 {summary}\nCreated by {actor_mention}."
                 try:
-                    await channel.send(msg)
-                    sent += 1
+                    message = await channel.send(msg, allowed_mentions=discord.AllowedMentions.none())
                 except discord.HTTPException:
                     failed += 1
-
+                    continue
+                published.append(channel.id)
+                try:
+                    await journal.save()
+                except Exception:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException:
+                        log.exception("Could not remove unrecorded welcome message %s", message.id)
+                    raise
+                sent += 1
         return sent, failed
 
     def _build_server_summary_lines(self, guild: discord.Guild) -> list[str]:
@@ -1073,7 +1151,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     )
     @app_commands.describe(
         template="Choose a server template",
-        clean_existing="Delete ALL existing channels/roles first (keeps command channel)",
+        clean_existing="Owner only. Prepare a separate preview to remove the old layout after building",
     )
     @app_commands.choices(
         template=[
@@ -1094,6 +1172,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     ) -> None:
         if not interaction.guild:
             return
+        if clean_existing and interaction.user.id != interaction.guild.owner_id:
+            return await respond(interaction, "Only the server owner can request cleanup.", ephemeral=True)
 
         schema = TEMPLATES.get(template.value)
         if not schema:
@@ -1112,7 +1192,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         preview = self._schema_preview_embed(schema, title=f"🧩 {template.name} preview", description="Step 2 of 3 · Review this preset with the menu below.")
         if clean_existing:
             preview.colour = discord.Colour(0xED4245)
-            preview.description += "\n⚠️ **Cleanup enabled. Existing channels and eligible roles will be deleted. Deleted messages cannot be restored.**"
+            preview.description += "\nCleanup will be offered after the replacement is ready. The server owner must approve the deletion list."
         view = CustomBuildConfirmView(
             self,
             schema,
@@ -1169,7 +1249,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     @app_commands.describe(
         json_text="Paste your server JSON here (or attach a .json file)",
         json_file="Upload a .json file with your server template",
-        clean_existing="Delete ALL existing channels/roles first (keeps command channel)",
+        clean_existing="Owner only. Prepare a separate preview to remove the old layout after building",
     )
     @app_commands.checks.has_permissions(administrator=True)
     @acknowledged(ephemeral=True)
@@ -1183,63 +1263,23 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     ) -> None:
         if not interaction.guild:
             return
+        if clean_existing and interaction.user.id != interaction.guild.owner_id:
+            return await respond(interaction, "Only the server owner can request cleanup.", ephemeral=True)
 
-        await defer_response(interaction, ephemeral=True, thinking=True)
-        # Get JSON from either text or file
-        raw_json: str | None = None
-        if json_file:
-            if not json_file.filename.endswith(".json"):
-                return await interaction.edit_original_response(
-                    embed=error_embed("Error", "Please upload a `.json` file."),
-                )
-            if json_file.size > 256_000:
-                return await interaction.edit_original_response(embed=error_embed("Template too large", "Upload a JSON template smaller than 256 KB."))
-            try:
-                raw_json = (await json_file.read()).decode("utf-8-sig")
-            except UnicodeDecodeError:
-                return await interaction.edit_original_response(embed=error_embed("Invalid encoding", "Save your JSON file as UTF-8 and upload it again."))
-        elif json_text:
-            raw_json = json_text
-        else:
-            return await interaction.edit_original_response(
-                embed=error_embed(
-                    "Error",
-                    "Provide either `json_text` or attach a `.json` file.\nUse `/server_json` to get the schema.",
-                ),
-            )
-
-        # Parse JSON
         try:
-            schema = parse_plan(raw_json)
-        except (json.JSONDecodeError, ValueError) as exc:
-            return await interaction.edit_original_response(
-                embed=error_embed("Invalid JSON", f"Could not parse your JSON:\n`{exc}`"),
-            )
-
-        # Validate the schema before showing a preview or touching server resources.
-        if not isinstance(schema, dict):
-            return await interaction.edit_original_response(
-                embed=error_embed("Invalid Schema", "The JSON root must be an object."),
-            )
-        if not isinstance(schema.get("roles", []), list) or not isinstance(schema.get("categories", []), list):
-            return await interaction.edit_original_response(
-                embed=error_embed("Invalid Schema", "`roles` and `categories` must be arrays."),
-            )
-        if not schema.get("roles") and not schema.get("categories"):
-            return await interaction.edit_original_response(
-                embed=error_embed("Empty Schema", "Add at least one role or category before building."),
-            )
-        try:
-            _validate_schema(schema)
+            if json_file:
+                schema = await read_plan_attachment(json_file)
+            elif json_text:
+                schema = parse_plan(json_text)
+            else:
+                return await respond(interaction, "Provide JSON text or a file. Use /server_json for an example.", ephemeral=True)
         except ValueError as exc:
-            return await interaction.edit_original_response(
-                embed=error_embed("Invalid Server Plan", str(exc)),
-            )
+            return await respond(interaction, embed=error_embed("Invalid server plan", str(exc)[:1000]), ephemeral=True)
 
         preview = self._schema_preview_embed(schema, title="🛠️ Custom server preview", description="Step 2 of 3 · Review your roles, channels, and permissions below.")
         if clean_existing:
             preview.colour = discord.Colour(0xED4245)
-            preview.description += "\n⚠️ **Cleanup enabled. Existing channels and eligible roles will be deleted. Deleted messages cannot be restored.**"
+            preview.description += "\nCleanup will be offered after the replacement is ready. The server owner must approve the deletion list."
         view = CustomBuildConfirmView(
             self,
             schema,
@@ -1270,86 +1310,99 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         if guild is None:
             return
 
-        progress_embed = (
-            warning_embed(
-                "Cleaning server",
-                "Removing existing channels and eligible roles as explicitly confirmed. The command channel is kept.",
-            )
-            if clean_existing
-            else info_embed("Building server", "Starting the build…")
-        )
+        if clean_existing and interaction.user.id != guild.owner_id:
+            return await respond(interaction, "Only the server owner can request cleanup.", ephemeral=True)
         if progress_msg is None:
             progress_msg = await interaction.followup.send(
-                embed=progress_embed,
-                ephemeral=True,
-                wait=True,
+                embed=info_embed("Building server", "Preparing the layout…"), ephemeral=True, wait=True
             )
 
-        created_channel_ids: set[int] = set()
-        structure_built = False
-        try:
-            logs, role_map = await build_server(
-                guild, schema, progress_msg,
-                created_channel_ids=created_channel_ids,
-                clean_existing=clean_existing, safe_channel_id=safe_channel_id,
-            )
-            structure_built = True
-            assign_logs: list[str] = []
+        journal_result = None
+        assignment_logs = []
 
-            for role_data in schema.get("roles", []):
-                if "administrator" in role_data.get("permissions", []):
-                    role = role_map.get(role_data.get("name", ""))
-                    if role and isinstance(interaction.user, discord.Member):
-                        try:
-                            await interaction.user.add_roles(role, reason="Confirmed server build - owner role")
-                            assign_logs.append(f"Assigned **{role.name}** to {interaction.user.mention}")
-                        except discord.HTTPException:
-                            assign_logs.append(f"Could not automatically assign **{role.name}**")
-                    break
+        async def finalize(role_map, journal):
+            nonlocal journal_result
+            journal_result = journal
+            assignment_failures = 0
+            if interaction.user.id == guild.owner_id and isinstance(interaction.user, discord.Member):
+                for role_data in schema.get("roles", []):
+                    if any(p.lower() == "administrator" for p in role_data.get("permissions", [])):
+                        role = role_map[role_data["name"]]
+                        if role not in interaction.user.roles:
+                            try:
+                                await interaction.user.add_roles(role, reason="Confirmed build by server owner")
+                            except discord.HTTPException:
+                                assignment_failures += 1
+                        break
 
-            auto_role_name = schema.get("auto_assign")
-            auto_role = role_map.get(auto_role_name) if auto_role_name else None
-            if auto_role:
+            auto_role = role_map.get(schema.get("auto_assign"))
+            completed_assignments = journal.state.setdefault('assigned_roles', [])
+            if auto_role is not None and auto_role.id not in completed_assignments:
+                if not can_assign_reward_role(guild, auto_role):
+                    raise BuildFinalizationError("The automatic member role now has restricted permissions or is above the bot. Review the role and retry.")
+                quarantined = set()
+                security = self.bot.get_cog('Security')
+                if security is not None:
+                    async with security.quarantine_service.lock:
+                        state = await security.quarantine_service.load()
+                        quarantined = {int(member_id) for member_id in state.get(str(guild.id), {}).get('members', {})}
                 assigned = 0
                 for member in guild.members:
-                    if member.bot or member.id == interaction.user.id:
+                    if member.bot or member.id == interaction.user.id or member.id in quarantined or auto_role in member.roles:
                         continue
                     try:
-                        await member.add_roles(auto_role, reason="Confirmed server build - auto-assign")
+                        await member.add_roles(auto_role, reason="Confirmed server build auto-assignment")
                         assigned += 1
                     except discord.HTTPException:
-                        continue
+                        assignment_failures += 1
                 if assigned:
-                    assign_logs.append(f"Assigned **{auto_role.name}** to **{assigned}** existing members")
+                    assignment_logs.append(f"Assigned **{auto_role.name}** to **{assigned}** existing members")
+                if not assignment_failures:
+                    completed_assignments.append(auto_role.id)
+                    await journal.save()
 
-            sent, failed = await self._post_created_channel_summaries(
-                guild, schema, interaction.user.mention, created_channel_ids
-            )
+            sent, failed = await self._post_created_channel_summaries(guild, schema, interaction.user.mention, journal)
             if sent:
-                assign_logs.append(f"Posted channel summaries in **{sent}** channels")
-            if failed:
-                assign_logs.append(f"Skipped/failed channel summaries in **{failed}** channels")
+                assignment_logs.append(f"Posted channel summaries in **{sent}** channels")
+            if assignment_failures or failed:
+                raise BuildFinalizationError(f"{assignment_failures} role assignments and {failed} channel summaries need a retry.")
 
-            result = "\n".join(logs + assign_logs) or "The build completed without additional log messages."
-            if len(result) > 3900:
-                result = result[:3900] + "\n…"
-            em = success_embed(f"{build_label} complete", result)
-            em.add_field(name="Created roles", value=str(len(role_map)), inline=True)
-            em.add_field(name="Categories", value=str(len(schema.get("categories", []))), inline=True)
-            em.add_field(
-                name="Channels",
-                value=str(sum(len(cat.get("channels", [])) for cat in schema.get("categories", []))),
-                inline=True,
+        try:
+            protected_channels, protected_roles = await self._cleanup_protections(guild) if clean_existing else (set(), set())
+            logs, _ = await build_server(
+                guild, schema, progress_msg, clean_existing=clean_existing,
+                safe_channel_id=safe_channel_id, finalize=finalize,
+                protected_channels=protected_channels, protected_roles=protected_roles,
             )
-            await progress_msg.edit(embed=em)
         except Exception as exc:
-            log.exception("Confirmed custom setup failed: %s", exc)
+            if isinstance(exc, (ValueError, BuildInProgress, BuildFinalizationError)):
+                message = str(exc)[:1000]
+            else:
+                reference = report_error(exc, context=build_label, guild_id=guild.id)
+                message = f"The build was interrupted. Error reference: `{reference}`."
+            from cogs.json_tools import plan_file
             await progress_msg.edit(
-                embed=error_embed(
-                    "Build failed",
-                    ("The server structure was created, but finalization failed.\n" if structure_built else "Resource creation failed; rollback was attempted where possible. Cleanup deletions cannot be restored.\n")
-                    + f"Reference: `{report_error(exc, context=build_label)}`. Check /diagnostics and the bot logs.",
-                )
+                embed=error_embed("Build needs attention", message + "\nRun the same plan again, or upload the attached JSON to /setup_custom to resume."),
+                attachments=[plan_file(schema, 'server-plan.json')],
+            )
+            return
+
+        result = "\n".join(logs + assignment_logs) or "The plan is ready."
+        if len(result) > 3900:
+            result = result[:3900] + "\n…"
+        await progress_msg.edit(embed=success_embed(f"{build_label} complete", result))
+        cleanup = journal_result.state.get('cleanup') if clean_existing else None
+        if cleanup and not cleanup['completed']:
+            channels, roles = cleanup['channels'], cleanup['roles']
+            if not channels and not roles:
+                return
+            lines = ['Channels', *(f'{identifier}  {name}' for identifier, name in channels),
+                     '', 'Roles', *(f'{identifier}  {name}' for identifier, name in roles)]
+            await interaction.followup.send(
+                embed=warning_embed("Review the old layout", f"The replacement is ready. The attached list identifies the {len(channels)} channels and {len(roles)} roles eligible for deletion. Deleted messages and role assignments cannot be restored."),
+                file=discord.File(io.BytesIO("\n".join(lines).encode()), filename='cleanup-preview.txt'),
+                view=CleanupConfirmView(self, guild.id, interaction.user.id, journal_result.path, cleanup),
+                ephemeral=True,
             )
 
     # /channel_summaries \u2014 existing server summary in current chat
@@ -1388,11 +1441,11 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     # \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
     @app_commands.command(
         name="generate_server",
-        description="Generate a server template with an optional review and confirmation step.",
+        description="Generate a server template for private review and confirmation.",
     )
     @app_commands.describe(
         theme="Describe the server theme (e.g., 'gaming community', 'study group')",
-        preview="Show a preview and require confirmation before building",
+        preview="Legacy option. All AI builds now require confirmation.",
     )
     @app_commands.checks.has_permissions(administrator=True)
     @acknowledged(ephemeral=True)
@@ -1402,8 +1455,6 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
     ) -> None:
         if not interaction.guild:
             return
-        await defer_response(interaction, thinking=True, ephemeral=preview)
-
         from cogs.ai import _rate_limited
         if _rate_limited(interaction.user.id):
             return await respond(interaction, embed=error_embed("AI limit", "Try again in a minute."), ephemeral=True)
@@ -1412,27 +1463,16 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         except (ValueError, TimeoutError) as exc:
             return await interaction.edit_original_response(embed=error_embed("AI draft unavailable", str(exc) or "AI timed out. Try again."))
 
-        if preview:
-            em = self._schema_preview_embed(schema, title="✨ AI server preview", description="Step 2 of 3 · Review the generated plan before creating anything.")
-            view = CustomBuildConfirmView(
-                self,
-                schema,
-                owner_id=interaction.user.id,
-                command_channel_id=self._safe_command_channel_id(interaction),
-                build_label=f"AI build · {theme[:50]}",
-            )
-            message = await interaction.edit_original_response(embed=em, view=view)
-            view.message = message
-            return
-
-        progress_em = info_embed("🧱 Building server", "Starting the build…")
-        progress_msg = await interaction.edit_original_response(embed=progress_em)
-
-        await self._execute_custom_build(
-            interaction, schema, clean_existing=False,
-            safe_channel_id=self._safe_command_channel_id(interaction),
-            build_label="AI server build", progress_msg=progress_msg,
+        em = self._schema_preview_embed(schema, title="✨ AI server preview", description="Step 2 of 3 · Review the generated plan before creating anything.")
+        view = CustomBuildConfirmView(
+            self,
+            schema,
+            owner_id=interaction.user.id,
+            command_channel_id=self._safe_command_channel_id(interaction),
+            build_label=f"AI build · {theme[:50]}",
         )
+        message = await interaction.edit_original_response(embed=em, view=view)
+        view.message = message
 
 
 async def setup(bot: commands.Bot) -> None:

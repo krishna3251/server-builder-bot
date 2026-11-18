@@ -174,9 +174,11 @@ async def get_ai_response(prompt: str, user_id: int, persona: str = "default", *
                             return "⚠️ AI access was rejected. Ask an administrator to check the configured key and model access."
                         data = await resp.json()
                         if resp.status == 200:
-                            choice = data.get("choices", [{}])[0]
-                            reply = choice.get("message", {}).get("content", "")
-                            if reply:
+                            choices = data.get("choices") or []
+                            message = choices[0].get("message") if choices else None
+                            content = message.get("content") if isinstance(message, dict) else None
+                            if isinstance(content, str) and content.strip():
+                                reply = content
                                 log.info("AI response from %s (%d tokens)", model, len(reply.split()))
                                 break
                             last_error = "Empty response"

@@ -82,18 +82,24 @@ MIT
 
 ## Discord UI (v2.2)
 
-- `/builder_panel`: choose a preset, custom JSON, or AI theme. Review the plan with the section menu, Previous/Next controls, and JSON export before confirming.
+- `/builder_panel` offers presets, custom JSON and AI themes. Review roles and channel access in the section menu before confirming. Export the JSON to reuse the exact plan.
 - `/help`: private category menu for the command guide.
 - `/diagnostics`: administrator-only module status, configuration checks, server permissions, and recent error references.
 - Buttons and modals report unexpected errors privately with a reference ID. Operators can look up that ID in `logs/error.log` or hosting logs.
 
 ## Operations and validation
 
-Run **one bot process**. Economy and ticket transition locks are process-local. Keep the `data/` directory on persistent storage; setting `MONGO_URI` persists ticket state only, not economy/XP/AI data. Ticket deletion deadlines are stored in MongoDB and restored after a normal restart. Do not run two deployments against the same data at once.
+Run **one bot process** with persistent storage for `data/`. Builder progress, economy, XP, AI memory and quarantine depend on that directory. Ticket configuration and deletion deadlines use MongoDB when configured and local JSON otherwise.
 
 Tickets use MongoDB when MONGO_URI is configured and atomic local JSON otherwise. A configured but unavailable database never silently falls back. An OpenRouter key is required for AI requests; AI_MODEL can override the default model. `/diagnostics` distinguishes configuration from verified connectivity. Enable **Server Members Intent** and **Message Content Intent** in the Discord Developer Portal. The bot must also have the relevant permissions and role position. Presets that create Administrator roles require the bot to be able to grant Administrator.
 
-The HTTP health endpoint returns 503 until Discord is ready or if a cog failed to load. It does not verify every remote dependency. Missing `DISCORD_TOKEN` exits with an error. Cleaning an existing server permanently deletes content; rollback only covers newly created resources.
+The HTTP health endpoint returns 503 until Discord and slash commands are ready. Check `/diagnostics` and the hosting logs for startup errors.
+
+With `clean_existing:true`, the server owner can build the replacement alongside the old layout. After the replacement is ready, the owner receives a separate approval with the exact channel and role IDs eligible for removal. Approval permanently deletes the listed channels, their messages and threads, and the listed role assignments. The builder preserves the command channel and the resources configured for tickets and moderation. The replacement needs enough room to coexist with the old layout until approval.
+
+If a build stops partway, confirm the same plan again to reuse recorded resources. For an AI plan, take the JSON attachment from the build result and submit it to `/setup_custom`. Keep `data/builds/` across restarts.
+
+Ticket setup requires dedicated staff roles and a staff-only log channel. When a ticket closes, the bot checks the log channel again and uploads a ZIP with the channel's message history and attachment copies before scheduling deletion. Tickets stay open when Discord rejects the archive or when the archive exceeds the upload limit.
 
 Offline checks (no credentials needed):
 
@@ -107,7 +113,7 @@ See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the original 57-command audit, veri
 
 ### JSON examples and command recovery
 
-Use `/json_example` to browse and download examples, a format guide, paste validation, or an AI draft. `/json_validate` validates an uploaded file or JSON text without changing the server. `/server_json` exports the same canonical examples. The source-controlled copies live in [examples/](examples/) with [the format guide](examples/JSON_REFERENCE.md). AI plans receive schema validation and at most one repair request; building still uses administrator checks and confirmation unless you explicitly disable AI preview.
+Use `/json_example` to browse and download examples, view the format guide, validate pasted JSON or get an AI draft. `/json_validate` checks a file or pasted JSON, and `/server_json` exports the examples. AI plans receive schema validation and at most one repair request. Applying a plan requires administrator access and explicit confirmation. [Examples and format guide](examples/JSON_REFERENCE.md)
 
 Commands acknowledge before slow work. Read-only results provide Refresh/Command guide/Close controls; existing specialized menus are retained. If commands are missing, inspect `/diagnostics`, hosting logs, intents, and permissions. Only the bot owner or configured DEV_IDS can run `/sync_commands` to retry global registration. Use slash commands; the `!` prefix is not an alias for them.
 
@@ -140,8 +146,8 @@ The bot uses Discord Components V2 for the command center, main builder panel, s
 | `/create_channel name kind category private` | Create a text channel, voice channel or category. A private channel initially admits its creator, the bot and administrators. |
 | `/builder_panel` | Open the new builder panel, including channel creation. |
 | `/security` | Open the administrator's private permission and recovery status. |
-| `/quarantine_setup staff_role` | Create a hidden category, review channel and marker role, then add restrictions to existing channels. The staff role is optional. Repeat to repair a partial setup. |
-| `/quarantine member reason` | Suspend editable roles and channel access, saving a durable recovery record. |
+| `/quarantine_setup staff_role` | Create a hidden review category and marker role, then add restrictions to existing channels. The staff role is optional. Repeat to repair a partial setup. |
+| `/quarantine member reason` | Suspend editable roles and channel access, create a private review room for the member and save a recovery record. |
 | `/sudo_ban member reason` | Apply the same reversible quarantine. The member stays in the guild. |
 | `/quarantine_release member` | Restore saved roles and channel access. Repeat after fixing permissions if release is partial. |
 | `/butler status` | Check private reporting and activity collection. |
@@ -150,7 +156,7 @@ The bot uses Discord Components V2 for the command center, main builder panel, s
 
 Quarantine setup requires Administrator on the caller. Apply/release requires Moderate Members and Manage Roles on the caller, plus the normal actor/target hierarchy checks. The bot needs View Channel, Send Messages, Read Message History, Manage Channels and Manage Roles and must outrank every role it suspends or restores. Existing role order is preserved. The owner is protected. Targets with privileged everyone/managed/uneditable roles are refused. The quarantine marker has zero guild permissions and is neither hoisted nor mentionable. Deleted resources can be recreated by rerunning setup.
 
-Per-member channel overwrites enforce quarantine even where other roles explicitly allow access. Channels created during quarantine and members who leave/rejoin are reconciled. Voice disconnection additionally needs Move Members. Failed restrictions produce a partial result, which can be retried. Roles that gained permissions during quarantine require staff review before restoration. Changes to overwrite fields made independently by staff are preserved on release when they differ from the bot's last applied values.
+Per-member channel permissions enforce quarantine even where other roles explicitly allow access. Each active case has its own room. Release removes the case member's private access grant and retains the history for staff. On startup, the bot makes the legacy shared review room staff-only and restores active cases to individual rooms. Voice disconnection needs Move Members. Partial operations can be retried. Saved roles that gained permissions require staff review before restoration.
 
 Timeouts, automatic warning timeouts, kicks, bans, quarantines and releases generate private receipts to both the bot application owner and the server owner. Successful bot actions are recorded in the daily ledger. The original `/ban` remains available for an actual Discord ban. Use `/sudo_ban` for quarantine. Daily bot-owner reports run at **00:05 Asia/Kolkata** by default, with retryable delivery and the first available today's report on startup. Configure `BUTLER_OWNER_ID` for the report recipient and `BUTLER_REPORT_HOUR`/`BUTLER_REPORT_MINUTE` for another local time. DMs must be open.
 

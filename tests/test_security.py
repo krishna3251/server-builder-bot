@@ -83,6 +83,7 @@ class SecurityFixture:
             return role
         async def create_channel(*args, **kwargs):
             channel = Channel(70 + len(self.channels), self.guild, kwargs.get('overwrites'))
+            channel.category_id = getattr(kwargs.get('category'), 'id', None)
             self.channels[channel.id] = channel
             self.guild.channels = list(self.channels.values())
             return channel
@@ -104,13 +105,12 @@ class QuarantineTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         original = overwrite_dict(self.channel.overwrites_for(self.target))
         settings = await self.service.setup(self.guild)
         self.assertEqual(original, overwrite_dict(self.channel.overwrites_for(self.target)))
-        for key in ('category', 'room'):
-            self.assertFalse(self.channels[settings[key]].overwrites_for(self.everyone).view_channel)
+        self.assertFalse(self.channels[settings['category']].overwrites_for(self.everyone).view_channel)
         self.assertFalse(self.channel.overwrites_for(self.roles[60]).view_channel)
         await self.service.setup(self.guild)
         self.guild.create_role.assert_awaited_once()
         self.guild.create_category.assert_awaited_once()
-        self.guild.create_text_channel.assert_awaited_once()
+        self.guild.create_text_channel.assert_not_awaited()
 
     async def test_quarantine_and_release_round_trip_survives_restart_and_staff_edit(self):
         settings = await self.service.setup(self.guild)
@@ -118,7 +118,7 @@ class QuarantineTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record['phase'], 'active')
         self.assertNotIn(self.regular, self.target.roles)
         self.assertFalse(self.channel.overwrites_for(self.target).view_channel)
-        room = self.channels[settings['room']]
+        room = self.channels[record['room']]
         self.assertTrue(room.overwrites_for(self.target).send_messages)
         # Another staff edit must survive release.
         edited = self.channel.overwrites_for(self.target)
@@ -129,6 +129,7 @@ class QuarantineTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         restored = self.channel.overwrites_for(self.target)
         self.assertTrue(restored.view_channel)
         self.assertFalse(restored.attach_files)
+        self.assertIsNone(room.overwrites_for(self.target).view_channel)
         self.assertNotIn(self.roles[60], self.target.roles)
         self.assertIn(self.regular, self.target.roles)
         self.assertEqual((await restarted.load())['10']['members'], {})
@@ -188,11 +189,28 @@ class QuarantineTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn('100', (await self.service.load())['10']['members']['2']['overwrites'])
 
     async def test_private_room_rejects_new_nonstaff_visibility_grants(self):
-        settings = await self.service.setup(self.guild)
-        room = self.channels[settings['room']]
+        await self.service.setup(self.guild)
+        record = await self.service.quarantine(self.guild, self.actor, self.target, 'review')
+        room = self.channels[record['room']]
         room.overwrites[self.regular] = discord.PermissionOverwrite(view_channel=True)
         await self.service.channel_changed(room)
         self.assertFalse(room.overwrites_for(self.regular).view_channel)
+
+    async def test_each_quarantine_case_has_separate_history_access(self):
+        await self.service.setup(self.guild)
+        other = Mock(id=5, bot=False, guild=self.guild, voice=None, roles=[self.everyone],
+                     top_role=self.everyone, add_roles=AsyncMock())
+        self.members[other.id] = other
+        first = await self.service.quarantine(self.guild, self.actor, self.target, 'first case')
+        second = await self.service.quarantine(self.guild, self.actor, other, 'second case')
+        self.assertNotEqual(first['room'], second['room'])
+        await self.service.channel_changed(self.channels[second['room']])
+        older_room = self.channels[first['room']]
+        newer_room = self.channels[second['room']]
+        self.assertTrue(older_room.overwrites_for(self.target).read_message_history)
+        self.assertTrue(newer_room.overwrites_for(other).read_message_history)
+        self.assertFalse(older_room.overwrites_for(other).view_channel)
+        self.assertFalse(newer_room.overwrites_for(self.target).view_channel)
 
     async def test_rejoin_keeps_quarantine(self):
         await self.service.setup(self.guild)
@@ -239,6 +257,15 @@ class CommandSecurityTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         interaction.guild = self.guild
         self.guild.me.guild_permissions = discord.Permissions.none()
         await SecurityCog.create_channel.callback(cog, interaction, 'chat')
+        self.guild.create_text_channel.assert_not_awaited()
+
+    async def test_top_level_channel_requires_guild_manage_channels(self):
+        cog = SecurityCog(Mock())
+        cog.quarantine_service = self.service
+        interaction = FakeInteraction()
+        interaction.guild = self.guild
+        interaction.user.guild_permissions = discord.Permissions.none()
+        await SecurityCog.create_channel.callback(cog, interaction, 'new-chat')
         self.guild.create_text_channel.assert_not_awaited()
 
     async def test_quarantine_command_and_sudo_alias_use_same_service_and_private_receipt(self):

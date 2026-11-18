@@ -6,6 +6,7 @@ import inspect
 import json
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,10 @@ from discord.ext import commands
 import config
 from cogs.json_tools import JsonTools, JsonReferenceView, plan_file
 from cogs.utility import UtilityCog
-from cogs.moderation import ClearWarningsConfirmView
+from cogs.moderation import ClearWarningsConfirmView, ModerationCog
 from services.template_service import example_plan, parse_plan, read_plan_attachment, generate_plan
 from services.ticket_store import TicketStore
+from services.ticket_service import archive_ticket, staff_log_channel
 from services.reminder_service import ReminderService
 from services import ai_service, economy_service, level_service
 from utils.helpers import parse_duration
@@ -58,6 +60,10 @@ class FormatTests(unittest.TestCase):
         for raw in ('hello {"roles": []}', '{"roles": [],}', '[]', '{}'):
             with self.subTest(raw=raw), self.assertRaises(ValueError): parse_plan(raw)
         self.assertEqual(parse_plan('```json\n{"roles":[{"name":"Member"}]}\n```')['roles'][0]['name'], 'Member')
+
+    def test_strict_json_rejects_duplicate_keys(self):
+        with self.assertRaisesRegex(ValueError, 'Duplicate JSON field'):
+            parse_plan('{"roles": [], "roles": [{"name": "Member"}]}')
 
     def test_duration_parser_rejects_negative_zero_junk_and_overflow(self):
         for raw in ('-1h', '0s', 'later 2h', '1h junk', '999999999999999999999999d'):
@@ -112,6 +118,59 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(parse_plan(uploaded.fp.getvalue().decode())['roles'])
         uploaded.close()
         arguments['view'].stop()
+
+    async def test_legacy_ai_option_still_requires_private_confirmation(self):
+        from cogs.server_builder import ServerBuilderCog
+        cog = ServerBuilderCog(None)
+        interaction = FakeInteraction()
+        interaction.channel = None
+        interaction.channel_id = 11
+        with patch('cogs.ai._rate_limited', return_value=False), patch(
+            'cogs.server_builder.generate_plan', new=AsyncMock(return_value=example_plan())
+        ), patch.object(cog, '_execute_custom_build', new=AsyncMock()) as build:
+            await ServerBuilderCog.generate_server.callback(cog, interaction, 'Gaming club', preview=False)
+            build.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        view = interaction.edit_original_response.call_args.kwargs['view']
+        self.assertEqual(type(view).__name__, 'CustomBuildConfirmView')
+        view.stop()
+
+    async def test_channel_moderation_checks_selected_channel(self):
+        interaction = FakeInteraction()
+        cog = ModerationCog(None)
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.permissions_for.side_effect = lambda member: discord.Permissions(
+            view_channel=True, manage_channels=member is not interaction.user
+        )
+        channel.edit = AsyncMock()
+        await ModerationCog.slowmode.callback(cog, interaction, channel, 10)
+        channel.edit.assert_not_awaited()
+        self.assertTrue(any(call.args == (interaction.user,) for call in channel.permissions_for.call_args_list))
+
+    async def test_ticket_archive_includes_latest_messages_and_attachment_bytes(self):
+        attachment = SimpleNamespace(id=55, filename='image.txt', size=4, read=AsyncMock(return_value=b'file'))
+        async def history(**kwargs):
+            self.assertIsNone(kwargs['limit'])
+            for index in range(225):
+                yield SimpleNamespace(
+                    created_at=datetime.now(timezone.utc), author=SimpleNamespace(id=10),
+                    content=f'message-{index}', attachments=[attachment] if index == 224 else [],
+                )
+        with await archive_ticket(SimpleNamespace(history=history), 1_000_000) as data:
+            with zipfile.ZipFile(data) as archive:
+                self.assertIn('message-224', archive.read('transcript.txt').decode())
+                self.assertEqual(archive.read('attachments/55-image.txt'), b'file')
+
+    def test_ticket_log_requires_staff_only_channel_overwrites(self):
+        guild = SimpleNamespace(id=10, default_role=object(), owner_id=1, me=SimpleNamespace(id=2))
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.permissions_for.return_value = discord.Permissions.none()
+        staff = MagicMock(spec=discord.Role)
+        staff.id = 11
+        staff.permissions = discord.Permissions.none()
+        channel.overwrites = {staff: discord.PermissionOverwrite(view_channel=True)}
+        self.assertTrue(staff_log_channel(channel, guild, {11}))
+        self.assertFalse(staff_log_channel(channel, guild, set()))
 
     async def test_json_validation_never_builds(self):
         interaction = FakeInteraction()
@@ -264,13 +323,18 @@ class AdditionalFailureTests(unittest.IsolatedAsyncioTestCase):
         cog.bot = SimpleNamespace(add_view=MagicMock())
         cog.config_manager = SimpleNamespace(get_guild=AsyncMock(return_value={}), save_guild=AsyncMock())
         interaction = FakeInteraction()
-        interaction.guild.me.guild_permissions = discord.Permissions(manage_channels=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True)
+        interaction.guild.me.guild_permissions = discord.Permissions(manage_channels=True, manage_roles=True, send_messages=True, attach_files=True, embed_links=True, read_message_history=True)
         interaction.guild.icon = None
         interaction.guild.name = 'Example'
         interaction.channel = MagicMock(spec=discord.TextChannel)
         interaction.channel.id = 30
         interaction.channel.send = AsyncMock(return_value=SimpleNamespace(id=31, channel=SimpleNamespace(mention='#tickets'), jump_url='https://discord.com/channels/10/30/31'))
-        await TicketSystem.setup_tickets.callback(cog, interaction, 'Help desk', 'Choose a category', SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3), SimpleNamespace(id=4))
+        log_channel = MagicMock(spec=discord.TextChannel)
+        log_channel.id = 3
+        log_channel.permissions_for.side_effect = lambda member: discord.Permissions(view_channel=member == interaction.user)
+        log_channel.overwrites = {}
+        category = SimpleNamespace(id=4, permissions_for=lambda member: discord.Permissions(view_channel=True))
+        await TicketSystem.setup_tickets.callback(cog, interaction, 'Help desk', 'Choose a category', SimpleNamespace(id=1), SimpleNamespace(id=2), log_channel, category)
         interaction.channel.send.assert_awaited_once()
         cog.config_manager.save_guild.assert_awaited_once()
 

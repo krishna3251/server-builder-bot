@@ -199,7 +199,8 @@ class UtilityCog(commands.Cog, name="Utility"):
         failed = getattr(self.bot, "extension_errors", {})
         em.add_field(name="Modules needing attention", value="\n".join(f"⚠️ {name}: `{reference}`" for name, reference in failed.items())[:1000] or "✅ No startup failures recorded", inline=True)
         required = ("manage_channels", "manage_roles", "manage_guild", "send_messages", "embed_links", "attach_files", "read_message_history")
-        missing = [p.replace("_", " ") for p in required if not getattr(guild.me.guild_permissions, p, False)]
+        permissions = guild.me.guild_permissions if guild.me else discord.Permissions.none()
+        missing = [p.replace("_", " ") for p in required if not getattr(permissions, p)]
         em.add_field(name="Server permissions", value=", ".join(missing) if missing else "✅ Core permissions available", inline=False)
         current_errors = [item for item in recent_errors if item.get("guild_id") in (None, guild.id)]
         em.add_field(name="Recent errors · this process", value="\n".join(f"`{item['reference']}` · {item['type']}" for item in current_errors[-5:]) or "✅ No captured errors", inline=False)
@@ -363,7 +364,7 @@ class UtilityCog(commands.Cog, name="Utility"):
         await respond(interaction, embed=em)
 
     # ── /poll ─────────────────────────────────────────────────────────────
-    @app_commands.command(name="poll", description="Create a reaction poll.")
+    @app_commands.command(name="poll", description="Create a poll with selectable choices.")
     @app_commands.describe(question="The poll question", options="Comma-separated options (max 10)")
     @acknowledged(ephemeral=False)
     async def poll(self, interaction: discord.Interaction, question: str, options: str) -> None:
@@ -401,7 +402,7 @@ class UtilityCog(commands.Cog, name="Utility"):
     @acknowledged(ephemeral=True)
     async def reminders(self, interaction: discord.Interaction):
         items = await self.reminders_service.list_for(interaction.user.id)
-        lines = [f"`{key}` · {'Delivery failed; check DMs' if value.get('status') == 'failed' else '<t:' + str(int(value['due'])) + ':R>'} · {discord.utils.escape_markdown(value['message'][:100])}" for key, value in items.items()]
+        lines = [f"`{key}` · {'Delivery failed; check DMs' if value.get('status') == 'failed' else '<t:' + str(int(value['due'])) + ':R>'} · {discord.utils.escape_markdown(value['message'][:65])}" for key, value in items.items()]
         await respond(interaction, embed=info_embed("⏰ Your reminders", "\n\n".join(lines) or "No saved reminders. Use /remind to create one."), ephemeral=True)
 
     @app_commands.command(name="reminder_cancel", description="Cancel one of your saved reminders by reference ID.")

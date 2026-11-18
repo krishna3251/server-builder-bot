@@ -27,8 +27,7 @@ def acknowledged(*, ephemeral=True):
     def decorate(function):
         @wraps(function)
         async def wrapped(self, interaction, *args, **kwargs):
-            private = kwargs.get('preview', True) if function.__name__ == 'generate_server' else ephemeral
-            await defer_response(interaction, ephemeral=private, thinking=True)
+            await defer_response(interaction, ephemeral=ephemeral, thinking=True)
             extras = getattr(interaction, 'extras', None)
             if not isinstance(extras, dict):
                 extras = interaction.extras = {}

@@ -10,10 +10,24 @@ DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 MONGO_URI: str = os.getenv("MONGO_URI", "")
 
+
+def _optional_id(name: str) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a Discord ID or be left empty.") from None
+    if not 0 <= value < 2**64:
+        raise ValueError(f"{name} must be a Discord ID or be left empty.")
+    return value
+
+
 # ── Channel / Role IDs ───────────────────────────────────────────────────────
-MOD_LOG_CHANNEL_ID: int = int(os.getenv("MOD_LOG_CHANNEL_ID", "0"))
-TICKET_LOG_CHANNEL_ID: int = int(os.getenv("TICKET_LOG_CHANNEL_ID", "0"))
-SUPPORT_ROLE_ID: int = int(os.getenv("SUPPORT_ROLE_ID", "0"))
+MOD_LOG_CHANNEL_ID: int = _optional_id("MOD_LOG_CHANNEL_ID")
+TICKET_LOG_CHANNEL_ID: int = _optional_id("TICKET_LOG_CHANNEL_ID")
+SUPPORT_ROLE_ID: int = _optional_id("SUPPORT_ROLE_ID")
 
 # ── Developer IDs ─────────────────────────────────────────────────────────
 DEV_IDS: list[int] = [
