@@ -8,7 +8,7 @@ from typing import Any
 import discord
 
 from core.errors import ValidationError
-from engines.builder.planner import builder_planner
+from engines.guild.permission_engine import PermissionPreset
 from engines.intelligence.intent import intent_parser
 from engines.intelligence.validator import ai_safety_validator
 from services import ai_service
@@ -77,24 +77,19 @@ class IntelligencePlanner:
         intent = intent_parser.parse(prompt)
         if intent.intent_type == "create_channel":
             params = intent.parameters
-            schema = {
-                "server_name": None,
-                "roles": [],
-                "categories": [
-                    {
-                        "name": "CHANNELS",
-                        "channels": [
-                            {
-                                "name": params.get("name", "channel"),
-                                "type": params.get("type", "text"),
-                                "permission_overwrites": [],
-                            }
-                        ],
-                    }
-                ],
+            category = {
+                "name": "CHANNELS",
+                "channels": [{"name": params["name"], "type": params["type"]}],
             }
+            preset = params["permission_preset"]
+            if preset in (PermissionPreset.STAFF, PermissionPreset.TICKET):
+                category["permission_overwrites"] = [{"role": "@everyone", "deny": ["view_channel"]}]
+                warnings.append("Private fallback. Review which staff roles can access the new category.")
+            elif preset in (PermissionPreset.ANNOUNCEMENT, PermissionPreset.VERIFIED):
+                category["permission_overwrites"] = [{"role": "@everyone", "deny": ["send_messages"]}]
+                warnings.append("Read-only fallback for @everyone. Add allowed posting roles in Discord if needed.")
             warnings.append("AI unavailable. Generated plan via Rule-Based Engine.")
-            return schema, "RULE_BASED", warnings
+            return {"roles": [], "categories": [category]}, "RULE_BASED", warnings
 
         elif intent.intent_type == "create_category":
             cat_name = intent.parameters.get("name", "Category")

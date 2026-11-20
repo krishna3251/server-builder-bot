@@ -1,18 +1,18 @@
-"""Server Analyzer — Read-only diagnostic audit of server structure, roles, permissions, and bots."""
-
+"""Read-only audit of visible channels, role grants, and configured features."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import discord
 
-from engines.guild.category_engine import CategoryEngine
-from engines.guild.permission_engine import DANGEROUS_PERMISSIONS, permission_engine
+from engines.guild.permission_engine import permission_engine
 from engines.guild.role_engine import RoleEngine
+from services.ticket_permissions import ticket_log_is_private
 
-log = logging.getLogger("engines.guild.analyzer")
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,7 +21,7 @@ class SuggestedFix:
     title: str
     description: str
     target_id: int
-    target_type: str  # "channel", "role", "category"
+    target_type: str
     action_type: str
     parameters: dict[str, Any]
 
@@ -35,116 +35,124 @@ class ServerAnalysisReport:
     roles_count: int
     orphan_channels: list[str] = field(default_factory=list)
     hierarchy_issues: list[str] = field(default_factory=list)
+    dangerous_roles: list[str] = field(default_factory=list)
     permission_conflicts: list[str] = field(default_factory=list)
     missing_bot_perms: list[str] = field(default_factory=list)
     admin_roles_count: int = 0
-    tickets_configured: bool = False
-    automod_enabled: bool = False
+    channels_outside_scope: int = 0
+    tickets_status: str = "Unknown"
+    local_automod_status: str = "Unknown"
+    native_automod_status: str = "Unknown"
     suggested_fixes: list[SuggestedFix] = field(default_factory=list)
 
     @property
     def is_healthy(self) -> bool:
-        return (
-            len(self.missing_bot_perms) == 0
-            and len(self.orphan_channels) == 0
-            and len(self.permission_conflicts) == 0
-            and len(self.hierarchy_issues) == 0
+        return not (
+            self.missing_bot_perms or self.orphan_channels or self.permission_conflicts
+            or self.dangerous_roles or self.hierarchy_issues or self.channels_outside_scope
+            or self.tickets_status not in {"Configured", "Unconfigured"}
+            or "Unknown" in (self.local_automod_status, self.native_automod_status)
         )
 
 
 class ServerAnalyzer:
-    """Read-only analysis engine for server health and structure."""
+    """Run the same audit from the slash command and the manager panel."""
 
     def __init__(self) -> None:
-        self.category_engine = CategoryEngine()
         self.role_engine = RoleEngine()
 
-    async def analyze(self, guild: discord.Guild, ticket_config: dict[str, Any] | None = None) -> ServerAnalysisReport:
-        """Run complete read-only audit on guild. Never modifies any state."""
+    async def analyze(self, guild: discord.Guild, ticket_config: dict[str, Any] | None = None, *,
+                      viewer: discord.Member | None = None, client=None) -> ServerAnalysisReport:
+        channels = [
+            channel for channel in guild.channels
+            if viewer is None or viewer.guild_permissions.administrator or channel.permissions_for(viewer).view_channel
+        ]
         report = ServerAnalysisReport(
-            guild_id=guild.id,
-            guild_name=guild.name,
-            categories_count=len(guild.categories),
-            channels_count=len(guild.channels),
-            roles_count=len(guild.roles),
+            guild_id=guild.id, guild_name=guild.name, roles_count=len(guild.roles),
+            categories_count=sum(isinstance(channel, discord.CategoryChannel) for channel in channels),
+            channels_count=len(channels), channels_outside_scope=len(guild.channels) - len(channels),
         )
 
-        # 1. Orphan channels
-        orphans = self.category_engine.detect_orphan_channels(guild)
-        for ch in orphans:
-            report.orphan_channels.append(ch.name)
-            report.suggested_fixes.append(
-                SuggestedFix(
-                    issue_id=f"orphan_{ch.id}",
-                    title=f"Assign Category to #{ch.name}",
-                    description=f"Channel #{ch.name} has no category.",
-                    target_id=ch.id,
-                    target_type="channel",
-                    action_type="move_channel",
-                    parameters={"channel_id": ch.id},
-                )
-            )
-
-        # 2. Bot permissions
         bot = guild.me
         if bot:
-            required_checks = {
-                "Manage Channels": bot.guild_permissions.manage_channels,
-                "Manage Roles": bot.guild_permissions.manage_roles,
-                "Manage Messages": bot.guild_permissions.manage_messages,
-                "View Audit Log": bot.guild_permissions.view_audit_log,
-                "Kick Members": bot.guild_permissions.kick_members,
-                "Ban Members": bot.guild_permissions.ban_members,
-            }
-            for perm_name, granted in required_checks.items():
-                if not granted:
-                    report.missing_bot_perms.append(perm_name)
-
-        # 3. Role hierarchy & dangerous roles
-        hierarchy_data = self.role_engine.analyze_role_hierarchy(guild)
-        report.admin_roles_count = len(hierarchy_data.get("admin_roles", []))
-        for r_name in hierarchy_data.get("unmanageable_roles", []):
-            report.hierarchy_issues.append(f"Role '{r_name}' is above DAMU's highest role.")
-
-        # 4. Permission conflicts
-        for ch in guild.channels:
-            warnings = permission_engine.audit_channel_permissions(ch)
-            for w in warnings:
-                report.permission_conflicts.append(w)
-                if "allows @everyone to send" in w:
-                    report.suggested_fixes.append(
-                        SuggestedFix(
-                            issue_id=f"perm_leak_{ch.id}",
-                            title=f"Lock #{ch.name} for @everyone",
-                            description=f"Revoke Send Messages from @everyone in #{ch.name}.",
-                            target_id=ch.id,
-                            target_type="channel",
-                            action_type="set_permissions",
-                            parameters={
-                                "channel_id": ch.id,
-                                "target_name": "@everyone",
-                                "overwrites": {"send_messages": False},
-                            },
-                        )
-                    )
-
-        # 5. Ticket configuration
-        if ticket_config:
-            cat_id = ticket_config.get("ticket_category_id")
-            support_id = ticket_config.get("support_role_id")
-            cat = guild.get_channel(cat_id) if cat_id else None
-            role = guild.get_role(support_id) if support_id else None
-            report.tickets_configured = bool(cat and role)
+            for permission in (
+                "manage_channels", "manage_roles", "manage_messages", "moderate_members", "view_audit_log",
+                "kick_members", "ban_members",
+            ):
+                if not getattr(bot.guild_permissions, permission):
+                    report.missing_bot_perms.append(permission.replace("_", " ").title())
         else:
-            report.tickets_configured = False
+            report.missing_bot_perms.append("Bot member unavailable")
 
-        # 6. AutoMod check
-        import config
-        from cogs.automod import AutoModCog
-        # Check if automod cog is loaded or settings configured
-        report.automod_enabled = True
+        hierarchy = self.role_engine.analyze_role_hierarchy(guild)
+        report.admin_roles_count = len(hierarchy["admin_roles"])
+        report.dangerous_roles = hierarchy["dangerous_roles"]
+        report.hierarchy_issues = hierarchy["unmanageable_roles"]
 
+        for channel in channels:
+            if not isinstance(channel, discord.CategoryChannel) and channel.category_id is None:
+                report.orphan_channels.append(channel.name)
+            report.permission_conflicts.extend(permission_engine.audit_channel_permissions(channel))
+            if permission_engine.public_posting_in_read_only_channel(channel):
+                report.suggested_fixes.append(SuggestedFix(
+                    issue_id=f"public_posting_{channel.id}",
+                    title=f"Restrict default posting in #{channel.name}",
+                    description="Set Send Messages to Deny for @everyone. Other overwrite fields stay as configured.",
+                    target_id=channel.id, target_type="channel", action_type="set_permissions",
+                    parameters={"channel_id": channel.id, "target_name": "@everyone",
+                                "overwrites": {"send_messages": False}},
+                ))
+
+        report.tickets_status, report.local_automod_status, report.native_automod_status = await asyncio.gather(
+            self._ticket_status(guild, ticket_config, client),
+            self._local_status(guild, client),
+            self._native_status(guild),
+        )
         return report
+
+    @staticmethod
+    async def _ticket_status(guild, configured, client):
+        cog = client.get_cog("TicketSystem") if client else None
+        try:
+            if configured is None and cog is not None:
+                configured = await asyncio.wait_for(cog.config_manager.get_guild(guild.id), timeout=3)
+            if configured is None:
+                return "Unknown"
+            if not configured:
+                return "Unconfigured"
+            names = ("support_role_id", "mod_role_id")
+            role_ids = {configured.get(key, 0) for key in names}
+            log_channel = guild.get_channel(configured.get("log_channel_id", 0))
+            if (not all(guild.get_role(role_id) is not None for role_id in role_ids)
+                    or not isinstance(guild.get_channel(configured.get("ticket_category_id", 0)), discord.CategoryChannel)
+                    or not isinstance(log_channel, discord.TextChannel)):
+                return "Missing saved role or channel"
+            if not ticket_log_is_private(log_channel, role_ids):
+                return "Log channel needs private staff access"
+            return "Configured"
+        except Exception as error:
+            log.warning("Ticket status unavailable for guild %s (%s)", guild.id, type(error).__name__)
+            return "Unknown"
+
+    @staticmethod
+    async def _local_status(guild, client):
+        cog = client.get_cog("Local AutoMod") if client else None
+        if cog is None:
+            return "Unknown"
+        try:
+            return "Enabled" if await asyncio.wait_for(cog.is_enabled(guild.id), timeout=3) else "Disabled"
+        except (OSError, ValueError, asyncio.TimeoutError):
+            return "Unknown"
+
+    @staticmethod
+    async def _native_status(guild):
+        if guild.me is None or not guild.me.guild_permissions.manage_guild:
+            return "Unknown"
+        try:
+            rules = await asyncio.wait_for(guild.fetch_automod_rules(), timeout=3)
+        except (discord.HTTPException, OSError, asyncio.TimeoutError):
+            return "Unknown"
+        return "Enabled" if any(rule.enabled for rule in rules) else "Disabled"
 
 
 server_analyzer = ServerAnalyzer()

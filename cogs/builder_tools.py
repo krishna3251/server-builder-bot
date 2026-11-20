@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from discord.ext import commands
 
 import config
 from cogs.server_builder import CustomBuildConfirmView
+from engines.guild.permission_engine import permission_engine
 from services.embed_service import error_embed, info_embed
 from services.guild_settings import GuildSettings
 from services.json_builder import _resolve_permissions, _styled_name, preflight_build
@@ -26,45 +28,57 @@ TEMPLATE_CHOICES = [app_commands.Choice(name=title, value=key) for key, title in
 
 def compare_permissions(guild: discord.Guild, schema: dict) -> list[str]:
     issues = []
-    roles = {role.name: role for role in guild.roles}
-    roles["@everyone"] = guild.default_role
+    roles = {"@everyone": guild.default_role}
     for entry in schema.get("roles", []):
-        role = roles.get(entry["name"]) or roles.get(_styled_name(entry, schema.get("role_font")))
-        if role is None:
-            issues.append(f"Missing role: {entry['name']}")
+        names = (entry["name"], _styled_name(entry, schema.get("role_font")))
+        matches = [role for role in guild.roles if role.name in names]
+        if len(matches) != 1:
+            status = "Ambiguous" if matches else "Missing"
+            issues.append(f"{status} role: {entry['name']}")
             continue
+        role = matches[0]
         roles[entry["name"]] = role
         if role.permissions != _resolve_permissions(entry.get("permissions", [])):
             issues.append(f"Role permissions differ: {entry['name']}")
 
+    def expected_overwrites(specs):
+        return {
+            spec["role"] if spec["role"].lower() != "@everyone" else "@everyone":
+            discord.PermissionOverwrite.from_pair(*(_resolve_permissions(spec.get(key, [])) for key in ("allow", "deny")))
+            for spec in specs
+        }
+
     def check_channel(channel, expected):
-        for overwrite in expected:
-            target = roles.get(overwrite["role"])
+        for name, overwrite in expected.items():
+            target = roles.get(name)
             if target is None:
-                issues.append(f"{channel.name}: missing overwrite role {overwrite['role']}")
+                issues.append(f"{channel.name}: unresolved overwrite role {name}")
                 continue
             current = channel.overwrites_for(target)
-            allow, deny = (_resolve_permissions(overwrite.get(key, [])) for key in ("allow", "deny"))
-            expected = discord.PermissionOverwrite.from_pair(allow, deny)
-            if any(value is not None and getattr(current, field) != value for field, value in expected):
-                issues.append(f"{channel.name}: overwrite differs for {overwrite['role']}")
+            fields = [field for field, value in overwrite if value is not None and getattr(current, field) != value]
+            if fields:
+                issues.append(f"{channel.name}: overwrite differs for {name} ({', '.join(fields)})")
 
     font = schema.get("font") or schema.get("name_font") or schema.get("name_style")
     for entry in schema.get("categories", []):
         names = (entry["name"], _styled_name(entry, schema.get("category_font") or font))
-        category = discord.utils.find(lambda item: item.name in names, guild.categories)
-        if category is None:
-            issues.append(f"Missing category: {entry['name']}")
+        matches = [item for item in guild.categories if item.name in names]
+        if len(matches) != 1:
+            status = "Ambiguous" if matches else "Missing"
+            issues.append(f"{status} category: {entry['name']}")
             continue
-        inherited = entry.get("permission_overwrites", [])
+        category = matches[0]
+        inherited = expected_overwrites(entry.get("permission_overwrites", []))
         check_channel(category, inherited)
         for channel_data in entry.get("channels", []):
             names = (channel_data["name"], _styled_name(channel_data, schema.get("channel_font") or font))
-            channel = discord.utils.find(lambda item: item.name in names, category.channels)
-            if channel is None:
-                issues.append(f"Missing channel: {entry['name']} / {channel_data['name']}")
+            matches = [item for item in category.channels if item.name in names]
+            if len(matches) != 1:
+                status = "Ambiguous" if matches else "Missing"
+                issues.append(f"{status} channel: {entry['name']} / {channel_data['name']}")
                 continue
-            check_channel(channel, channel_data.get("permission_overwrites", []))
+            explicit = expected_overwrites(channel_data.get("permission_overwrites", []))
+            check_channel(matches[0], permission_engine.merge_overwrites(inherited, explicit))
     return issues
 
 
@@ -164,11 +178,12 @@ class BuilderTools(commands.Cog, name="Builder Tools"):
         except ValueError as error:
             return await respond(interaction, embed=error_embed("Review your JSON", str(error)[:2000]))
         issues = compare_permissions(interaction.guild, schema)
-        description = "\n".join(f"• {issue}" for issue in issues[:30])[:3800]
-        if len(issues) > 30:
-            description += f"\n{len(issues) - 30} more differences."
+        description = "\n".join(f"• {issue}" for issue in issues)
+        if len(description) > 3800:
+            file = discord.File(io.BytesIO(description.encode()), filename="permission-comparison.txt")
+            return await respond(interaction, f"{len(issues)} findings. Download the full comparison.", file=file)
         await respond(interaction, embed=info_embed("Permission comparison",
-                                                   description or "All permissions specified in the plan matched."))
+                                                   description or "All permission fields specified in the plan matched."))
 
     async def update_delegate(self, interaction: discord.Interaction, member: discord.Member, *, add: bool) -> None:
         guild = interaction.guild
@@ -206,7 +221,6 @@ class BuilderTools(commands.Cog, name="Builder Tools"):
         members = self.settings.get(interaction.guild_id).get("delegates", [])
         text = "\n".join(f"<@{member}>" for member in members)
         if len(text) > 3700:
-            import io
             file = discord.File(io.BytesIO(json.dumps(members).encode()), filename="builder-delegates.json")
             return await respond(interaction, f"{len(members)} approved delegates.", file=file)
         await respond(interaction, embed=info_embed("Builder delegates", text or "No approved delegates."),

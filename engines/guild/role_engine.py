@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from typing import Any
 
 import discord
 
 from core.errors import HierarchyError, PermissionError, ResourceNotFoundError, ValidationError
-from engines.guild.permission_engine import DANGEROUS_PERMISSIONS, permission_engine
+from engines.guild.permission_engine import permission_engine
 from services.json_builder import _parse_colour, _resolve_permissions
 
 log = logging.getLogger("engines.guild.role_engine")
@@ -17,7 +17,20 @@ log = logging.getLogger("engines.guild.role_engine")
 class RoleEngine:
     """Manages Discord roles with strict hierarchy verification and dangerous permission safety."""
 
-    async def create_role(self, guild: discord.Guild, params: dict[str, Any]) -> discord.Role:
+    @staticmethod
+    def validate_permissions(bot: discord.Member, raw, *, allow_administrator: bool) -> discord.Permissions:
+        permissions = _resolve_permissions(raw) if isinstance(raw, list) else raw
+        if not isinstance(permissions, discord.Permissions):
+            raise ValidationError("Provide supported role permissions.", field="permissions")
+        if permissions.administrator and not allow_administrator:
+            raise ValidationError("Administrator grants require explicit confirmation.", field="permissions")
+        if not bot.guild_permissions.administrator and permissions.value & ~bot.guild_permissions.value:
+            raise PermissionError("The bot cannot grant some of the requested role permissions.",
+                                  required_permission="Requested role permissions")
+        return permissions
+
+    async def create_role(self, guild: discord.Guild, params: dict[str, Any], *,
+                          allow_administrator: bool = False) -> discord.Role:
         """Create a new role after hierarchy and permission safety verification."""
         bot = guild.me
         if not bot or not bot.guild_permissions.manage_roles:
@@ -33,21 +46,8 @@ class RoleEngine:
         hoist = bool(params.get("hoist", False))
         mentionable = bool(params.get("mentionable", False))
 
-        raw_perms = params.get("permissions", [])
-        if isinstance(raw_perms, list):
-            # Check for Administrator permission
-            if any(str(p).lower() == "administrator" for p in raw_perms):
-                explicit_confirmed = params.get("confirm_administrator", False)
-                if not explicit_confirmed:
-                    raise ValidationError(
-                        "Administrator permission requested for role creation. Explicit confirmation required.",
-                        field="permissions",
-                    )
-            perms = _resolve_permissions(raw_perms)
-        elif isinstance(raw_perms, discord.Permissions):
-            perms = raw_perms
-        else:
-            perms = discord.Permissions.none()
+        perms = self.validate_permissions(bot, params.get("permissions", []),
+                                          allow_administrator=allow_administrator)
 
         return await guild.create_role(
             name=name,
@@ -58,7 +58,8 @@ class RoleEngine:
             reason=params.get("reason", "Created via DAMU Role Engine"),
         )
 
-    async def edit_role(self, guild: discord.Guild, role_id: int, params: dict[str, Any]) -> discord.Role:
+    async def edit_role(self, guild: discord.Guild, role_id: int, params: dict[str, Any], *,
+                        allow_administrator: bool = False) -> discord.Role:
         """Edit an existing role after hierarchy verification."""
         bot = guild.me
         if not bot or not bot.guild_permissions.manage_roles:
@@ -84,17 +85,9 @@ class RoleEngine:
         if "mentionable" in params:
             edit_kwargs["mentionable"] = bool(params["mentionable"])
         if "permissions" in params:
-            raw_perms = params["permissions"]
-            if isinstance(raw_perms, list):
-                if any(str(p).lower() == "administrator" for p in raw_perms):
-                    if not params.get("confirm_administrator", False):
-                        raise ValidationError(
-                            "Administrator permission requested for role modification. Explicit confirmation required.",
-                            field="permissions",
-                        )
-                edit_kwargs["permissions"] = _resolve_permissions(raw_perms)
-            elif isinstance(raw_perms, discord.Permissions):
-                edit_kwargs["permissions"] = raw_perms
+            edit_kwargs["permissions"] = self.validate_permissions(
+                bot, params["permissions"], allow_administrator=allow_administrator,
+            )
 
         if edit_kwargs:
             await role.edit(**edit_kwargs)
@@ -131,17 +124,14 @@ class RoleEngine:
         dangerous_roles: list[str] = []
 
         for role in guild.roles:
-            if role.is_default():
-                continue
-            if bot_top and role >= bot_top:
+            if bot_top and not role.is_default() and role.id != bot_top.id and role >= bot_top:
                 unmanageable_roles.append(role.name)
             if role.permissions.administrator:
-                admin_roles.append(role.name)
-            else:
-                for p in DANGEROUS_PERMISSIONS:
-                    if getattr(role.permissions, p, False):
-                        dangerous_roles.append(f"{role.name} ({p})")
-                        break
+                admin_roles.append("@everyone" if role.is_default() else role.name)
+            grants = permission_engine.check_dangerous_permissions(role.permissions)
+            if grants:
+                name = "@everyone" if role.is_default() else role.name
+                dangerous_roles.append(f"{name}: {', '.join(grants)}")
 
         return {
             "total_roles": len(guild.roles),

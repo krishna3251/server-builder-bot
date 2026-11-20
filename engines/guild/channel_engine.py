@@ -9,7 +9,6 @@ import discord
 
 from core.errors import PermissionError, ResourceNotFoundError, ValidationError
 from engines.guild.permission_engine import PermissionPreset, permission_engine
-from services.json_builder import _parse_colour, _resolve_permissions
 
 log = logging.getLogger("engines.guild.channel_engine")
 
@@ -17,7 +16,8 @@ log = logging.getLogger("engines.guild.channel_engine")
 class ChannelEngine:
     """Manages channel creation, modification, deletion, cloning, and permissions."""
 
-    async def create_channel(self, guild: discord.Guild, params: dict[str, Any]) -> discord.abc.GuildChannel:
+    async def create_channel(self, guild: discord.Guild, params: dict[str, Any], *,
+                             created_roles: dict | None = None) -> discord.abc.GuildChannel:
         """Validate and create a channel in the guild."""
         bot = guild.me
         if not bot or not bot.guild_permissions.manage_channels:
@@ -29,6 +29,8 @@ class ChannelEngine:
 
         name = str(raw_name).strip()[:100]
         ch_type = str(params.get("type", "text")).lower()
+        if ch_type not in {"text", "voice", "forum", "stage"}:
+            raise ValidationError("Choose a supported channel type.", field="type")
 
         # Resolve category if specified
         category: discord.CategoryChannel | None = None
@@ -44,18 +46,42 @@ class ChannelEngine:
 
         if category_param and not isinstance(category, discord.CategoryChannel):
             raise ValidationError("Select an existing category in this server.", field="category")
+        if category is not None and (
+            category.guild.id != guild.id or not category.permissions_for(bot).manage_channels
+        ):
+            raise PermissionError("The bot needs Manage Channels in the selected category.")
 
         # Build overwrites: either from preset or direct list
         overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
         preset = params.get("permission_preset")
-        if preset:
+        if preset and preset != "inherit":
             overwrites = permission_engine.build_overwrites_for_preset(guild, preset)
+        elif params.get("permission_overwrites"):
+            overwrites = permission_engine.schema_overwrites(
+                guild, params["permission_overwrites"], created_roles or {},
+            )
         elif "permissions" in params and isinstance(params["permissions"], dict):
             # Convert raw permissions dictionary if supplied
             for role_name, rules in params["permissions"].items():
                 role = discord.utils.get(guild.roles, name=role_name) or (guild.default_role if role_name == "@everyone" else None)
                 if role and isinstance(rules, dict):
                     overwrites[role] = discord.PermissionOverwrite(**rules)
+
+        if category is not None:
+            everyone = guild.default_role
+            public = overwrites.get(everyone)
+            if public and public.view_channel is True and not category.permissions_for(everyone).view_channel:
+                raise ValidationError("A public preset cannot broaden access in this private category.", field="permissions")
+            inherited = {}
+            just_created = {role.id: role for role in (created_roles or {}).values()}
+            for target, overwrite in category.overwrites.items():
+                if isinstance(target, discord.Object) and target.type is discord.Role:
+                    target = just_created.get(target.id) or guild.get_role(target.id)
+                    if target is None:
+                        raise ValidationError("A category role could not be resolved. Refresh the plan before building.")
+                inherited[target] = overwrite
+            # Send the parent ACL explicitly so permissions hold from the creation request.
+            overwrites = permission_engine.merge_overwrites(inherited, overwrites)
 
         topic = str(params.get("topic", ""))[:1024]
         slowmode = max(0, min(int(params.get("slowmode", 0)), 21600))
@@ -92,7 +118,7 @@ class ChannelEngine:
             kwargs = {
                 "name": name,
                 "category": category,
-                "topic": topic,
+                "nsfw": nsfw,
             }
             if overwrites:
                 kwargs["overwrites"] = overwrites
@@ -114,13 +140,12 @@ class ChannelEngine:
     async def edit_channel(self, guild: discord.Guild, params: dict[str, Any]) -> discord.abc.GuildChannel:
         """Edit an existing channel's properties."""
         bot = guild.me
-        if not bot or not bot.guild_permissions.manage_channels:
-            raise PermissionError("Bot lacks 'Manage Channels' permission.", required_permission="Manage Channels")
-
         channel_id = params.get("channel_id")
         channel = guild.get_channel(int(channel_id)) if channel_id else None
         if not channel:
             raise ResourceNotFoundError("Channel", channel_id or "unknown")
+        if not bot or not channel.permissions_for(bot).manage_channels:
+            raise PermissionError("The bot needs Manage Channels in the selected channel.")
 
         edit_kwargs: dict[str, Any] = {}
         if "name" in params:
@@ -143,13 +168,14 @@ class ChannelEngine:
     async def delete_channel(self, guild: discord.Guild, params: dict[str, Any]) -> bool:
         """Delete an existing channel safely."""
         bot = guild.me
-        if not bot or not bot.guild_permissions.manage_channels:
-            raise PermissionError("Bot lacks 'Manage Channels' permission.", required_permission="Manage Channels")
-
         channel_id = params.get("channel_id")
         channel = guild.get_channel(int(channel_id)) if channel_id else None
-        if not channel:
+        if channel is None:
             raise ResourceNotFoundError("Channel", channel_id or "unknown")
+        if isinstance(channel, discord.CategoryChannel):
+            raise ValidationError("Select a channel rather than a category.")
+        if not bot or not channel.permissions_for(bot).manage_channels:
+            raise PermissionError("The bot needs Manage Channels in the selected channel.")
 
         reason = params.get("reason", "Deleted via DAMU Channel Engine")
         await channel.delete(reason=reason)
@@ -198,18 +224,17 @@ class ChannelEngine:
     async def update_permissions(self, guild: discord.Guild, params: dict[str, Any]) -> bool:
         """Update permissions for a specific role or member on a channel."""
         bot = guild.me
-        if not bot or not bot.guild_permissions.manage_channels:
-            raise PermissionError("Bot lacks 'Manage Channels' permission.", required_permission="Manage Channels")
-
         channel_id = params.get("channel_id")
         channel = guild.get_channel(int(channel_id)) if channel_id else None
         if not channel:
             raise ResourceNotFoundError("Channel", channel_id or "unknown")
+        if not bot or not channel.permissions_for(bot).manage_roles:
+            raise PermissionError("The bot needs Manage Roles in the selected channel.", required_permission="Manage Roles")
 
         preset = params.get("permission_preset")
         if preset:
             overwrites = permission_engine.build_overwrites_for_preset(guild, preset)
-            await channel.edit(overwrites=overwrites)
+            await channel.edit(overwrites=permission_engine.merge_overwrites(channel.overwrites, overwrites))
             return True
 
         target_id = params.get("target_id")
@@ -222,10 +247,18 @@ class ChannelEngine:
 
         if not target:
             raise ResourceNotFoundError("Role/Member target", target_id or "unknown")
+        if isinstance(target, discord.Role) and (target.managed or not target.is_default() and target >= bot.top_role):
+            raise PermissionError("The selected role is managed or at or above the bot's role.",
+                                  required_permission="Manage Roles")
 
-        overwrite_rules = params.get("overwrites", {})
-        overwrite = discord.PermissionOverwrite(**overwrite_rules)
-        await channel.set_permissions(target, overwrite=overwrite)
+        rules = params.get("overwrites", {})
+        if not rules or any(name not in discord.PermissionOverwrite.VALID_NAMES
+                            or (value is not None and type(value) is not bool)
+                            for name, value in rules.items()):
+            raise ValidationError("Specify valid channel permission fields.")
+        overwrite = channel.overwrites_for(target)
+        overwrite.update(**rules)
+        await channel.set_permissions(target, overwrite=None if overwrite.is_empty() else overwrite)
         return True
 
     def analyze_channel(self, channel: discord.abc.GuildChannel) -> dict[str, Any]:
