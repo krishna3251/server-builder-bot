@@ -123,6 +123,10 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
     def _guild_settings(self, guild_id: int) -> dict[str, Any]:
         return self._settings.get(str(guild_id), {})
 
+    async def is_enabled(self, guild_id: int) -> bool:
+        await self._load()
+        return self._guild_settings(guild_id).get("enabled") is True
+
     def _is_message_exempt(self, guild: discord.Guild, channel, member: discord.Member) -> bool:
         if member.bot or self._is_exempt(member):
             return True

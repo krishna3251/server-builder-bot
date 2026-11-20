@@ -17,6 +17,7 @@ class RiskLevel(str, enum.Enum):
 
 
 class ActionType(str, enum.Enum):
+    RENAME_GUILD = "rename_guild"
     CREATE_ROLE = "create_role"
     EDIT_ROLE = "edit_role"
     DELETE_ROLE = "delete_role"

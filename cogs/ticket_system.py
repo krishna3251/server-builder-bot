@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import add_usage_footer, info_embed, success_embed, warning_embed
+from services.ticket_permissions import ticket_log_is_private
 
 load_dotenv()
 
@@ -147,6 +148,14 @@ class CloseTicketModal(SafeModal, title="Close Ticket"):
         if member.id != opener_id and not staff:
             return await interaction.followup.send("You no longer have permission to close this ticket.", ephemeral=True)
 
+        log_channel = interaction.guild.get_channel(config_data.get("log_channel_id"))
+        staff_roles = {config_data.get("support_role_id"), config_data.get("mod_role_id")}
+        if not isinstance(log_channel, discord.TextChannel) or not ticket_log_is_private(log_channel, staff_roles):
+            return await interaction.followup.send(
+                "The ticket remains open. Ask an administrator to select a private staff log channel with /setup_tickets.",
+                ephemeral=True,
+            )
+
         # Determine ticket counter from channel name
         ticket_counter_str = channel.name.split("-")[1] if "-" in channel.name else "????"
 
@@ -172,35 +181,30 @@ class CloseTicketModal(SafeModal, title="Close Ticket"):
         transcript_text = "\n".join(transcript_lines)
         transcript_bytes = transcript_text.encode("utf-8")
 
-        # Step 3 \u2014 Post to log channel
-        log_channel_id = config_data.get("log_channel_id")
-        log_channel: Optional[discord.TextChannel] = None
-        if log_channel_id:
-            log_channel = interaction.guild.get_channel(log_channel_id)  # type: ignore[assignment]
-
-        if log_channel:
-            opener_mention = f"<@{opener_id}>" if opener_id else "Unknown"
-            log_embed = warning_embed(f"Ticket closed • #{ticket_counter_str}", "")
-            log_embed.add_field(name="Ticket", value=channel.name, inline=True)
-            log_embed.add_field(name="Opened by", value=opener_mention, inline=True)
-            log_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
-            log_embed.add_field(name="Reason", value=reason, inline=False)
-            log_embed.add_field(
-                name="Closed at",
-                value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
-                inline=True,
+        # Step 3 — Recheck log access after reading history.
+        if not ticket_log_is_private(log_channel, staff_roles):
+            return await interaction.followup.send(
+                "The ticket log is no longer private. The ticket remains open.", ephemeral=True
             )
-            transcript_file = discord.File(
-                io.BytesIO(transcript_bytes), filename=f"{channel.name}-transcript.txt"
-            )
-            try:
-                await log_channel.send(embed=log_embed, file=transcript_file)
-            except (discord.Forbidden, discord.HTTPException) as e:
-                reference = report_error(e, context="Saving ticket transcript", guild_id=interaction.guild.id)
-                return await interaction.followup.send(f"The transcript could not be saved. The ticket remains open. Fix log channel permissions and try again. Reference: `{reference}`", ephemeral=True)
-        else:
-            return await interaction.followup.send("The ticket log channel is unavailable. Ask an administrator to run /setup_tickets before closing this ticket.", ephemeral=True)
-
+        opener_mention = f"<@{opener_id}>" if opener_id else "Unknown"
+        log_embed = warning_embed(f"Ticket closed • #{ticket_counter_str}", "")
+        log_embed.add_field(name="Ticket", value=channel.name, inline=True)
+        log_embed.add_field(name="Opened by", value=opener_mention, inline=True)
+        log_embed.add_field(name="Closed by", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="Reason", value=reason, inline=False)
+        log_embed.add_field(
+            name="Closed at",
+            value=discord.utils.format_dt(discord.utils.utcnow(), style="F"),
+            inline=True,
+        )
+        transcript_file = discord.File(
+            io.BytesIO(transcript_bytes), filename=f"{channel.name}-transcript.txt"
+        )
+        try:
+            await log_channel.send(embed=log_embed, file=transcript_file)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            reference = report_error(e, context="Saving ticket transcript", guild_id=interaction.guild.id)
+            return await interaction.followup.send(f"The transcript could not be saved. The ticket remains open. Fix log channel permissions and try again. Reference: `{reference}`", ephemeral=True)
         # Step 4 \u2014 Lock out the opener
         if opener_id:
             opener_member = interaction.guild.get_member(opener_id)
@@ -269,10 +273,8 @@ class TicketControlView(SafeView):
         member = interaction.user
         assert isinstance(member, discord.Member)
 
-        has_support = any(r.id == support_role_id for r in member.roles)
-        has_mod = any(r.id == mod_role_id for r in member.roles)
-
-        if not has_support and not has_mod and not member.guild_permissions.manage_guild:
+        staff_roles = {support_role_id, mod_role_id} - {interaction.guild.id}
+        if not staff_roles.intersection(role.id for role in member.roles) and not member.guild_permissions.manage_guild:
             return await interaction.followup.send(
                 "Only support staff can claim tickets.", ephemeral=True
             )
@@ -614,6 +616,18 @@ class TicketSystem(commands.Cog):
                 ephemeral=True,
             )
 
+        if interaction.guild.id in {support_role.id, mod_role.id}:
+            return await respond(interaction, "Choose dedicated support and moderation roles. @everyone cannot be ticket staff.", ephemeral=True)
+        if not ticket_log_is_private(log_channel, {support_role.id, mod_role.id}):
+            return await respond(
+                interaction, "Choose a private log channel visible only to the selected ticket staff and administrators.",
+                ephemeral=True,
+            )
+        log_perms = log_channel.permissions_for(bot_member)
+        if not all(getattr(log_perms, name) for name in ("view_channel", "send_messages", "attach_files", "embed_links")):
+            return await respond(interaction, "The bot needs access to send embeds and files in the ticket log channel.",
+                                 ephemeral=True)
+
         # Validate image if provided
         ticket_image_url: Optional[str] = None
         if ticket_image is not None:
@@ -765,6 +779,11 @@ class TicketSystem(commands.Cog):
         if not isinstance(category, discord.CategoryChannel):
             return await interaction.followup.send(
                 "Ticket category not found. Please ask an admin to reconfigure with /setup_tickets.",
+                ephemeral=True,
+            )
+        if interaction.guild.id in {config_data.get("support_role_id"), config_data.get("mod_role_id")} or interaction.guild.me is None:
+            return await interaction.followup.send(
+                "Ticket staff roles or bot membership are unavailable. Ask an admin to review /setup_tickets.",
                 ephemeral=True,
             )
 
@@ -945,13 +964,15 @@ class TicketSystem(commands.Cog):
         log_channel_id = config_data.get("log_channel_id")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
-            if log_channel and isinstance(log_channel, discord.TextChannel):
+            if isinstance(log_channel, discord.TextChannel) and ticket_log_is_private(
+                log_channel, {config_data.get("support_role_id"), config_data.get("mod_role_id")},
+            ):
                 try:
                     await log_channel.send(embed=dm_embed)
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.error("Failed to send to log channel: %s", e)
             else:
-                log.warning("Log channel %s not found in guild %s.", log_channel_id, guild.id)
+                log.warning("Private ticket log channel %s unavailable in guild %s.", log_channel_id, guild.id)
 
     # ── /cancel_delete ────────────────────────────────────────────────────────
 

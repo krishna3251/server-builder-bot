@@ -7,6 +7,11 @@ import discord
 from core.models import ActionStatus, BuildPlan, EngineResult, RiskLevel
 
 
+def _field_text(lines: list[str]) -> str:
+    text = "\n".join(lines)
+    return text if len(text) <= 1024 else f"{text[:1023]}…"
+
+
 def format_preview_embed(plan: BuildPlan) -> discord.Embed:
     """Format a structured BuildPlan into a user-facing Change Preview embed."""
     risk_emojis = {
@@ -40,10 +45,10 @@ def format_preview_embed(plan: BuildPlan) -> discord.Embed:
         action_lines.append(f"...and **{len(plan.actions) - 12}** more actions")
 
     if action_lines:
-        embed.add_field(name="Planned Changes", value="\n".join(action_lines), inline=False)
+        embed.add_field(name="Planned Changes", value=_field_text(action_lines), inline=False)
 
     if plan.warnings:
-        warn_text = "\n".join(f"⚠️ {w}" for w in plan.warnings[:6])
+        warn_text = _field_text([f"⚠️ {w}" for w in plan.warnings[:6]])
         embed.add_field(name="Security & Policy Warnings", value=warn_text, inline=False)
 
     embed.set_footer(text="Review the changes above before confirming execution.")
@@ -55,13 +60,13 @@ def format_result_embed(result: EngineResult) -> discord.Embed:
     if result.success:
         embed = discord.Embed(
             title="✅ Operation Completed Successfully",
-            description=result.message,
+            description=result.message[:4096],
             colour=0x2ECC71,
         )
     else:
         embed = discord.Embed(
             title="❌ Operation Failed",
-            description=result.message,
+            description=result.message[:4096],
             colour=0xE74C3C,
         )
         if result.error_code:
@@ -88,9 +93,9 @@ def format_result_embed(result: EngineResult) -> discord.Embed:
             lines.append(f"{icon} {action.type.value.replace('_', ' ').title()}: **{action.target}**")
         if len(result.actions) > 10:
             lines.append(f"...and {len(result.actions) - 10} more actions")
-        embed.add_field(name="Execution Audit", value="\n".join(lines), inline=False)
+        embed.add_field(name="Execution Audit", value=_field_text(lines), inline=False)
 
     if result.warnings:
-        embed.add_field(name="Warnings", value="\n".join(f"⚠️ {w}" for w in result.warnings[:4]), inline=False)
+        embed.add_field(name="Warnings", value=_field_text([f"⚠️ {w}" for w in result.warnings[:4]]), inline=False)
 
     return embed

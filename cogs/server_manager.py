@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import logging
-from typing import Any, Sequence
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -11,12 +12,13 @@ from discord.ext import commands
 
 import config
 from core.engine import engine
-from core.errors import format_user_error
-from core.interaction import safe_defer, safe_edit, safe_followup, safe_modal, safe_send
+from core.errors import DamuError, ValidationError
+from core.interaction import safe_defer, safe_edit, safe_modal, safe_send
 from core.models import Action, ActionType, BuildPlan, RiskLevel
 from core.result import format_preview_embed, format_result_embed
+from core.risk import assess_plan_risk
 from engines.builder.planner import builder_planner
-from engines.guild.analyzer import SuggestedFix, server_analyzer
+from engines.guild.analyzer import ServerAnalysisReport, SuggestedFix, server_analyzer
 from engines.guild.category_engine import CategoryEngine
 from engines.guild.channel_engine import ChannelEngine
 from engines.guild.permission_engine import PermissionPreset, permission_engine
@@ -32,20 +34,27 @@ from utils.interactions import acknowledged
 log = logging.getLogger("cogs.server_manager")
 
 
+class ManagerView(discord.ui.View):
+    """Recheck identity and current permissions on every nested manager view."""
+
+    permission = "administrator"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if (interaction.user.id == self.user_id and interaction.guild_id == self.guild.id
+                and getattr(interaction.user.guild_permissions, self.permission, False)):
+            return True
+        await safe_send(interaction, "The requester must still have permission to use these controls.", ephemeral=True)
+        return False
+
+
 # ── 1. Main Navigation View ───────────────────────────────────────────────────
-class MainServerManagerView(discord.ui.View):
+class MainServerManagerView(ManagerView):
     """Primary navigation hub for DAMU Server Manager."""
 
     def __init__(self, guild: discord.Guild, user_id: int, timeout: float = 300.0) -> None:
         super().__init__(timeout=timeout)
         self.guild = guild
         self.user_id = user_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await safe_send(interaction, "Only the user who opened this panel can use it.", ephemeral=True)
-            return False
-        return True
 
     @discord.ui.button(label="Builder", style=discord.ButtonStyle.primary, emoji="🏗️", row=0)
     async def btn_builder(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -98,7 +107,7 @@ class MainServerManagerView(discord.ui.View):
         await safe_defer(interaction, ephemeral=True)
         embed = discord.Embed(
             title="🛡️ MODERATION & AUTOMOD",
-            description="Moderation commands available:\n• `/kick`, `/ban`, `/mute`, `/warn`\n• `/automod` for link & image spam protection.",
+            description="Moderation commands available:\n• `/kick`, `/ban`, `/mute`, `/warn`\n• `/automod_status` for the bot filter · `/automod exception` for Discord rules.",
             colour=0x5865F2,
         )
         view = BackToMainView(self.guild, self.user_id)
@@ -107,8 +116,8 @@ class MainServerManagerView(discord.ui.View):
     @discord.ui.button(label="Analyze", style=discord.ButtonStyle.success, emoji="🔎", row=2)
     async def btn_analyze(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await safe_defer(interaction, ephemeral=True)
-        report = await server_analyzer.analyze(self.guild)
-        view = ServerAnalyzerView(self.guild, self.user_id, report)
+        report = await server_analyzer.analyze(self.guild, viewer=interaction.user, client=interaction.client)
+        view = ServerAnalyzerView(self.guild, self.user_id, report, full_access=True)
         embed = view.get_embed()
         await safe_edit(interaction, embed=embed, view=view)
 
@@ -121,7 +130,7 @@ class MainServerManagerView(discord.ui.View):
         await safe_edit(interaction, embed=embed, view=view)
 
 
-class BackToMainView(discord.ui.View):
+class BackToMainView(ManagerView):
     """Reusable back button to return to the main server manager."""
 
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
@@ -148,13 +157,12 @@ def build_main_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="Channels", value=str(len(guild.channels)), inline=True)
     embed.add_field(name="Categories", value=str(len(guild.categories)), inline=True)
     embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
-    embed.add_field(name="Health", value="🟢 Healthy", inline=True)
     embed.set_footer(text="Select a module below to inspect or modify server resources.")
     return embed
 
 
 # ── 2. Channel Manager View ───────────────────────────────────────────────────
-class ChannelManagerView(discord.ui.View):
+class ChannelManagerView(ManagerView):
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
         super().__init__(timeout=300.0)
         self.guild = guild
@@ -163,7 +171,7 @@ class ChannelManagerView(discord.ui.View):
     def get_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title="💬 CHANNEL MANAGER",
-            description="Create, configure, clone, or modify channels with preview safety.",
+            description="Create or delete channels after reviewing a preview.",
             colour=0x5865F2,
         )
         embed.add_field(name="Total Channels", value=str(len(self.guild.channels)), inline=True)
@@ -192,7 +200,7 @@ class ChannelManagerView(discord.ui.View):
 
 class CreateChannelModal(discord.ui.Modal, title="Create New Channel"):
     channel_name = discord.ui.TextInput(label="Channel Name", placeholder="e.g. support-help", max_length=100, required=True)
-    channel_type = discord.ui.TextInput(label="Type (text / voice / forum)", placeholder="text", default="text", max_length=10, required=True)
+    channel_type = discord.ui.TextInput(label="Type (text / voice / forum / stage)", placeholder="text", default="text", max_length=10, required=True)
     channel_topic = discord.ui.TextInput(label="Topic", placeholder="Channel topic or purpose", style=discord.TextStyle.paragraph, required=False, max_length=500)
     slowmode = discord.ui.TextInput(label="Slowmode (seconds)", placeholder="0", default="0", max_length=5, required=False)
 
@@ -202,46 +210,52 @@ class CreateChannelModal(discord.ui.Modal, title="Create New Channel"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.administrator:
+        if (interaction.user.id != self.user_id or interaction.guild_id != self.guild.id
+                or not getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False)):
             await safe_send(interaction, "The requesting administrator must submit this form.", ephemeral=True)
             return
-        await safe_defer(interaction, ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         ch_type = self.channel_type.value.strip().lower()
-        if ch_type not in ("text", "voice", "forum", "stage"):
-            ch_type = "text"
-
+        if ch_type not in ("text", "voice", "forum", "stage") or not self.channel_name.value.strip():
+            return await safe_send(interaction, "Enter a channel name and choose text, voice, forum, or stage.", ephemeral=True)
+        topic = self.channel_topic.value.strip()
         try:
             sm = int(self.slowmode.value.strip() or "0")
+            if not 0 <= sm <= 21600:
+                raise ValueError
         except ValueError:
-            sm = 0
+            return await safe_send(interaction, "Enter a slowmode between 0 and 21,600 seconds.", ephemeral=True)
+        if ch_type in ("voice", "stage") and (topic or sm):
+            return await safe_send(interaction, "Channel topics and slowmode in this form apply to text and forum channels.", ephemeral=True)
 
         channel_params = {
             "name": self.channel_name.value.strip().replace(" ", "-").lower(),
             "type": ch_type,
-            "topic": self.channel_topic.value.strip(),
+            "topic": topic,
             "slowmode": sm,
         }
 
         view = SelectCategoryAndPresetView(self.guild, self.user_id, channel_params)
         embed = discord.Embed(
             title="⚙️ Configure Channel Placement & Preset",
-            description=f"Creating **#{channel_params['name']}** ({ch_type}).\nSelect parent category and permission policy below:",
+            description=f"Creating **#{channel_params['name']}** ({ch_type}).\nChoose a category and permission preset.",
             colour=0x5865F2,
         )
         await safe_edit(interaction, embed=embed, view=view)
 
 
-class SelectCategoryAndPresetView(discord.ui.View):
+class SelectCategoryAndPresetView(ManagerView):
     def __init__(self, guild: discord.Guild, user_id: int, channel_params: dict[str, Any]) -> None:
         super().__init__(timeout=180.0)
         self.guild = guild
         self.user_id = user_id
         self.params = channel_params
         self.selected_category_id: int | None = None
-        self.selected_preset: str = PermissionPreset.PUBLIC.value
+        self.selected_preset = "inherit"
 
         # Category Select
-        cat_options = [discord.SelectOption(label="No Category", value="none")]
+        cat_options = [discord.SelectOption(label="No Category", value="none", default=True)]
         for cat in guild.categories[:24]:
             cat_options.append(discord.SelectOption(label=cat.name[:100], value=str(cat.id)))
 
@@ -257,6 +271,7 @@ class SelectCategoryAndPresetView(discord.ui.View):
 
         # Preset Select
         preset_options = [
+            discord.SelectOption(label="Inherit permissions", value="inherit", default=True),
             discord.SelectOption(label="Public", value=PermissionPreset.PUBLIC.value, description="Everyone can view & chat"),
             discord.SelectOption(label="Members", value=PermissionPreset.MEMBERS.value, description="Members only"),
             discord.SelectOption(label="Verified", value=PermissionPreset.VERIFIED.value, description="Verified members only"),
@@ -275,53 +290,42 @@ class SelectCategoryAndPresetView(discord.ui.View):
 
     @discord.ui.button(label="Proceed to Preview", style=discord.ButtonStyle.primary, emoji="🔍", row=2)
     async def proceed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await safe_defer(interaction, ephemeral=True)
-        self.params["category_id"] = self.selected_category_id
-        self.params["permission_preset"] = self.selected_preset
-
-        plan = BuildPlan(
-            guild_id=self.guild.id,
-            requester_id=self.user_id,
-            operation="Create Channel",
-            risk_level=RiskLevel.LOW,
-            actions=[
-                Action(
-                    type=ActionType.CREATE_CHANNEL,
-                    target=self.params["name"],
-                    parameters=self.params,
-                )
-            ],
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        action = Action(
+            type=ActionType.CREATE_CHANNEL,
+            target=self.params["name"],
+            parameters={**self.params, "category_id": self.selected_category_id,
+                        "permission_preset": self.selected_preset},
         )
-
+        plan = BuildPlan(self.guild.id, self.user_id, "Create Channel", actions=[action])
+        plan.risk_level = assess_plan_risk(plan)
         preview_embed = format_preview_embed(plan)
+        category = self.guild.get_channel(self.selected_category_id) if self.selected_category_id else None
+        placement = category.name if category else "Server root"
+        preview_embed.add_field(name="Category", value=placement)
+        preview_embed.add_field(name="Permissions", value=self.selected_preset.replace("_", " ").title())
         view = ChangePreviewView(self.guild, self.user_id, plan)
         await safe_edit(interaction, embed=preview_embed, view=view)
 
-
-class SelectChannelToDeleteView(discord.ui.View):
+class SelectChannelToDeleteView(ManagerView):
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
         super().__init__(timeout=180.0)
         self.guild = guild
         self.user_id = user_id
 
-        options = [
-            discord.SelectOption(label=f"#{ch.name[:90]}", value=str(ch.id))
-            for ch in guild.channels[:25]
-            if not isinstance(ch, discord.CategoryChannel)
-        ]
-        if not options:
-            options = [discord.SelectOption(label="No channels available", value="none")]
-
-        select = discord.ui.Select(placeholder="Select channel to delete...", options=options)
+        select = discord.ui.ChannelSelect(
+            placeholder="Select a channel to delete…",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.voice,
+                           discord.ChannelType.stage_voice, discord.ChannelType.forum, discord.ChannelType.media],
+        )
 
         async def callback(inter: discord.Interaction):
-            await safe_defer(inter, ephemeral=True)
-            val = select.values[0]
-            if val == "none":
+            if not await safe_defer(inter, ephemeral=True):
                 return
-            ch = self.guild.get_channel(int(val))
-            if not ch:
-                return
+            ch = self.guild.get_channel(select.values[0].id)
+            if ch is None:
+                return await safe_send(inter, "The selected channel is unavailable.", ephemeral=True)
 
             plan = BuildPlan(
                 guild_id=self.guild.id,
@@ -347,7 +351,7 @@ class SelectChannelToDeleteView(discord.ui.View):
 
 
 # ── 3. Category Manager View ──────────────────────────────────────────────────
-class CategoryManagerView(discord.ui.View):
+class CategoryManagerView(ManagerView):
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
         super().__init__(timeout=300.0)
         self.guild = guild
@@ -398,7 +402,13 @@ class CreateCategoryModal(discord.ui.Modal, title="Create Category"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await safe_defer(interaction, ephemeral=True)
+        if (interaction.user.id != self.user_id or interaction.guild_id != self.guild.id
+                or not getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False)):
+            return await safe_send(interaction, "The requesting administrator must submit this form.", ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        if not self.cat_name.value.strip():
+            return await safe_send(interaction, "Enter a category name.", ephemeral=True)
         plan = BuildPlan(
             guild_id=self.guild.id,
             requester_id=self.user_id,
@@ -418,7 +428,7 @@ class CreateCategoryModal(discord.ui.Modal, title="Create Category"):
 
 
 # ── 4. Role Manager View ──────────────────────────────────────────────────────
-class RoleManagerView(discord.ui.View):
+class RoleManagerView(ManagerView):
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
         super().__init__(timeout=300.0)
         self.guild = guild
@@ -466,7 +476,7 @@ class RoleManagerView(discord.ui.View):
 
 
 # ── 5. Permission Manager View ────────────────────────────────────────────────
-class PermissionManagerView(discord.ui.View):
+class PermissionManagerView(ManagerView):
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
         super().__init__(timeout=300.0)
         self.guild = guild
@@ -474,10 +484,33 @@ class PermissionManagerView(discord.ui.View):
 
     def get_embed(self) -> discord.Embed:
         return discord.Embed(
-            title="🔐 PERMISSION MANAGER",
-            description="Inspect channel overwrites and apply secure presets (Public, Staff, Verified, Announcement).",
+            title="Permission Manager",
+            description="Select a channel or category to inspect its access rules. "
+                        "Use Channels → Create Channel to choose a preset for a new channel.",
             colour=0x5865F2,
         )
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, placeholder="Inspect a channel or category…", row=0,
+                       channel_types=[discord.ChannelType.text, discord.ChannelType.news, discord.ChannelType.voice,
+                                      discord.ChannelType.stage_voice, discord.ChannelType.forum,
+                                      discord.ChannelType.media, discord.ChannelType.category])
+    async def inspect_permissions(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect) -> None:
+        channel = self.guild.get_channel(select.values[0].id)
+        if channel is None:
+            return await safe_send(interaction, "The selected channel is unavailable.", ephemeral=True)
+        embed = self.get_embed()
+        embed.title = f"Permissions for {channel.name}"
+        public = channel.permissions_for(self.guild.default_role)
+        embed.add_field(name="@everyone", value=(
+            f"View Channel {'allowed' if public.view_channel else 'denied'}\n"
+            f"Send Messages {'allowed' if public.send_messages else 'denied'}"
+        ))
+        embed.add_field(name="Channel overrides", value=str(len(channel.overwrites)))
+        if channel.category_id is not None:
+            embed.add_field(name="Category permissions", value="Synced" if channel.permissions_synced else "Customized")
+        findings = permission_engine.audit_channel_permissions(channel)
+        embed.add_field(name="Findings", value="\n".join(findings)[:1024] or "None of the scan checks flagged this channel.", inline=False)
+        await safe_edit(interaction, embed=embed, view=self)
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="◀", row=1)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -487,7 +520,7 @@ class PermissionManagerView(discord.ui.View):
 
 
 # ── 6. Change Preview View ────────────────────────────────────────────────────
-class ChangePreviewView(discord.ui.View):
+class ChangePreviewView(ManagerView):
     """Universal change preview and confirmation screen before applying changes."""
 
     def __init__(self, guild: discord.Guild, user_id: int, plan: BuildPlan, timeout: float = 180.0) -> None:
@@ -495,25 +528,24 @@ class ChangePreviewView(discord.ui.View):
         self.guild = guild
         self.user_id = user_id
         self.plan = plan
+        self.plan.risk_level = assess_plan_risk(self.plan)
         self.busy = False
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await safe_send(interaction, "Only the requester can confirm or cancel this change.", ephemeral=True)
-            return False
-        return True
+        if self.plan.risk_level == RiskLevel.CRITICAL:
+            self.apply.label = "Confirm Administrator Grants"
+            self.apply.style = discord.ButtonStyle.danger
 
     @discord.ui.button(label="Apply Changes", style=discord.ButtonStyle.success, emoji="✅", row=0)
     async def apply(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await safe_defer(interaction, ephemeral=True)
-        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.administrator:
-            return await safe_send(interaction, "The requesting administrator must still have Administrator permission.", ephemeral=True)
+        if not await self.interaction_check(interaction):
+            return
         if self.busy or self.is_finished():
             return await safe_send(interaction, "This change is already being applied or has finished.", ephemeral=True)
         self.busy = True
         try:
+            if not await safe_defer(interaction, ephemeral=True):
+                return
             ctx = await engine.create_context(self.guild, interaction.user, interaction)
-            result = await engine.execute(self.plan, ctx)
+            result = await engine.execute(self.plan, ctx, confirmed=True)
             embed = format_result_embed(result)
             view = BackToMainView(self.guild, self.user_id)
             await safe_edit(interaction, embed=embed, view=view)
@@ -523,6 +555,9 @@ class ChangePreviewView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger, emoji="❌", row=0)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.busy or self.is_finished():
+            return await safe_send(interaction, "This change is already being applied or has finished.", ephemeral=True)
+        self.stop()
         await safe_defer(interaction, ephemeral=True)
         embed = discord.Embed(
             title="🚫 Action Cancelled",
@@ -534,7 +569,7 @@ class ChangePreviewView(discord.ui.View):
 
 
 # ── 7. Server Builder Wizard View ─────────────────────────────────────────────
-class ServerBuilderWizardView(discord.ui.View):
+class ServerBuilderWizardView(ManagerView):
     """Interactive multi-step server building wizard."""
 
     def __init__(self, guild: discord.Guild, user_id: int) -> None:
@@ -547,11 +582,11 @@ class ServerBuilderWizardView(discord.ui.View):
     def get_step_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title="🏗️ DAMU SERVER BUILDER WIZARD",
-            description="**Step 1:** Choose a server template below, then review modules and generate plan.",
+            description="**Step 1:** Choose a server template below, then generate a preview.",
             colour=0x5865F2,
         )
         embed.add_field(name="Selected Template", value=f"**{self.selected_template.title()}**", inline=True)
-        embed.add_field(name="Active Modules", value=", ".join(self.selected_modules), inline=False)
+        embed.add_field(name="Plan includes", value=", ".join(self.selected_modules), inline=False)
         return embed
 
     @discord.ui.button(label="Gaming", style=discord.ButtonStyle.primary, emoji="🎮", row=0)
@@ -577,13 +612,14 @@ class ServerBuilderWizardView(discord.ui.View):
         await safe_defer(interaction, ephemeral=True)
         from cogs.server_builder import TEMPLATES
         schema = TEMPLATES.get(self.selected_template, TEMPLATES["community"])
-        plan = builder_planner.create_plan_from_schema(
-            self.guild,
-            interaction.user,
-            schema,
-            operation_name=f"Template: {self.selected_template.title()}",
-            selected_modules=self.selected_modules,
-        )
+        try:
+            plan = builder_planner.create_plan_from_schema(
+                self.guild, interaction.user, schema,
+                operation_name=f"Template: {self.selected_template.title()}",
+                selected_modules=self.selected_modules,
+            )
+        except ValidationError as error:
+            return await safe_send(interaction, str(error), ephemeral=True)
         preview_embed = format_preview_embed(plan)
         view = ChangePreviewView(self.guild, self.user_id, plan)
         await safe_edit(interaction, embed=preview_embed, view=view)
@@ -596,7 +632,8 @@ class ServerBuilderWizardView(discord.ui.View):
 
     @discord.ui.button(label="Plan from prompt", style=discord.ButtonStyle.secondary, row=1)
     async def describe_plan(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.administrator:
+        if (interaction.user.id != self.user_id or interaction.guild_id != self.guild.id
+                or not getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False)):
             return await safe_send(interaction, "The requesting administrator must open this form.", ephemeral=True)
         await safe_modal(interaction, ManagerPlanModal(self.guild, self.user_id))
 
@@ -611,7 +648,8 @@ class ManagerPlanModal(discord.ui.Modal, title="Describe a server layout"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.administrator:
+        if (interaction.user.id != self.user_id or interaction.guild_id != self.guild.id
+                or not getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False)):
             return await safe_send(interaction, "The requesting administrator must submit this form.", ephemeral=True)
         if not await safe_defer(interaction, ephemeral=True, thinking=True):
             return
@@ -628,61 +666,84 @@ class ManagerPlanModal(discord.ui.Modal, title="Describe a server layout"):
             embed.add_field(name="Plan source", value=tier.replace("_", " ").title())
             await safe_send(interaction, embed=embed, view=ChangePreviewView(self.guild, self.user_id, plan),
                             ephemeral=True)
+        except ValidationError as error:
+            await safe_send(interaction, str(error), ephemeral=True)
         except Exception as error:
             reference = report_error(error, context="Server manager prompt", guild_id=self.guild.id)
             await safe_send(interaction, f"Could not prepare a plan. Reference: `{reference}`.", ephemeral=True)
 
 
 # ── 8. Server Analyzer & Smart Fixes View ─────────────────────────────────────
-class ServerAnalyzerView(discord.ui.View):
-    def __init__(self, guild: discord.Guild, user_id: int, report: Any) -> None:
+class ServerAnalyzerView(ManagerView):
+    def __init__(self, guild: discord.Guild, user_id: int, report: ServerAnalysisReport, *, full_access: bool = False):
         super().__init__(timeout=300.0)
         self.guild = guild
         self.user_id = user_id
         self.report = report
+        self.permission = "administrator" if full_access else "manage_guild"
+        if not full_access:
+            self.remove_item(self.back)
+            self.remove_item(self.suggested_fixes)
 
     def get_embed(self) -> discord.Embed:
+        report = self.report
+        status = "No findings in the checked scope" if report.is_healthy else "Review findings and scan coverage"
         embed = discord.Embed(
-            title="🔎 SERVER ANALYZER",
-            description=f"Diagnostic audit for **{self.guild.name}** (Read-Only).",
-            colour=0x2ECC71 if self.report.is_healthy else 0xF1C40F,
-        )
-        embed.add_field(
-            name="Structure",
-            value=f"✅ Categories: {self.report.categories_count}\n✅ Channels: {self.report.channels_count}\n"
-            + (f"⚠️ Orphan Channels: {len(self.report.orphan_channels)}" if self.report.orphan_channels else "✅ No Orphan Channels"),
-            inline=True,
+            title="Server permission scan",
+            description=f"**{status}**\n{report.channels_count} channels and categories checked"
+                        f" · {report.channels_outside_scope} outside your channel access",
+            colour=0x2ECC71 if report.is_healthy else 0xF1C40F,
         )
         embed.add_field(
             name="Roles",
-            value=f"✅ Total Roles: {self.report.roles_count}\n"
-            + (f"⚠️ Hierarchy Issues: {len(self.report.hierarchy_issues)}" if self.report.hierarchy_issues else "✅ Hierarchy Clean"),
+            value=(f"{report.roles_count} checked · {report.admin_roles_count} with Administrator\n"
+                   f"{len(report.dangerous_roles)} with elevated permissions\n"
+                   f"{len(report.hierarchy_issues)} at or above the bot's role"),
             inline=True,
         )
-        embed.add_field(
-            name="Permissions",
-            value=f"⚠️ Conflicts: {len(self.report.permission_conflicts)}" if self.report.permission_conflicts else "✅ Overwrites Consistent",
-            inline=True,
-        )
-        embed.add_field(
-            name="Bot Permissions",
-            value=f"❌ Missing: {', '.join(self.report.missing_bot_perms)}" if self.report.missing_bot_perms else "✅ Full Permissions",
-            inline=False,
-        )
+        embed.add_field(name="Channel findings", value=(
+            f"{len(report.permission_conflicts)} permission findings\n"
+            f"{len(report.orphan_channels)} uncategorized channels"
+        ), inline=True)
+        embed.add_field(name="Bot permission gaps",
+                        value=", ".join(report.missing_bot_perms) or "None in the server-level checklist",
+                        inline=False)
+        embed.add_field(name="Feature configuration", value=(
+            f"Tickets: **{report.tickets_status}**\n"
+            f"Bot-run AutoMod: **{report.local_automod_status}**\n"
+            f"Discord AutoMod: **{report.native_automod_status}**"
+        ), inline=False)
         return embed
 
-    @discord.ui.button(label="Suggested Fixes", style=discord.ButtonStyle.primary, emoji="🔧", row=0)
-    async def suggested_fixes(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await safe_defer(interaction, ephemeral=True)
-        if not self.report.suggested_fixes:
-            embed = discord.Embed(title="✅ No Fixes Needed", description="Your server structure is healthy!", colour=0x2ECC71)
-            view = BackToMainView(self.guild, self.user_id)
-            await safe_edit(interaction, embed=embed, view=view)
-            return
+    @discord.ui.button(label="Download findings", style=discord.ButtonStyle.secondary, row=0)
+    async def findings(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        report = self.report
+        lines = [f"Server permission scan for {report.guild_name}",
+                 f"Channels outside scope: {report.channels_outside_scope}",
+                 f"Tickets: {report.tickets_status}",
+                 f"Bot-run AutoMod: {report.local_automod_status}",
+                 f"Discord AutoMod: {report.native_automod_status}"]
+        for title, entries in (
+            ("Roles with elevated permissions", report.dangerous_roles),
+            ("Roles at or above the bot's role", report.hierarchy_issues),
+            ("Channel permission findings", report.permission_conflicts),
+            ("Bot permission gaps", report.missing_bot_perms),
+            ("Uncategorized channels", report.orphan_channels),
+        ):
+            lines.extend(["", title, *(f"- {entry}" for entry in (entries or ["None"]))])
+        await safe_send(interaction, file=discord.File(io.BytesIO("\n".join(lines).encode()),
+                        filename="server-permission-scan.txt"), ephemeral=True)
 
-        view = SmartFixView(self.guild, self.user_id, self.report.suggested_fixes, 0)
-        embed = view.get_current_embed()
-        await safe_edit(interaction, embed=embed, view=view)
+    @discord.ui.button(label="Suggested repairs", style=discord.ButtonStyle.primary, emoji="🔧", row=0)
+    async def suggested_fixes(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not interaction.user.guild_permissions.administrator:
+            return await safe_send(interaction, "Administrator permission is required to open repairs.", ephemeral=True)
+        if not self.report.suggested_fixes:
+            return await safe_send(interaction, "This scan has no automatic repairs. Download the findings for items to review.", ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        view = SmartFixView(self.guild, self.user_id, self.report.suggested_fixes)
+        await safe_edit(interaction, embed=view.get_current_embed(), view=view)
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="◀", row=0)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -691,7 +752,7 @@ class ServerAnalyzerView(discord.ui.View):
         await safe_edit(interaction, embed=build_main_embed(self.guild), view=view)
 
 
-class SmartFixView(discord.ui.View):
+class SmartFixView(ManagerView):
     """Presents suggested repairs one by one, requiring explicit confirmation."""
 
     def __init__(self, guild: discord.Guild, user_id: int, fixes: list[SuggestedFix], current_index: int = 0) -> None:
@@ -708,8 +769,8 @@ class SmartFixView(discord.ui.View):
 
     @discord.ui.button(label="Apply Fix", style=discord.ButtonStyle.success, emoji="✅", row=0)
     async def apply_fix(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if interaction.user.id != self.user_id or not interaction.user.guild_permissions.administrator:
-            return await safe_send(interaction, "The requesting administrator must confirm this repair.", ephemeral=True)
+        if not await self.interaction_check(interaction):
+            return
         if self.busy or self.is_finished():
             return await safe_send(interaction, "This repair is already running or finished.", ephemeral=True)
         self.busy = True
@@ -722,13 +783,16 @@ class SmartFixView(discord.ui.View):
         try:
             channel_engine = ChannelEngine()
             async with build_session(self.guild.id):
-                if fix.action_type == "set_permissions":
-                    await channel_engine.update_permissions(self.guild, fix.parameters)
-                elif fix.action_type == "move_channel":
-                    await channel_engine.move_channel(self.guild, fix.parameters)
-                else:
+                channel = self.guild.get_channel(fix.target_id)
+                if fix.action_type != "set_permissions":
                     raise ValueError("Unsupported automatic repair")
-            msg = f"✅ Applied fix: **{fix.title}**"
+                if channel is None or not permission_engine.public_posting_in_read_only_channel(channel):
+                    msg = "This finding has changed. Run /server_analyze again to refresh it."
+                else:
+                    await channel_engine.update_permissions(self.guild, fix.parameters)
+                    msg = f"✅ Applied fix: **{fix.title}**"
+        except DamuError as exc:
+            msg = str(exc)
         except Exception as exc:
             reference = report_error(exc, context="Server manager repair", guild_id=self.guild.id)
             msg = f"❌ Could not apply the repair. Reference: `{reference}`."
@@ -765,7 +829,7 @@ class ServerManagerCog(commands.Cog, name="Server Manager"):
 
     @app_commands.command(name="server_manager", description="Open the DAMU interactive server management control panel.")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @acknowledged(ephemeral=True)
     async def server_manager(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
@@ -776,7 +840,7 @@ class ServerManagerCog(commands.Cog, name="Server Manager"):
 
     @app_commands.command(name="damu", description="Shortcut to open the DAMU server management control panel.")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @acknowledged(ephemeral=True)
     async def damu(self, interaction: discord.Interaction) -> None:
         await self.server_manager.callback(self, interaction)
@@ -788,8 +852,9 @@ class ServerManagerCog(commands.Cog, name="Server Manager"):
     async def server_analyze(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
         await safe_defer(interaction, ephemeral=True)
-        report = await server_analyzer.analyze(interaction.guild)
-        view = ServerAnalyzerView(interaction.guild, interaction.user.id, report)
+        report = await server_analyzer.analyze(interaction.guild, viewer=interaction.user, client=interaction.client)
+        view = ServerAnalyzerView(interaction.guild, interaction.user.id, report,
+                                  full_access=interaction.user.guild_permissions.administrator)
         embed = view.get_embed()
         await safe_send(interaction, embed=embed, view=view, ephemeral=True)
 

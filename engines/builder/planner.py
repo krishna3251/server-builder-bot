@@ -7,9 +7,10 @@ from typing import Any
 
 import discord
 
-from core.models import Action, ActionType, BuildPlan, RiskLevel
+from core.errors import ValidationError
+from core.models import Action, ActionType, BuildPlan
+from core.risk import assess_plan_risk
 from engines.builder.schema import schema_validator
-from engines.guild.permission_engine import permission_engine
 
 log = logging.getLogger("engines.builder.planner")
 
@@ -38,22 +39,23 @@ class BuilderPlanner:
             metadata={"schema": validated_schema, "selected_modules": selected_modules or []},
         )
 
-        # 1. Rename guild if requested
-        if validated_schema.get("server_name"):
-            plan.actions.append(
-                Action(
-                    type=ActionType.EDIT_CATEGORY,  # or generic edit
-                    target=f"Guild: {validated_schema['server_name']}",
-                    parameters={"action": "rename_guild", "name": validated_schema["server_name"]},
-                )
-            )
-
         # 2. Roles
-        existing_role_names = {r.name.lower(): r for r in guild.roles}
+        referenced_roles = {
+            overwrite["role"]
+            for category in validated_schema.get("categories", [])
+            for resource in (category, *category.get("channels", []))
+            for overwrite in resource.get("permission_overwrites", [])
+        }
         for role_data in validated_schema.get("roles", []):
             r_name = role_data.get("name", "")
-            if skip_existing_roles and r_name.lower() in existing_role_names:
-                continue
+            if skip_existing_roles:
+                matches = [r for r in guild.roles if r.name.casefold() == r_name.casefold()]
+                if matches:
+                    if r_name in referenced_roles:
+                        if len(matches) != 1 or matches[0].name != r_name or matches[0].managed:
+                            raise ValidationError(f"Resolve the ambiguous or managed role '{r_name}' before building.")
+                        warnings.append(f"Channel access uses the existing role '{r_name}' and its members.")
+                    continue
 
             plan.actions.append(
                 Action(
@@ -89,30 +91,16 @@ class BuilderPlanner:
                     )
                 )
 
-        # 4. Optional modules
-        if selected_modules:
-            for mod in selected_modules:
-                plan.actions.append(
-                    Action(
-                        type=ActionType.CONFIGURE_MODULE,
-                        target=f"Module: {mod}",
-                        parameters={"module": mod},
-                    )
-                )
+        # Rename last so failed resource creation cannot leave a changed guild name.
+        server_name = validated_schema.get("server_name")
+        if server_name and server_name.strip() != guild.name:
+            plan.actions.append(Action(
+                type=ActionType.RENAME_GUILD,
+                target=server_name.strip(),
+                parameters={"name": server_name.strip()},
+            ))
 
-        # Risk assessment
-        has_admin = any("administrator" in w.lower() for w in warnings)
-        if has_admin:
-            plan.risk_level = RiskLevel.CRITICAL
-            plan.requires_confirmation = True
-        elif len(plan.actions) > 15:
-            plan.risk_level = RiskLevel.HIGH
-            plan.requires_confirmation = True
-        elif len(plan.actions) > 5:
-            plan.risk_level = RiskLevel.MEDIUM
-        else:
-            plan.risk_level = RiskLevel.LOW
-
+        plan.risk_level = assess_plan_risk(plan)
         return plan
 
 

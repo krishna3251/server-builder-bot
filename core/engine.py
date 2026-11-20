@@ -2,302 +2,221 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import discord
-from services.json_builder import build_session
 
 from core.context import ExecutionContext
-from core.errors import DamuError, ErrorCategory, PermissionError, classify_error
+from core.errors import DamuError, ErrorCategory, ValidationError, classify_error
 from core.events import bus
 from core.logging import log_event
-from core.models import (
-    Action,
-    ActionStatus,
-    ActionType,
-    BuildPlan,
-    EngineResult,
-    RiskLevel,
-)
+from core.models import Action, ActionStatus, ActionType, BuildPlan, EngineResult
+from core.risk import assess_plan_risk
+from engines.guild.category_engine import CategoryEngine
+from engines.guild.channel_engine import ChannelEngine
+from engines.guild.permission_engine import permission_engine
+from engines.guild.role_engine import RoleEngine
+from services.json_builder import build_session
 
 log = logging.getLogger("core.engine")
 
+SUPPORTED_ACTIONS = {
+    ActionType.CREATE_ROLE, ActionType.DELETE_ROLE, ActionType.CREATE_CATEGORY,
+    ActionType.CREATE_CHANNEL, ActionType.DELETE_CHANNEL, ActionType.SET_PERMISSIONS,
+    ActionType.RENAME_GUILD,
+}
+
 
 class DamuEngine:
-    """Orchestrates plan generation, validation, execution, verification, and rollback."""
-
-    def __init__(self) -> None:
-        self.log = log
+    """Validate and execute the plan reviewed by the requesting administrator."""
 
     async def create_context(
-        self,
-        guild: discord.Guild,
-        user: discord.User | discord.Member,
+        self, guild: discord.Guild, user: discord.User | discord.Member,
         interaction: discord.Interaction | None = None,
     ) -> ExecutionContext:
-        """Create a fresh execution context with a unique transaction ID."""
         return ExecutionContext(guild=guild, user=user, interaction=interaction)
 
     async def plan(self, request: dict[str, Any], context: ExecutionContext) -> BuildPlan:
-        """Generate a structured BuildPlan from a user request, schema, or preset."""
         operation = request.get("operation") or request.get("action") or "custom_operation"
-        plan = BuildPlan(
-            guild_id=context.guild.id,
-            requester_id=context.user.id,
-            operation=operation,
-            build_id=context.build_id,
-            metadata=request,
-        )
-
-        actions_data = request.get("actions", [])
-        if not actions_data and "action" in request:
-            actions_data = [request]
-
-        for item in actions_data:
-            act_type_str = item.get("action") or item.get("type", "")
+        plan = BuildPlan(context.guild.id, context.user.id, operation, build_id=context.build_id, metadata=request)
+        items = request.get("actions") or ([request] if "action" in request else [])
+        for item in items:
             try:
-                act_type = ActionType(act_type_str)
-            except ValueError:
-                act_type = ActionType.CREATE_CHANNEL
-
-            action = Action(
-                type=act_type,
-                target=item.get("target") or item.get("name", "unnamed"),
+                action_type = ActionType(item.get("action") or item.get("type", ""))
+            except ValueError as error:
+                raise ValidationError("The plan contains an unknown action.") from error
+            if action_type not in SUPPORTED_ACTIONS:
+                raise ValidationError(f"The manager cannot apply {action_type.value} actions.")
+            plan.actions.append(Action(
+                type=action_type, target=item.get("target") or item.get("name", "unnamed"),
                 parameters=item.get("parameters") or item,
                 dependencies=item.get("dependencies", []),
-                rollback_data=item.get("rollback_data", {}),
-            )
-            plan.actions.append(action)
-
-        # Assess risk
-        plan.risk_level = self._assess_risk(plan)
-        if plan.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL):
-            plan.requires_confirmation = True
-
-        context.log(f"Plan generated: {operation} ({len(plan.actions)} actions, risk: {plan.risk_level.value})")
+            ))
+        plan.risk_level = assess_plan_risk(plan)
         await bus.emit("plan_created", plan=plan, context=context)
         return plan
 
-    def _assess_risk(self, plan: BuildPlan) -> RiskLevel:
-        """Determine risk level of a plan based on requested actions and permissions."""
-        has_delete = any("delete" in a.type.value for a in plan.actions)
-        has_mass_ops = len(plan.actions) > 10
-
-        has_admin = False
-        for a in plan.actions:
-            perms = a.parameters.get("permissions") or []
-            if isinstance(perms, list) and any(str(p).lower() == "administrator" for p in perms):
-                has_admin = True
-                plan.warnings.append(f"Action '{a.target}' grants dangerous Administrator permission.")
-
-        if has_admin:
-            return RiskLevel.CRITICAL
-        if has_delete or has_mass_ops:
-            return RiskLevel.HIGH
-        if len(plan.actions) > 3 or any("role" in a.type.value for a in plan.actions):
-            return RiskLevel.MEDIUM
-        return RiskLevel.LOW
-
     async def validate(self, plan: BuildPlan, context: ExecutionContext) -> tuple[bool, list[str]]:
-        """Validate permissions, hierarchy, and schema consistency before touching Discord API."""
-        errors: list[str] = []
+        guild = context.guild
         bot = context.bot_member
-
         if not bot:
-            return False, ["Bot member object not found in guild."]
+            return False, ["The bot's server membership could not be resolved."]
+        if not plan.actions:
+            return False, ["This plan has no changes."]
 
-        # Check basic bot permissions
-        bot_perms = bot.guild_permissions
+        errors: list[str] = []
+        categories: dict[str, str] = {}
+        action_ids: set[str] = set()
         for action in plan.actions:
-            if "channel" in action.type.value or "category" in action.type.value:
-                if not bot_perms.manage_channels:
-                    errors.append("Bot lacks 'Manage Channels' permission.")
-                    break
-            if "role" in action.type.value:
-                if not bot_perms.manage_roles:
-                    errors.append("Bot lacks 'Manage Roles' permission.")
-                    break
+            params = action.parameters
+            kind = action.type
+            if kind not in SUPPORTED_ACTIONS:
+                errors.append(f"Unsupported manager action: {kind.value}.")
+                continue
+            if action.action_id in action_ids or action.status != ActionStatus.PENDING:
+                errors.append("An action is duplicated or has already been processed.")
+            action_ids.add(action.action_id)
+            if action.dependencies or params.get("category_target"):
+                if (kind != ActionType.CREATE_CHANNEL or len(action.dependencies) != 1
+                        or categories.get(action.dependencies[0]) != params.get("category_target")
+                        or action.dependencies[0] not in categories):
+                    errors.append(f"Invalid category dependency for {action.target}.")
+            if kind == ActionType.CREATE_CATEGORY:
+                categories[action.action_id] = action.target
 
-        # Check role hierarchy if creating/modifying roles
-        for action in plan.actions:
-            if action.type == ActionType.CREATE_ROLE or action.type == ActionType.EDIT_ROLE:
-                target_role_id = action.parameters.get("role_id")
-                if target_role_id:
-                    role = context.guild.get_role(int(target_role_id))
-                    if role and role >= bot.top_role:
-                        errors.append(f"Role '{role.name}' is higher than or equal to bot's highest role.")
+            if kind in (ActionType.CREATE_CATEGORY, ActionType.CREATE_CHANNEL) and not bot.guild_permissions.manage_channels:
+                errors.append("The bot needs Manage Channels to create channels or categories.")
+            if kind in (ActionType.CREATE_ROLE, ActionType.DELETE_ROLE) and not bot.guild_permissions.manage_roles:
+                errors.append("The bot needs Manage Roles to create or delete roles.")
+            if kind == ActionType.RENAME_GUILD and not bot.guild_permissions.manage_guild:
+                errors.append("The bot needs Manage Server to rename the server.")
+            if kind in (ActionType.DELETE_CHANNEL, ActionType.SET_PERMISSIONS):
+                channel = guild.get_channel(params.get("channel_id"))
+                permission = "manage_channels" if kind == ActionType.DELETE_CHANNEL else "manage_roles"
+                if channel is None:
+                    errors.append(f"Channel unavailable: {action.target}.")
+                elif not getattr(channel.permissions_for(bot), permission):
+                    errors.append(f"The bot needs {permission.replace('_', ' ').title()} in {action.target}.")
+            if kind == ActionType.DELETE_ROLE:
+                role = guild.get_role(params.get("role_id"))
+                if (role is None or role.is_default() or not permission_engine.bot_can_manage_role(guild, role)
+                        or not permission_engine.can_manage_role(context.user, role)):
+                    errors.append(f"Role unavailable or outside the permitted hierarchy: {action.target}.")
+            if kind == ActionType.CREATE_ROLE:
+                try:
+                    RoleEngine.validate_permissions(bot, params.get("permissions", []), allow_administrator=True)
+                except DamuError as error:
+                    errors.append(str(error))
+        errors = list(dict.fromkeys(errors))
+        await bus.emit("plan_validated", plan=plan, context=context, valid=not errors, errors=errors)
+        return not errors, errors
 
-        valid = len(errors) == 0
-        context.log(f"Validation {'passed' if valid else 'failed'}: {errors}")
-        await bus.emit("plan_validated", plan=plan, context=context, valid=valid, errors=errors)
-        return valid, errors
-
-    async def execute(self, plan: BuildPlan, context: ExecutionContext) -> EngineResult:
-        if (plan.guild_id != context.guild.id or plan.requester_id != context.user.id
-                or not context.user.guild_permissions.administrator):
-            return EngineResult.fail(operation=plan.operation, message="The requesting administrator must confirm the plan.",
-                                     error_code="PERMISSION_REQUIRED", build_id=plan.build_id)
+    async def execute(self, plan: BuildPlan, context: ExecutionContext, *, confirmed: bool = False) -> EngineResult:
+        if (not confirmed or plan.guild_id != context.guild.id or plan.requester_id != context.user.id
+                or not getattr(getattr(context.user, "guild_permissions", None), "administrator", False)):
+            return EngineResult.fail(
+                plan.operation, "The requesting administrator must confirm the plan.",
+                error_code="PERMISSION_REQUIRED", build_id=plan.build_id,
+            )
         try:
             async with build_session(context.guild.id):
                 return await self._execute(plan, context)
-        except RuntimeError as error:
-            return EngineResult.fail(operation=plan.operation, message="Another build is running or the plan could not finish.",
-                                     error_code="BUILD_UNAVAILABLE", build_id=plan.build_id)
+        except RuntimeError:
+            return EngineResult.fail(
+                plan.operation, "Another build is running or the plan could not finish.",
+                error_code="BUILD_UNAVAILABLE", build_id=plan.build_id,
+            )
 
     async def _execute(self, plan: BuildPlan, context: ExecutionContext) -> EngineResult:
-        """Execute all actions in plan step-by-step with rollback on failure."""
         valid, errors = await self.validate(plan, context)
         if not valid:
-            return EngineResult.fail(
-                operation=plan.operation,
-                message=f"Validation failed: {'; '.join(errors)}",
-                error_code="VALIDATION_FAILED",
-                build_id=plan.build_id,
-            )
+            return EngineResult.fail(plan.operation, "\n".join(errors), error_code="VALIDATION_FAILED", build_id=plan.build_id)
 
-        context.log(f"Executing build transaction {plan.build_id}")
-        log_event("build_started", guild_id=context.guild.id, user_id=context.user.id, build_id=plan.build_id, operation=plan.operation)
-
-        created_channels: list[discord.abc.GuildChannel] = []
-        created_roles: list[discord.Role] = []
+        guild = context.guild
+        log_event("build_started", guild_id=guild.id, user_id=context.user.id, build_id=plan.build_id, operation=plan.operation)
+        channel_engine, category_engine, role_engine = ChannelEngine(), CategoryEngine(), RoleEngine()
+        categories: dict[str, discord.CategoryChannel] = {}
+        roles: dict[str, discord.Role] = {}
+        created: list[tuple[Action, discord.abc.GuildChannel | discord.Role]] = []
 
         try:
-            from engines.guild.category_engine import CategoryEngine
-            from engines.guild.channel_engine import ChannelEngine
-            from engines.guild.role_engine import RoleEngine
-
-            channel_engine = ChannelEngine()
-            category_engine = CategoryEngine()
-            role_engine = RoleEngine()
-
             for action in plan.actions:
                 if context.is_cancelled():
-                    raise DamuError("Execution cancelled by user or timeout.", category=ErrorCategory.TRANSIENT)
-
+                    raise DamuError("The build was cancelled.", category=ErrorCategory.TRANSIENT)
                 action.status = ActionStatus.RUNNING
                 await bus.emit("action_started", action=action, context=context)
+                params = action.parameters
+                resource = None
 
-                # Route action to appropriate resource engine
                 if action.type == ActionType.CREATE_ROLE:
-                    role = await role_engine.create_role(context.guild, action.parameters)
-                    created_roles.append(role)
-                    action.created_resource_id = role.id
-                    action.status = ActionStatus.COMPLETED
-                elif action.type == ActionType.DELETE_ROLE:
-                    role_id = int(action.parameters.get("role_id", 0))
-                    role = context.guild.get_role(role_id)
-                    if role:
-                        await role.delete(reason=f"DAMU plan {plan.build_id}")
-                    action.status = ActionStatus.COMPLETED
+                    resource = await role_engine.create_role(guild, params, allow_administrator=True)
+                    roles[action.target] = resource
                 elif action.type == ActionType.CREATE_CATEGORY:
-                    cat = await category_engine.create_category(context.guild, action.parameters)
-                    created_channels.append(cat)
-                    action.created_resource_id = cat.id
-                    action.status = ActionStatus.COMPLETED
+                    resource = await category_engine.create_category(guild, params, created_roles=roles)
+                    categories[action.action_id] = resource
                 elif action.type == ActionType.CREATE_CHANNEL:
-                    ch = await channel_engine.create_channel(context.guild, action.parameters)
-                    created_channels.append(ch)
-                    action.created_resource_id = ch.id
-                    action.status = ActionStatus.COMPLETED
+                    if action.dependencies:
+                        params = {**params, "category": categories[action.dependencies[0]]}
+                    resource = await channel_engine.create_channel(guild, params, created_roles=roles)
+                elif action.type == ActionType.DELETE_ROLE:
+                    role = guild.get_role(params["role_id"])
+                    if role is None or not permission_engine.can_manage_role(context.user, role):
+                        raise ValidationError("The role is missing or outside the permitted hierarchy.")
+                    await role_engine.delete_role(guild, role.id, reason=f"DAMU plan {plan.build_id}")
                 elif action.type == ActionType.DELETE_CHANNEL:
-                    ch_id = int(action.parameters.get("channel_id", 0))
-                    ch = context.guild.get_channel(ch_id)
-                    if ch:
-                        await ch.delete(reason=f"DAMU plan {plan.build_id}")
-                    action.status = ActionStatus.COMPLETED
+                    await channel_engine.delete_channel(guild, params)
                 elif action.type == ActionType.SET_PERMISSIONS:
-                    await channel_engine.update_permissions(context.guild, action.parameters)
-                    action.status = ActionStatus.COMPLETED
-                else:
-                    action.status = ActionStatus.COMPLETED
+                    await channel_engine.update_permissions(guild, params)
+                elif action.type == ActionType.RENAME_GUILD:
+                    await guild.edit(name=params["name"], reason=f"DAMU plan {plan.build_id}")
 
-                context.log(f"Action completed: {action.type.value} -> {action.target}")
+                if resource is not None:
+                    created.append((action, resource))
+                    action.created_resource_id = resource.id
+                action.status = ActionStatus.COMPLETED
                 await bus.emit("action_completed", action=action, context=context)
-
-            # Verification step
-            verified = await self.verify(plan, context)
-            if not verified:
-                plan.warnings.append("Some resources could not be fully verified after creation.")
-
-            log_event("build_completed", guild_id=context.guild.id, build_id=plan.build_id, status="SUCCESS")
-            return EngineResult.ok(
-                operation=plan.operation,
-                message=f"Completed {len(plan.actions)} actions successfully.",
-                resource_id=plan.actions[0].created_resource_id if plan.actions else None,
-                actions=plan.actions,
-                warnings=plan.warnings,
-                build_id=plan.build_id,
-            )
-
-        except Exception as exc:
-            context.log(f"Execution failed: {exc}. Commencing recovery & rollback.")
-            log.error("Execution failed during plan %s: %s", plan.build_id, exc, exc_info=True)
-            log_event("build_failed", guild_id=context.guild.id, build_id=plan.build_id, error=str(exc))
-
-            # Mark current action as failed
-            for a in plan.actions:
-                if a.status == ActionStatus.RUNNING:
-                    a.status = ActionStatus.FAILED
-                    a.error = str(exc)
-
-            # Rollback created items
-            rollback_log = await self.recover(created_channels, created_roles, plan, context)
-
-            error_category = classify_error(exc)
+        except (Exception, asyncio.CancelledError) as exc:
+            log.exception("Execution failed during plan %s", plan.build_id)
+            for action in plan.actions:
+                if action.status == ActionStatus.RUNNING:
+                    action.status = ActionStatus.FAILED
+                    action.error = classify_error(exc).value
+                elif action.status == ActionStatus.PENDING:
+                    action.status = ActionStatus.SKIPPED
+            removed = await self.recover(created, plan.build_id)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            message = str(exc) if isinstance(exc, DamuError) else "Discord could not complete the build. Review the execution audit."
+            recovery = f"Reverted {removed} of {len(created)} newly created resources."
+            if any(action.status == ActionStatus.COMPLETED for action in plan.actions):
+                recovery += " Completed changes still listed may require manual review."
             return EngineResult.fail(
-                operation=plan.operation,
-                message=f"Execution failed: {exc}",
-                error_code=error_category.value,
-                recovery=f"Rolled back {len(created_channels)} channels and {len(created_roles)} roles: {rollback_log}",
-                warnings=plan.warnings,
-                build_id=plan.build_id,
-                actions=plan.actions,
+                plan.operation, message, error_code=classify_error(exc).value, recovery=recovery,
+                warnings=plan.warnings, build_id=plan.build_id, actions=plan.actions,
             )
 
-    async def verify(self, plan: BuildPlan, context: ExecutionContext) -> bool:
-        """Verify that newly created/modified resources exist in the guild."""
-        for action in plan.actions:
-            if action.status == ActionStatus.COMPLETED and action.created_resource_id:
-                if "channel" in action.type.value or "category" in action.type.value:
-                    if not context.guild.get_channel(action.created_resource_id):
-                        return False
-                elif "role" in action.type.value:
-                    if not context.guild.get_role(action.created_resource_id):
-                        return False
-        return True
+        log_event("build_completed", guild_id=guild.id, build_id=plan.build_id, status="SUCCESS")
+        return EngineResult.ok(
+            plan.operation, f"Completed {len(plan.actions)} actions.",
+            resource_id=created[0][1].id if created else None, actions=plan.actions,
+            warnings=plan.warnings, build_id=plan.build_id,
+        )
 
-    async def recover(
-        self,
-        created_channels: list[discord.abc.GuildChannel],
-        created_roles: list[discord.Role],
-        plan: BuildPlan,
-        context: ExecutionContext,
-    ) -> str:
-        """Roll back partially created channels and roles to keep guild state clean."""
-        context.log("Executing rollback on created resources")
-        deleted_ch = 0
-        deleted_ro = 0
-
-        for ch in reversed(created_channels):
+    async def recover(self, created, build_id: str) -> int:
+        removed = 0
+        for action, resource in reversed(created):
             try:
-                await ch.delete(reason=f"Rollback for plan {plan.build_id}")
-                deleted_ch += 1
-            except Exception as e:
-                context.log(f"Failed to delete channel {ch.id} during rollback: {e}")
-
-        for role in reversed(created_roles):
-            try:
-                await role.delete(reason=f"Rollback for plan {plan.build_id}")
-                deleted_ro += 1
-            except Exception as e:
-                context.log(f"Failed to delete role {role.id} during rollback: {e}")
-
-        for a in plan.actions:
-            if a.status == ActionStatus.COMPLETED:
-                a.status = ActionStatus.ROLLED_BACK
-
-        return f"Cleaned up {deleted_ch} channels and {deleted_ro} roles."
+                await resource.delete(reason=f"Rollback for plan {build_id}")
+            except discord.NotFound:
+                pass
+            except Exception:
+                log.exception("Could not remove resource %s during rollback of %s", resource.id, build_id)
+                continue
+            action.status = ActionStatus.ROLLED_BACK
+            removed += 1
+        return removed
 
 
 engine = DamuEngine()

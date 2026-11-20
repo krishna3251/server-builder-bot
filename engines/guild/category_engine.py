@@ -20,7 +20,8 @@ def _is_category(ch: Any) -> bool:
 class CategoryEngine:
     """Manages categories, inherited permissions, and orphan channel detection."""
 
-    async def create_category(self, guild: discord.Guild, params: dict[str, Any]) -> discord.CategoryChannel:
+    async def create_category(self, guild: discord.Guild, params: dict[str, Any], *,
+                              created_roles: dict | None = None) -> discord.CategoryChannel:
         """Create a new category with optional preset or overwrites."""
         bot = guild.me
         if not bot or not bot.guild_permissions.manage_channels:
@@ -36,6 +37,11 @@ class CategoryEngine:
         preset = params.get("permission_preset")
         if preset:
             overwrites = permission_engine.build_overwrites_for_preset(guild, preset)
+        elif params.get("permission_overwrites"):
+            overwrites = permission_engine.schema_overwrites(
+                guild, params["permission_overwrites"], created_roles or {},
+            )
+            overwrites[bot] = discord.PermissionOverwrite(view_channel=True, manage_channels=True)
 
         position = params.get("position")
         kwargs: dict[str, Any] = {"name": category_name}

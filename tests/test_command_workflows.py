@@ -277,7 +277,14 @@ class AdditionalFailureTests(unittest.IsolatedAsyncioTestCase):
         interaction.channel = MagicMock(spec=discord.TextChannel)
         interaction.channel.id = 30
         interaction.channel.send = AsyncMock(return_value=SimpleNamespace(id=31, channel=SimpleNamespace(mention='#tickets'), jump_url='https://discord.com/channels/10/30/31'))
-        await TicketSystem.setup_tickets.callback(cog, interaction, 'Help desk', 'Choose a category', SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3), SimpleNamespace(id=4))
+        interaction.guild.roles = []
+        log_channel = MagicMock(spec=discord.TextChannel, id=3, guild=interaction.guild)
+        log_channel.overwrites = {}
+        log_channel.permissions_for.side_effect = lambda target: (
+            discord.Permissions.all() if target is interaction.guild.me else discord.Permissions.none()
+        )
+        await TicketSystem.setup_tickets.callback(cog, interaction, 'Help desk', 'Choose a category',
+                                                 SimpleNamespace(id=1), SimpleNamespace(id=2), log_channel, SimpleNamespace(id=4))
         interaction.channel.send.assert_awaited_once()
         cog.config_manager.save_guild.assert_awaited_once()
 

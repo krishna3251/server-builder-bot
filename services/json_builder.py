@@ -57,8 +57,9 @@ _PRIVILEGED = {
     "administrator", "manage_guild", "manage_channels", "manage_roles",
     "manage_messages", "kick_members", "ban_members", "manage_webhooks",
     "mute_members", "deafen_members", "move_members", "mention_everyone",
-    "view_audit_log",
+    "view_audit_log", "moderate_members", "manage_threads", "manage_events", "manage_expressions",
 }
+_PERM_MAP.update({name: discord.Permissions.VALID_FLAGS[name] for name in _PRIVILEGED if name not in _PERM_MAP})
 
 
 def _resolve_permissions(perm_names: list[str]) -> discord.Permissions:
@@ -361,7 +362,7 @@ async def _build_server_unlocked(
     return logs, role_map
 
 
-def _validate_schema(schema: dict[str, Any]) -> None:
+def _validate_schema(schema: dict[str, Any], *, channel_types: tuple[str, ...] = ("text", "voice")) -> None:
     """Fully validate untrusted plans before any resource is changed."""
     def name(value, label, maximum=100):
         if not isinstance(value, str) or not value.strip() or len(value) > maximum:
@@ -428,14 +429,19 @@ def _validate_schema(schema: dict[str, Any]) -> None:
             target = ow["role"]
             if target.lower() != "@everyone" and target not in role_names:
                 raise ValueError(f"Unknown overwrite role: {target}")
-            if target in seen:
+            target_key = "@everyone" if target.lower() == "@everyone" else target
+            if target_key in seen:
                 raise ValueError(f"Duplicate overwrite for role: {target}")
-            seen.add(target)
+            seen.add(target_key)
             permissions(ow.get("allow", []), "Allowed permissions")
             permissions(ow.get("deny", []), "Denied permissions")
             if (target == auto_assign or target.lower() == "@everyone") and _PRIVILEGED.intersection(p.lower() for p in ow.get("allow", [])):
                 raise ValueError("Privileged channel permissions cannot be granted to everyone or the automatic member role.")
-            if _resolve_permissions(ow.get("allow", [])).value & _resolve_permissions(ow.get("deny", [])).value:
+            allowed = _resolve_permissions(ow.get("allow", []))
+            denied = _resolve_permissions(ow.get("deny", []))
+            if allowed.administrator or denied.administrator:
+                raise ValueError("Administrator is a server role permission and cannot be set on a channel.")
+            if allowed.value & denied.value:
                 raise ValueError("A permission cannot be both allowed and denied.")
 
     channel_count = thread_count = 0
@@ -452,8 +458,8 @@ def _validate_schema(schema: dict[str, Any]) -> None:
             if not isinstance(channel, dict):
                 raise ValueError("Every channel must be an object.")
             name(channel.get("name"), "Channel name")
-            if channel.get("type", "text") not in ("text", "voice"):
-                raise ValueError("Channel type must be text or voice.")
+            if channel.get("type", "text") not in channel_types:
+                raise ValueError("Channel type must be " + ", ".join(channel_types) + ".")
             overwrites(channel.get("permission_overwrites", []))
             if not isinstance(channel.get("topic", ""), str) or len(channel.get("topic", "")) > 1024:
                 raise ValueError("Channel topics must be strings of at most 1,024 characters.")
