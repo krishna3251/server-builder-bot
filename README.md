@@ -10,6 +10,10 @@ A full-featured Discord bot built with **discord.py 2.x** featuring:
 - **Moderation** — Kick, ban, mute, warn, clear, lock/unlock, slowmode
 - **Analytics** — Track messages, commands, and member activity
 - **Utility** — Ping, server/user info, polls, reminders, and more
+- **Community tools** — Welcome cards, auto roles, rules, and persistent verification
+- **Server Manager** — Interactive resource management, permission comparisons, and diagnostics
+
+See [DAMU feature comparison and settings import](DAMU_MIGRATION.md) for the added commands and the hosting cutover.
 
 ## Setup
 

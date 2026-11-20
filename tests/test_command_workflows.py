@@ -79,7 +79,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             for path in Path('cogs').glob('*.py'):
                 if not path.name.startswith('_'):
                     await bot.load_extension('cogs.' + path.stem)
-        self.assertEqual(len(bot.extensions), 12)
+        self.assertEqual(len(bot.extensions), 17)
         all_commands = list(bot.tree.walk_commands())
         for command in all_commands:
             with self.subTest(command=command.qualified_name):
@@ -90,6 +90,12 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(bot.tree.get_command('json_example'))
         self.assertIsNotNone(bot.tree.get_command('json_validate'))
         self.assertIsNotNone(bot.tree.get_command('automod').get_command('exception'))
+        for name in ('automod_exception', 'automod_reset', 'automod_status', 'autorole_setup',
+                     'builder_bypass_add', 'builder_bypass_list', 'builder_bypass_remove', 'commands_channel_setup',
+                     'damu', 'damu_doctor', 'damu_status', 'dashboard_status', 'example_template', 'mass_role',
+                     'perm_sync_check', 'send_rules', 'server_analyze', 'server_manager', 'server_templates',
+                     'setup_paste_json', 'setupverification', 'template_details', 'verification_status', 'welcome_setup'):
+            self.assertIsNotNone(bot.tree.get_command(name), name)
         await bot.close()
 
     async def test_balance_acknowledges_before_storage_then_finishes_original(self):

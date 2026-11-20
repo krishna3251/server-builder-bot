@@ -80,7 +80,7 @@ class AICog(commands.Cog, name="AI"):
 
     # ── /ai_persona ───────────────────────────────────────────────────────
     @app_commands.command(name="ai_persona", description="Switch the AI's personality.")
-    @app_commands.describe(set="Persona name: default, mentor, sarcastic, professional, coder")
+    @app_commands.describe(set="Choose an assistant persona")
     @app_commands.choices(
         set=[
             app_commands.Choice(name="Default (helpful assistant)", value="default"),
@@ -88,6 +88,7 @@ class AICog(commands.Cog, name="AI"):
             app_commands.Choice(name="Sarcastic (witty & dry)", value="sarcastic"),
             app_commands.Choice(name="Professional (formal)", value="professional"),
             app_commands.Choice(name="Coder (software engineer)", value="coder"),
+            app_commands.Choice(name="Rukiya (livestream companion)", value="rukiya"),
         ]
     )
     @acknowledged(ephemeral=True)

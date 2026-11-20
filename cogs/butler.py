@@ -165,7 +165,10 @@ class ButlerCog(commands.Cog, name="Server Butler"):
     @commands.Cog.listener()
     async def on_audit_log_entry_create(self, entry):
         if await self.usable(entry.guild.id):
-            await self.service.audit(entry)
+            try:
+                await self.service.audit(entry)
+            except (AttributeError, ValueError, TypeError):
+                log.warning("Skipped malformed Discord audit metadata in guild %s", entry.guild.id)
 
     @commands.Cog.listener()
     async def on_disconnect(self):
