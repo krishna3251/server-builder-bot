@@ -3,6 +3,7 @@ import copy
 import json
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -296,6 +297,54 @@ class CommandSecurityTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
 
 
 class ModerationReceiptTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_warning_escalation_preserves_a_longer_timeout(self):
+        from cogs import moderation
+        self.target.guild_permissions = discord.Permissions.none()
+        self.target.send = AsyncMock()
+        self.target.timeout = AsyncMock()
+        self.actor.guild_permissions = discord.Permissions(moderate_members=True)
+        self.guild.me.guild_permissions = discord.Permissions(moderate_members=True)
+        self.guild.fetch_member = AsyncMock(return_value=self.target)
+        interaction = FakeInteraction()
+        interaction.guild = self.guild
+        interaction.user = self.actor
+        interaction.id = 234
+
+        for prior_timeout, should_mute in (
+            (discord.utils.utcnow() + timedelta(hours=2), False),
+            (None, True),
+        ):
+            self.target.timed_out_until = prior_timeout
+            self.target.timeout.reset_mock()
+            with patch.multiple(
+                moderation, _warnings={'10_2': [{}, {}]}, _warnings_loaded=True,
+                _save_warnings=AsyncMock(), _mod_log=AsyncMock(), notify_action=AsyncMock(),
+            ):
+                await moderation.ModerationCog.warn.callback(moderation.ModerationCog(Mock()), interaction, self.target)
+                self.assertEqual(len(moderation._warnings['10_2']), 3)
+                self.assertEqual(self.target.timeout.await_count, int(should_mute))
+                self.assertEqual(moderation.notify_action.await_count, int(should_mute))
+
+    async def test_channel_mod_commands_check_permissions_in_the_selected_channel(self):
+        from cogs.moderation import ModerationCog
+        interaction = FakeInteraction()
+        interaction.guild = self.guild
+        interaction.user = self.actor
+        self.channel.edit = AsyncMock()
+        cog = ModerationCog(Mock())
+        self.channel.permissions_for.side_effect = lambda member: discord.Permissions(
+            view_channel=True, manage_channels=member is self.guild.me, manage_roles=member is self.guild.me,
+        )
+        await cog.slowmode.callback(cog, interaction, self.channel, 30)
+        await cog.lock.callback(cog, interaction, self.channel)
+        await cog.unlock.callback(cog, interaction, self.channel)
+        self.channel.edit.assert_not_awaited()
+        self.channel.set_permissions.assert_not_awaited()
+
+        self.channel.permissions_for.side_effect = None
+        await cog.slowmode.callback(cog, interaction, self.channel, 30)
+        self.channel.edit.assert_awaited_once_with(slowmode_delay=30)
+
     async def test_kick_ban_and_timeout_notify_only_after_success(self):
         from cogs.moderation import ModerationCog
         self.target.guild_permissions = discord.Permissions.none()

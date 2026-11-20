@@ -9,12 +9,12 @@ import copy
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiofiles
 import discord
-from services.error_service import SafeView
+from services.error_service import SafeView, report_error
 from discord import app_commands
 from discord.ext import commands
 
@@ -164,6 +164,19 @@ class ModerationCog(commands.Cog, name="Moderation"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.spam_guard = PrivilegedSpamGuard()
+
+    async def _can_edit_channel(self, interaction: discord.Interaction, channel: discord.TextChannel, permission: str) -> bool:
+        for member, label in ((interaction.user, "You"), (channel.guild.me, "I")):
+            if member is not None:
+                permissions = channel.permissions_for(member)
+                if permissions.view_channel and getattr(permissions, permission):
+                    continue
+            name = permission.replace("_", " ").title()
+            await respond(interaction, embed=error_embed(
+                "Permission required", f"{label} need View Channel and {name} in the selected channel."
+            ), ephemeral=True)
+            return False
+        return True
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -392,16 +405,30 @@ class ModerationCog(commands.Cog, name="Moderation"):
         log_em = warning_embed("Member Warned", f"**{user}** by {interaction.user.mention}\nReason: {reason}\nTotal: {count}")
         await _mod_log(interaction.guild, log_em)
 
-        # Auto-mute on 3rd warning
-        if count >= 3 and count % 3 == 0 and interaction.guild.me.guild_permissions.moderate_members and not user.guild_permissions.administrator and interaction.user.guild_permissions.moderate_members and bot_can_act(interaction.guild, user) and is_above(interaction.user, user):
-            try:
-                td = parse_duration("1h")
-                await user.timeout(td, reason=f"Auto-mute: {count} warnings reached")
-                await notify_action(self.bot, interaction.guild, interaction.user, user, "automatic timeout", f"1 hour after {count} warnings", interaction.id)
-                auto_em = warning_embed("Auto-Muted", f"**{user}** auto-muted for 1h after reaching {count} warnings.")
-                await interaction.followup.send(embed=auto_em, ephemeral=True)
-            except Exception:
-                pass
+        # Escalate every third warning without reducing an active timeout.
+        guild = interaction.guild
+        if count % 3 != 0 or not (
+            guild.me and guild.me.guild_permissions.moderate_members
+            and interaction.user.guild_permissions.moderate_members
+        ):
+            return
+        try:
+            target = await guild.fetch_member(user.id)
+            if target.guild_permissions.administrator or not (
+                bot_can_act(guild, target) and is_above(interaction.user, target)
+            ):
+                return
+            until = discord.utils.utcnow() + timedelta(hours=1)
+            if target.timed_out_until and target.timed_out_until >= until:
+                return
+            await target.timeout(until, reason=f"Auto-mute: {count} warnings reached")
+        except discord.HTTPException as error:
+            reference = report_error(error, context="Escalating a warning to a timeout", guild_id=guild.id)
+            await interaction.followup.send(f"Warning saved. Automatic timeout failed (reference `{reference}`).", ephemeral=True)
+            return
+        await notify_action(self.bot, guild, interaction.user, target, "automatic timeout", f"1 hour after {count} warnings", interaction.id)
+        auto_em = warning_embed("Auto-Muted", f"**{target}** auto-muted for 1h after reaching {count} warnings.")
+        await interaction.followup.send(embed=auto_em, ephemeral=True)
 
     # ── /warnings ─────────────────────────────────────────────────────────
     @app_commands.command(name="warnings", description="View warnings for a member.")
@@ -482,46 +509,46 @@ class ModerationCog(commands.Cog, name="Moderation"):
     # ── /slowmode ─────────────────────────────────────────────────────────
     @app_commands.command(name="slowmode", description="Set slowmode on a channel.")
     @app_commands.describe(channel="Target channel", seconds="Slowmode delay in seconds (0 to disable)")
-    @app_commands.checks.has_permissions(manage_channels=True)
     @guild_only()
     @acknowledged(ephemeral=True)
     @app_commands.guild_only()
-    @app_commands.checks.bot_has_permissions(manage_channels=True)
     async def slowmode(self, interaction: discord.Interaction, channel: discord.TextChannel, seconds: app_commands.Range[int, 0, 21600]) -> None:
+        if not await self._can_edit_channel(interaction, channel, "manage_channels"):
+            return
         await channel.edit(slowmode_delay=seconds)
         em = success_embed("Slowmode", f"Slowmode for {channel.mention} set to **{seconds}s**.")
         await respond(interaction, embed=em)
 
     # ── /lock ─────────────────────────────────────────────────────────────
-    @app_commands.command(name="lock", description="Lock a channel (prevent sending messages).")
+    @app_commands.command(name="lock", description="Deny Send Messages for @everyone in a channel.")
     @app_commands.describe(channel="Channel to lock")
-    @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
     @acknowledged(ephemeral=True)
     @app_commands.guild_only()
-    @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def lock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
+        if not await self._can_edit_channel(interaction, channel, "manage_roles"):
+            return
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = False
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
-        em = success_embed("Locked", f"{channel.mention} has been locked.")
+        em = success_embed("Default posting locked", f"{channel.mention} denies Send Messages for @everyone. Explicit role and member permissions still apply.")
         await respond(interaction, embed=em)
 
     # ── /unlock ───────────────────────────────────────────────────────────
-    @app_commands.command(name="unlock", description="Unlock a channel.")
+    @app_commands.command(name="unlock", description="Reset the @everyone Send Messages override in a channel.")
     @app_commands.describe(channel="Channel to unlock")
-    @app_commands.checks.has_permissions(manage_roles=True)
     @guild_only()
     @acknowledged(ephemeral=True)
     @app_commands.guild_only()
-    @app_commands.checks.bot_has_permissions(manage_roles=True)
     async def unlock(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         assert interaction.guild is not None
+        if not await self._can_edit_channel(interaction, channel, "manage_roles"):
+            return
         overwrite = channel.overwrites_for(interaction.guild.default_role)
         overwrite.send_messages = None
         await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
-        em = success_embed("Unlocked", f"{channel.mention} has been unlocked.")
+        em = success_embed("Default posting reset", f"{channel.mention} now uses the default Send Messages setting for @everyone.")
         await respond(interaction, embed=em)
 
 
