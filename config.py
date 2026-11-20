@@ -5,10 +5,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def normalize_token(value: str | None) -> str:
+    value = (value or "").strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+def validate_discord_token(token: str) -> None:
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is missing or empty.")
+    if token.casefold() in {"your_bot_token", "your_token_here", "your_discord_bot_token_here",
+                            "your_discord_bot_token", "bot_token", "changeme", "placeholder"}:
+        raise RuntimeError("DISCORD_TOKEN is set to an example placeholder value.")
+
+
 # ── Core ──────────────────────────────────────────────────────────────────────
-DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
+DISCORD_TOKEN: str = normalize_token(os.getenv("DISCORD_TOKEN"))
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 MONGO_URI: str = os.getenv("MONGO_URI", "")
+GIPHY_API_KEY: str = os.getenv("GIPHY_API_KEY", "").strip()
 
 # ── Channel / Role IDs ───────────────────────────────────────────────────────
 MOD_LOG_CHANNEL_ID: int = int(os.getenv("MOD_LOG_CHANNEL_ID", "").strip() or "0")
@@ -61,6 +78,9 @@ TICKET_LOG_FILE: str = f"{DATA_DIR}/tickets/ticket_log.json"
 WARNINGS_FILE: str = f"{DATA_DIR}/warnings.json"
 ANALYTICS_FILE: str = f"{DATA_DIR}/analytics.json"
 SHOP_FILE: str = f"{DATA_DIR}/economy/shop.json"
+DASHBOARD_CONFIG_FILE: str = f"{DATA_DIR}/dashboard_config.json"
+VERIFICATION_CONFIG_FILE: str = f"{DATA_DIR}/verification_config.json"
+AUTOMOD_FILE: str = f"{DATA_DIR}/automod/offenses.json"
 
 # ── Bot Meta ──────────────────────────────────────────────────────────────
 BOT_NAME: str = "ServerBot"

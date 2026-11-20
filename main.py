@@ -12,6 +12,7 @@ from discord.ext import commands
 from flask import Flask
 
 import config
+from core.startup import StartupManager, StartupState
 from utils.logger import setup_logging
 from services.error_service import respond_error, report_error
 
@@ -20,11 +21,24 @@ _keep_alive_app = Flask(__name__)
 
 
 @_keep_alive_app.route("/")
+@_keep_alive_app.route("/ready")
 def _health_check():
     active_bot = globals().get("bot")
     ready = bool(active_bot and active_bot.is_ready())
     failures = sorted(getattr(active_bot, "extension_errors", {}))
     return {"ready": ready, "failed_extensions": failures}, 200 if ready and not failures and not getattr(active_bot, "command_sync_error", None) else 503
+
+
+@_keep_alive_app.route("/health")
+def _process_health():
+    return {"status": "alive"}, 200
+
+
+@_keep_alive_app.route("/status")
+def _startup_status():
+    status = startup_manager.get_health_status()
+    status.pop("last_error", None)
+    return status
 
 
 def _run_keep_alive():
@@ -78,13 +92,17 @@ class ServerBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Load all cogs dynamically from the cogs/ directory."""
+        log.info("Release: %s v%s | source=krishna3251/server-builder-bot", config.BOT_NAME, config.BOT_VERSION)
         cog_dir = pathlib.Path("cogs")
         for cog_file in cog_dir.glob("*.py"):
             if cog_file.name.startswith("_"):
                 continue
             ext = f"cogs.{cog_file.stem}"
+            if ext in self.extensions:
+                continue
             try:
                 await self.load_extension(ext)
+                self.extension_errors.pop(ext, None)
                 log.info("Loaded cog: %s", ext)
             except Exception as exc:
                 self.extension_errors[ext] = report_error(exc, context=f"Loading {ext}")
@@ -110,6 +128,7 @@ class ServerBot(commands.Bot):
 
 
 bot = ServerBot()
+startup_manager = StartupManager(bot)
 
 
 @bot.tree.error
@@ -139,24 +158,16 @@ async def on_app_command_error(
 
 
 async def main() -> None:
-    if not config.DISCORD_TOKEN.strip():
-        log.critical(
-            "DISCORD_TOKEN is missing. Add it to the hosting environment variables; "
-            "the bot will not attempt to log in."
-        )
-        raise RuntimeError("DISCORD_TOKEN is required to start the bot.")
-
+    token = config.normalize_token(config.DISCORD_TOKEN)
+    config.validate_discord_token(token)
     Thread(target=_run_keep_alive, daemon=True).start()
     try:
-        async with bot:
-            await asyncio.sleep(1)
-            await bot.start(config.DISCORD_TOKEN.strip())
-    except discord.LoginFailure:
-        log.critical("Discord rejected DISCORD_TOKEN. Check the token and rotate it if exposed.")
-        raise
-    except Exception:
-        log.exception("Fatal bot startup/runtime error")
-        raise
+        await startup_manager.run(token)
+        state = startup_manager.state
+    finally:
+        await startup_manager.shutdown()
+    if state in (StartupState.INVALID_TOKEN, StartupState.FATAL_ERROR):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

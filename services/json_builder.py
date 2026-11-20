@@ -88,6 +88,81 @@ _NAMED_COLOURS: dict[str, int] = {
 }
 
 
+_FONT_OFFSETS: dict[str, dict[str, int]] = {
+    "bold": {"upper": 0x1D400, "lower": 0x1D41A, "digit": 0x1D7CE},
+    "italic": {"upper": 0x1D434, "lower": 0x1D44E},
+    "bold_italic": {"upper": 0x1D468, "lower": 0x1D482},
+    "script": {"upper": 0x1D49C, "lower": 0x1D4B6},
+    "bold_script": {"upper": 0x1D4D0, "lower": 0x1D4EA},
+    "fraktur": {"upper": 0x1D504, "lower": 0x1D51E},
+    "double_struck": {"upper": 0x1D538, "lower": 0x1D552, "digit": 0x1D7D8},
+    "monospace": {"upper": 0x1D670, "lower": 0x1D68A, "digit": 0x1D7F6},
+}
+
+_SCRIPT_EXCEPTIONS = {
+    "B": "\u212c", "E": "\u2130", "F": "\u2131", "H": "\u210b", "I": "\u2110",
+    "L": "\u2112", "M": "\u2133", "R": "\u211b", "e": "\u212f", "g": "\u210a",
+    "o": "\u2134",
+}
+_FRAKTUR_EXCEPTIONS = {
+    "C": "\u212d", "H": "\u210c", "I": "\u2111", "R": "\u211c", "Z": "\u2128",
+}
+_DOUBLE_STRUCK_EXCEPTIONS = {
+    "C": "\u2102", "H": "\u210d", "N": "\u2115", "P": "\u2119", "Q": "\u211a",
+    "R": "\u211d", "Z": "\u2124",
+}
+_SMALL_CAPS = str.maketrans({
+    "a": "\u1d00", "b": "\u0299", "c": "\u1d04", "d": "\u1d05", "e": "\u1d07",
+    "f": "\ua730", "g": "\u0262", "h": "\u029c", "i": "\u026a", "j": "\u1d0a",
+    "k": "\u1d0b", "l": "\u029f", "m": "\u1d0d", "n": "\u0274", "o": "\u1d0f",
+    "p": "\u1d18", "q": "q", "r": "\u0280", "s": "s", "t": "\u1d1b",
+    "u": "\u1d1c", "v": "\u1d20", "w": "\u1d21", "x": "x", "y": "\u028f",
+    "z": "\u1d22",
+})
+
+
+def _style_text(text: str, style: str | None) -> str:
+    """Apply a Unicode text style. Discord does not support installable fonts."""
+    if not isinstance(style, str) or not style:
+        return text
+
+    normalized = style.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized == "small_caps":
+        return text.lower().translate(_SMALL_CAPS)
+
+    offsets = _FONT_OFFSETS.get(normalized)
+    if not offsets:
+        return text
+
+    exceptions: dict[str, str] = {}
+    if normalized in {"script", "bold_script"}:
+        exceptions = _SCRIPT_EXCEPTIONS
+    elif normalized == "fraktur":
+        exceptions = _FRAKTUR_EXCEPTIONS
+    elif normalized == "double_struck":
+        exceptions = _DOUBLE_STRUCK_EXCEPTIONS
+
+    styled: list[str] = []
+    for char in text:
+        if char in exceptions:
+            styled.append(exceptions[char])
+        elif "A" <= char <= "Z" and "upper" in offsets:
+            styled.append(chr(offsets["upper"] + ord(char) - ord("A")))
+        elif "a" <= char <= "z" and "lower" in offsets:
+            styled.append(chr(offsets["lower"] + ord(char) - ord("a")))
+        elif "0" <= char <= "9" and "digit" in offsets:
+            styled.append(chr(offsets["digit"] + ord(char) - ord("0")))
+        else:
+            styled.append(char)
+
+    return "".join(styled)
+
+
+def _styled_name(data: dict[str, Any], fallback_style: str | None = None) -> str:
+    style = data.get("font") or data.get("name_font") or data.get("name_style") or fallback_style
+    return _style_text(data["name"], style)
+
+
 def _parse_colour(colour_str: str | None) -> discord.Colour:
     """Parse a colour from hex (#FF0000) or named colour (red, gold, blurple, etc.)."""
     if not colour_str:
@@ -147,7 +222,7 @@ async def _build_server_unlocked(
     try:
         # ── Rename server ────────────────────────────────────────────────────
         if schema.get("server_name"):
-            await guild.edit(name=schema["server_name"])
+            await guild.edit(name=_style_text(schema["server_name"], schema.get("server_font")))
             logs.append(f"Renamed server to **{schema['server_name']}**")
 
         # ── Create roles ─────────────────────────────────────────────────────
@@ -156,7 +231,7 @@ async def _build_server_unlocked(
             perms = _resolve_permissions(role_data.get("permissions", []))
             colour = _parse_colour(role_data.get("color"))
             role = await guild.create_role(
-                name=role_data["name"],
+                name=_styled_name(role_data, schema.get("role_font")),
                 colour=colour,
                 hoist=role_data.get("hoist", False),
                 mentionable=role_data.get("mentionable", False),
@@ -185,7 +260,10 @@ async def _build_server_unlocked(
 
             if guild.me is not None:
                 overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
-            category = await guild.create_category(name=cat_data["name"], overwrites=overwrites)
+            global_font = schema.get("font") or schema.get("name_font") or schema.get("name_style")
+            category = await guild.create_category(
+                name=_styled_name(cat_data, schema.get("category_font") or global_font), overwrites=overwrites,
+            )
             created_channels.append(category)
             logs.append(f"Created category: **{cat_data['name']}**")
             progress.advance()
@@ -212,12 +290,13 @@ async def _build_server_unlocked(
                         ch_overwrites[target] = combined
 
                 ch_type = ch_data.get("type", "text").lower()
+                channel_name = _styled_name(ch_data, schema.get("channel_font") or global_font)
                 if ch_type == "voice":
                     # Clamp bitrate to guild's max (96000 for unboosted servers)
                     max_bitrate = guild.bitrate_limit
                     bitrate = min(ch_data.get("bitrate", 64000), max_bitrate)
                     kwargs: dict[str, Any] = {
-                        "name": ch_data["name"],
+                        "name": channel_name,
                         "category": category,
                         "bitrate": bitrate,
                         "user_limit": ch_data.get("user_limit", 0),
@@ -230,7 +309,7 @@ async def _build_server_unlocked(
                     logs.append(f"Created voice channel: **{ch_data['name']}**{perm_note}")
                 else:
                     kwargs: dict[str, Any] = {
-                        "name": ch_data["name"],
+                        "name": channel_name,
                         "category": category,
                         "topic": ch_data.get("topic", ""),
                         "slowmode_delay": ch_data.get("slowmode", 0),

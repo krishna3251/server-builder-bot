@@ -16,7 +16,7 @@ from discord.ext import commands
 from services.template_service import parse_plan, generate_plan
 from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
-from services.json_builder import build_server, _validate_schema, preflight_build
+from services.json_builder import build_server, _styled_name, _validate_schema, preflight_build
 
 
 class ModernBuilderPanel(discord.ui.LayoutView):
@@ -410,6 +410,7 @@ class CustomBuildConfirmView(SafeView):
         command_channel_id: int,
         clean_existing: bool = False,
         build_label: str = "Server build",
+        delegate_check=None,
     ) -> None:
         super().__init__(timeout=120)
         self.cog = cog
@@ -417,6 +418,7 @@ class CustomBuildConfirmView(SafeView):
         self.owner_id = owner_id
         self.command_channel_id = command_channel_id
         self.clean_existing = clean_existing
+        self.delegate_check = delegate_check
         self.started = False
         self.section = "overview"
         self.detail_page = 0
@@ -472,18 +474,28 @@ class CustomBuildConfirmView(SafeView):
         self.update_navigation()
         await interaction.response.edit_message(embed=self.review_embed(), view=self)
 
+    def _may_confirm(self, interaction: discord.Interaction) -> bool:
+        guild = interaction.guild
+        return bool(
+            guild and interaction.user.id == self.owner_id and (
+                interaction.user.guild_permissions.administrator
+                or (self.delegate_check and not self.clean_existing
+                    and self.delegate_check(guild, interaction.user, self.schema))
+            )
+        )
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await respond(interaction,
-                "Only the administrator who started this build can confirm it.",
+                "Only the person who started this build can confirm it.",
                 ephemeral=True,
             )
             return False
         if self.started:
             await respond(interaction, "This build has already started.", ephemeral=True)
             return False
-        if not interaction.guild or not interaction.user.guild_permissions.administrator:
-            await respond(interaction, "Administrator permission is required to use this plan.", ephemeral=True)
+        if not self._may_confirm(interaction):
+            await respond(interaction, "You no longer have permission to use this plan.", ephemeral=True)
             return False
         return True
 
@@ -497,8 +509,8 @@ class CustomBuildConfirmView(SafeView):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.started:
             return await respond(interaction, "This build has already started.", ephemeral=True)
-        if not interaction.guild or not interaction.user.guild_permissions.administrator:
-            return await respond(interaction, "Administrator permission is required to confirm this build.", ephemeral=True)
+        if not self._may_confirm(interaction):
+            return await respond(interaction, "You no longer have permission to confirm this build.", ephemeral=True)
         try:
             preflight_build(interaction.guild, self.schema, clean_existing=self.clean_existing)
         except ValueError as exc:
@@ -1008,6 +1020,7 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         sent = 0
         failed = 0
 
+        font = schema.get("channel_font") or schema.get("font") or schema.get("name_font") or schema.get("name_style")
         for cat in schema.get("categories", []):
             for ch_data in cat.get("channels", []):
                 if ch_data.get("type", "text").lower() != "text":
@@ -1017,7 +1030,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
                 if not channel_name:
                     continue
 
-                channel = next((c for c in guild.text_channels if c.id in created_channel_ids and c.name == channel_name), None)
+                styled_name = _styled_name(ch_data, font)
+                channel = next((c for c in guild.text_channels if c.id in created_channel_ids and c.name in (channel_name, styled_name)), None)
                 if not channel:
                     failed += 1
                     continue
@@ -1295,6 +1309,12 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             )
             structure_built = True
             assign_logs: list[str] = []
+            tools = self.bot.get_cog("Builder Tools")
+            if tools:
+                try:
+                    await tools.settings.update(guild.id, last_build=schema)
+                except OSError:
+                    log.warning("Could not save the completed build plan for guild %s", guild.id)
 
             for role_data in schema.get("roles", []):
                 if "administrator" in role_data.get("permissions", []):

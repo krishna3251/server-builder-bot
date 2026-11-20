@@ -31,6 +31,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "🧱 Server builder",
         "**Create one channel:** `/create_channel`\n**Quick start:** `/builder_panel` · **JSON reference:** `/json_example`\n"
         "**Commands:** `/setup_server`, `/setup_custom`, `/server_json`, `/json_example`, `/json_validate`, `/generate_server`, `/channel_summaries`\n\n"
+        "`/server_manager` opens the control panel. `/server_analyze` checks the server.\n"
         "Review previews before applying changes. Cleaning an existing server is destructive.",
     ),
     "tickets": (
@@ -46,8 +47,15 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "`/warn` · `/warnings` · `/clearwarnings` · `/clear`\n"
         "`/slowmode` · `/lock` · `/unlock`\n"
         "`/automod exception` · `/automod recent-timeouts`\n"
+        "`/automod_status` · `/automod_exception` · `/automod_reset` for the bot's link and GIF filter.\n"
         "`/security` · `/quarantine_setup` · `/quarantine` · `/sudo_ban` · `/quarantine_release`\n\n"
         "Moderation commands require the relevant server permissions and respect role hierarchy.",
+    ),
+    "community": (
+        "👋 Community tools",
+        "`/dashboard_status` · `/welcome_setup` · `/autorole_setup` · `/commands_channel_setup`\n"
+        "`/send_rules` · `/mass_role`\n"
+        "`/setupverification` · `/verification_status`",
     ),
     "economy": (
         "💰 Economy & leveling",
@@ -87,6 +95,7 @@ class HelpCategorySelect(discord.ui.Select):
             discord.SelectOption(label="Server Builder", value="builder", emoji="🧱"),
             discord.SelectOption(label="Tickets", value="tickets", emoji="🎫"),
             discord.SelectOption(label="Moderation", value="moderation", emoji="🛡️"),
+            discord.SelectOption(label="Community", value="community", emoji="👋"),
             discord.SelectOption(label="Economy & Leveling", value="economy", emoji="💰"),
             discord.SelectOption(label="AI Assistant", value="ai", emoji="✨"),
             discord.SelectOption(label="Server Butler", value="butler", emoji="🎩"),

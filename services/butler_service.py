@@ -11,6 +11,7 @@ import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
+from aiohttp import ClientConnectionError
 
 from services.butler_store import ButlerStore
 
@@ -228,7 +229,12 @@ class ButlerService:
             return
         user = getattr(entry, "user", None)
         user_id = getattr(entry, "user_id", None) or getattr(user, "id", 0) or 0
-        target = getattr(getattr(entry, "target", None), "id", 0) or 0
+        try:
+            target = getattr(getattr(entry, "target", None), "id", 0) or 0
+        except TypeError:
+            if not isinstance(entry, discord.AuditLogEntry) or entry._target_id is not None:
+                raise
+            target = 0
         return await self.store.audit(
             entry.guild.id,
             entry.id,
@@ -277,6 +283,8 @@ class ButlerService:
                 status = "unavailable: audit-log access denied"
             except discord.HTTPException:
                 status = "partial: audit-log API request failed"
+            except (TimeoutError, ClientConnectionError):
+                status = "partial: audit-log connection timed out or reset"
             await self.store.audit_status(guild.id, status)
 
     async def schedule(self):
