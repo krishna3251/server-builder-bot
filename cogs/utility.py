@@ -45,6 +45,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "`/kick` · `/ban` · `/unban` · `/mute` · `/unmute`\n"
         "`/warn` · `/warnings` · `/clearwarnings` · `/clear`\n"
         "`/slowmode` · `/lock` · `/unlock`\n"
+        "`/automod exception` · `/automod recent-timeouts`\n"
         "`/security` · `/quarantine_setup` · `/quarantine` · `/sudo_ban` · `/quarantine_release`\n\n"
         "Moderation commands require the relevant server permissions and respect role hierarchy.",
     ),
@@ -191,15 +192,17 @@ class UtilityCog(commands.Cog, name="Utility"):
         em = info_embed("🩺 Bot diagnostics", "Configuration and runtime checks for administrators. Error references match the bot logs.")
         em.add_field(name="Connection", value=f"{'✅ Ready' if self.bot.is_ready() else '⏳ Connecting'} · {round(self.bot.latency * 1000) if math.isfinite(self.bot.latency) else 'N/A'} ms", inline=True)
         em.add_field(name="AI configuration", value="✅ Key configured" if config.OPENROUTER_API_KEY else "⚠️ Set OPENROUTER_API_KEY", inline=True)
-        em.add_field(name="Ticket configuration", value="MongoDB configured (connection not verified)" if config.MONGO_URI else "Local JSON mode (persistent storage required)", inline=True)
+        em.add_field(name="Ticket configuration", value="MongoDB configured (connection not verified)" if config.MONGO_URI.strip() else "Local JSON mode (persistent storage required)", inline=True)
         sync_error = getattr(self.bot, 'command_sync_error', None)
         em.add_field(name='Slash command sync', value=f'⚠️ Failed: `{sync_error}` · developer can run /sync_commands' if sync_error else 'No sync failure recorded (check hosting logs for startup details)', inline=False)
         loaded = sorted(self.bot.extensions)
         em.add_field(name="Loaded modules", value="\n".join(f"✅ {name.removeprefix('cogs.')}" for name in loaded) or "None", inline=True)
         failed = getattr(self.bot, "extension_errors", {})
         em.add_field(name="Modules needing attention", value="\n".join(f"⚠️ {name}: `{reference}`" for name, reference in failed.items())[:1000] or "✅ No startup failures recorded", inline=True)
-        required = ("manage_channels", "manage_roles", "manage_guild", "send_messages", "embed_links", "attach_files", "read_message_history")
-        missing = [p.replace("_", " ") for p in required if not getattr(guild.me.guild_permissions, p, False)]
+        permissions = guild.me.guild_permissions if guild.me else discord.Permissions.none()
+        required = ("manage_channels", "manage_roles", "manage_guild", "moderate_members", "view_audit_log",
+                    "send_messages", "embed_links", "attach_files", "read_message_history")
+        missing = [p.replace("_", " ") for p in required if not getattr(permissions, p)]
         em.add_field(name="Server permissions", value=", ".join(missing) if missing else "✅ Core permissions available", inline=False)
         current_errors = [item for item in recent_errors if item.get("guild_id") in (None, guild.id)]
         em.add_field(name="Recent errors · this process", value="\n".join(f"`{item['reference']}` · {item['type']}" for item in current_errors[-5:]) or "✅ No captured errors", inline=False)

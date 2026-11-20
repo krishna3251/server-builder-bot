@@ -38,6 +38,14 @@ Grant the bot **View Channel** and **Manage Messages** wherever cleanup is neede
 
 The bot alerts the affected account and the server owner by DM, and posts incident counts to the configured `MOD_LOG_CHANNEL_ID`. Alerts are limited to one per account per server per minute. Failed removals appear in the hosting logs even when DMs are closed.
 
+### Discord AutoMod exceptions
+
+- Run `/automod exception`, select the Discord AutoMod rule, then choose exempt roles or channels. Use **Switch to Remove** to undo an exemption. The panel shows which rules are enabled and which have a timeout action.
+- To use mentions directly, pass the `rule` plus a `role` or `channel` to `/automod exception`. Use `remove: True` to remove those entries. A role or channel exemption applies to the selected rule. Add it to each rule that needs it.
+- Run `/automod recent-timeouts member: @member` to check up to five matching entries from Discord's recent audit logs. The result identifies the native rule or the account that applied the timeout, with the reason when recorded. Match the rule that acted before changing exceptions.
+
+Both the moderator and bot need **Manage Server** for exception settings and **Moderate Members** to change a timeout rule. The timeout lookup requires the moderator and bot to have **View Audit Log**. Server Builder's privileged spam guard and Butler delete qualifying messages. Timeout actions can come from Discord AutoMod, the bot's manual or warning-based moderation commands, or another app with the required permissions.
+
 ## Requirements
 
 - Python 3.10+

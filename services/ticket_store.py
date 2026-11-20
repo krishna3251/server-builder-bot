@@ -17,8 +17,9 @@ class TicketStore:
         self.path = Path(config.DATA_DIR) / 'tickets' / 'guild_configs.json'
         self._lock = asyncio.Lock()
         self._data = None
-        if config.MONGO_URI.strip():
-            self.client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
+        mongo_uri = config.MONGO_URI.strip()
+        if mongo_uri:
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=5000)
             self.col = self.client['ticket_bot']['guild_configs']
 
     @property
