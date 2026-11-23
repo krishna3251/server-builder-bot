@@ -70,7 +70,9 @@ LEVEL_ROLES: dict[int, int] = {
 }
 
 # ── Paths ─────────────────────────────────────────────────────────────────
-DATA_DIR: str = "data"
+# Wispbyte can reuse an existing /home/container/data directory when running
+# source code from /home/container/server-builder-bot.
+DATA_DIR: str = os.getenv("BOT_DATA_DIR", "data").strip() or "data"
 MEMORY_FILE: str = f"{DATA_DIR}/memory/user_memory.json"
 WALLETS_FILE: str = f"{DATA_DIR}/economy/wallets.json"
 XP_FILE: str = f"{DATA_DIR}/levels/xp_data.json"

@@ -50,15 +50,9 @@ def _run_keep_alive():
 # ─────────────────────────────────────────────────────────────────────────
 
 # ── Ensure data directories exist ────────────────────────────────────────
-_DATA_DIRS = [
-    "data/memory",
-    "data/economy",
-    "data/levels",
-    "data/tickets",
-    "data/templates",
-]
+_DATA_DIRS = ("memory", "economy", "levels", "tickets", "templates")
 for _d in _DATA_DIRS:
-    pathlib.Path(_d).mkdir(parents=True, exist_ok=True)
+    (pathlib.Path(config.DATA_DIR) / _d).mkdir(parents=True, exist_ok=True)
 
 # ── Logging ───────────────────────────────────────────────────────────────
 setup_logging()

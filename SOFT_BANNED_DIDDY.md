@@ -32,3 +32,35 @@ The persistent settings file is data/soft_banned_diddy.json. Keep this file with
 ### Safety limits
 
 Do not use the no-write channel to collect secret information. The feature is a moderation trap, not a substitute for Discord permissions or anti-raid protections. Members with privileged or uneditable roles may not be eligible for quarantine; these cases need manual staff review. Existing trap channels are not auto-adopted unless an Administrator explicitly selects them.
+
+
+## Wispbyte: keep the same data directory after changing repositories
+
+The old DAMU startup ran in /home/container; the new checkout runs in
+/home/container/server-builder-bot. Without configuration, they save different
+data/ directories, so quarantine/AutoMod/trap-channel state does not transfer.
+
+**Before switching:** Back up /home/container/data and .env (if present).
+In the Wispbyte environment, set BOT_DATA_DIR=/home/container/data. Alternatively,
+export it in the startup command immediately before launching Python. Do not place
+the Discord token directly into the startup command or commit it to GitHub.
+
+The override applies to the moderation/quarantine journal, trap-channel settings,
+AutoMod, and other features using config's data paths. Existing data is reused;
+the app does not automatically import data from the old repository's Git checkout.
+
+After reboot, look for the runtime log
+source=krishna3251/server-builder-bot, a Discord Logged in as ... line and
+successful slash-command sync. "Server marked as running" or a successful
+git clone does **not** establish that Discord login succeeded.
+
+Run /soft_banned_diddy_status to verify the feature is enabled on this guild.
+If no configuration exists, run /quarantine_setup then /soft_banned_diddy
+with an existing private log channel and moderator role. Check that the bot's role
+outranks the target member, and that Members and Message Content privileged intents
+are enabled in the Discord Developer Portal.
+
+The default path remains the repository-local data folder unless
+BOT_DATA_DIR is set. On an ephemeral host, /home/container/data must itself
+be backed by persistent storage; setting an environment variable does not make
+an ephemeral volume persistent.
