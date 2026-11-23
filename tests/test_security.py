@@ -204,6 +204,118 @@ class QuarantineTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.roles[60], self.target.roles)
 
 
+class ManualQuarantineReleaseTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
+    """Only audit-verified staff may release by directly removing the marker."""
+
+    async def _quarantine(self, *, staff=None):
+        await self.service.setup(self.guild, staff_role=staff)
+        await self.service.quarantine(self.guild, self.actor, self.target, "review")
+        self.guild.me.guild_permissions = discord.Permissions(
+            manage_channels=True, manage_roles=True, move_members=True,
+            view_audit_log=True,
+        )
+        self.bot = Mock()
+        self.bot.get_cog.return_value = None
+        self.cog = SecurityCog(self.bot)
+        self.cog.quarantine_service = self.service
+        self.before = SimpleNamespace(roles=list(self.target.roles))
+        self.target.roles = [r for r in self.target.roles if r.id != 60]
+        self.actor.guild_permissions = discord.Permissions(administrator=True)
+        self.actor.roles = [self.everyone, self.moderator]
+        self.members[self.actor.id] = self.actor
+
+    def _entry(self, actor_id, *, target_id=2, marker_id=60, when=None):
+        return SimpleNamespace(
+            target=SimpleNamespace(id=target_id),
+            user=SimpleNamespace(id=actor_id),
+            created_at=when or discord.utils.utcnow(),
+            before=SimpleNamespace(roles=[SimpleNamespace(id=marker_id)]),
+            after=SimpleNamespace(roles=[]),
+        )
+
+    def _audit(self, entries):
+        async def audit_logs(**kwargs):
+            self.assertEqual(kwargs["action"], discord.AuditLogAction.member_role_update)
+            for entry in entries:
+                yield entry
+        self.guild.audit_logs = audit_logs
+
+    async def test_owner_manual_marker_removal_restores_roles_once(self):
+        await self._quarantine()
+        self._audit([self._entry(self.actor.id)])
+        with patch("cogs.security.notify_action", new_callable=AsyncMock) as notice:
+            await self.cog.on_member_update(self.before, self.target)
+        self.assertIn(self.regular, self.target.roles)
+        self.assertNotIn(self.roles[60], self.target.roles)
+        self.assertTrue(self.channel.overwrites_for(self.target).view_channel)
+        self.assertNotIn(str(self.target.id), (await self.service.load())['10']['members'])
+        notice.assert_awaited_once()
+        self.assertIn('manual quarantine release', notice.await_args.args[4])
+        self.assertEqual(len(self.cog._manual_release_checks), 0)
+
+    async def test_configured_moderator_manual_marker_removal_is_authorized(self):
+        await self._quarantine(staff=self.moderator)
+        mod = Mock(spec=discord.Member, id=4, guild=self.guild, top_role=self.moderator)
+        mod.roles = [self.everyone, self.moderator]
+        mod.guild_permissions = discord.Permissions(manage_roles=True, moderate_members=True)
+        self.members[mod.id] = mod
+        self._audit([self._entry(mod.id)])
+        with patch("cogs.security.notify_action", new_callable=AsyncMock) as notice:
+            await self.cog.on_member_update(self.before, self.target)
+        self.assertIn(self.regular, self.target.roles)
+        self.assertFalse((await self.service.load())['10']['members'])
+        self.assertEqual(notice.await_args.args[2], mod)
+
+    async def test_unconfigured_actor_cannot_release_by_removing_marker(self):
+        await self._quarantine()
+        stranger = Mock(spec=discord.Member, id=5, guild=self.guild, top_role=self.moderator)
+        stranger.roles = [self.everyone, self.moderator]
+        stranger.guild_permissions = discord.Permissions(manage_roles=True)
+        self.members[stranger.id] = stranger
+        self._audit([self._entry(stranger.id)])
+        with patch("cogs.security.asyncio.sleep", new_callable=AsyncMock), patch(
+            "cogs.security.notify_action", new_callable=AsyncMock
+        ) as notice:
+            await self.cog.on_member_update(self.before, self.target)
+        self.assertIn(self.roles[60], self.target.roles)
+        self.assertNotIn(self.regular, self.target.roles)
+        self.assertIn('2', (await self.service.load())['10']['members'])
+        notice.assert_not_awaited()
+
+    async def test_no_audit_permission_keeps_quarantine_and_does_not_trust_event(self):
+        await self._quarantine()
+        self.guild.me.guild_permissions = discord.Permissions(
+            manage_roles=True, manage_channels=True,
+        )
+        self.guild.audit_logs = Mock(side_effect=AssertionError("Audit log must not be called"))
+        await self.cog.on_member_update(self.before, self.target)
+        self.assertIn(self.roles[60], self.target.roles)
+        self.assertIn('2', (await self.service.load())['10']['members'])
+        self.guild.audit_logs.assert_not_called()
+
+    async def test_stale_or_wrong_marker_audit_entries_do_not_release(self):
+        await self._quarantine()
+        old = discord.utils.utcnow() - timedelta(minutes=3)
+        self._audit([
+            self._entry(self.actor.id, when=old),
+            self._entry(self.actor.id, target_id=999),
+            self._entry(self.actor.id, marker_id=999),
+        ])
+        with patch("cogs.security.asyncio.sleep", new_callable=AsyncMock):
+            await self.cog.on_member_update(self.before, self.target)
+        self.assertIn(self.roles[60], self.target.roles)
+        self.assertIn('2', (await self.service.load())['10']['members'])
+
+    async def test_explicit_release_in_progress_is_not_reapplied(self):
+        await self._quarantine()
+        state = await self.service.load()
+        state['10']['members']['2']['phase'] = 'releasing'
+        self.guild.audit_logs = Mock(side_effect=AssertionError("Already releasing"))
+        await self.cog.on_member_update(self.before, self.target)
+        self.assertNotIn(self.roles[60], self.target.roles)
+        self.guild.audit_logs.assert_not_called()
+
+
 class CommandSecurityTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
     async def test_create_channel_real_callback_defers_before_creation_and_private_acl(self):
         cog = SecurityCog(Mock())
