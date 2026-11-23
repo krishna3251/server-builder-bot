@@ -98,9 +98,10 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
                 log.exception("Could not load protected-channel configuration")
                 raise
 
-    async def _save(self) -> None:
-        # Caller holds the lock; do not update the in-memory state before commit.
-        await write_json_atomic(str(self.path), self._settings)
+    async def _save(self, new_settings: dict) -> None:
+        # Caller holds the lock; publish new state only after a durable write.
+        await write_json_atomic(str(self.path), new_settings)
+        self._settings = new_settings
 
     def _cfg(self, guild_id: int) -> dict:
         return self._settings.get(str(guild_id), {})
@@ -217,26 +218,41 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
                 return await respond(interaction, "The selected channel must be visible and writable to @everyone. No protections enabled.", ephemeral=True)
             if not all((target.permissions_for(me).view_channel,
                         target.permissions_for(me).send_messages,
+                        target.permissions_for(me).read_message_history,
                         target.permissions_for(me).manage_messages)):
                 return await respond(interaction, "Bot needs View, Send and Manage Messages in the selected channel.", ephemeral=True)
             # Move only a deliberately selected/saved channel; no other channels are reordered.
             await target.edit(category=None, position=0, reason="Keep the warning channel at the top")
             await self._security().quarantine_service.channel_changed(target)
-            note = await target.send(WARNING, allowed_mentions=discord.AllowedMentions.none())
-            await note.pin(reason="Persistent trap-channel warning")
+            note = None
+            if saved.get("channel_id") == target.id and saved.get("warning_message_id"):
+                try:
+                    candidate = await target.fetch_message(saved["warning_message_id"])
+                    if candidate.author.id == me.id:
+                        note = candidate
+                except discord.NotFound:
+                    pass
+            if note is None:
+                note = await target.send(WARNING, allowed_mentions=discord.AllowedMentions.none())
+            elif note.content != WARNING:
+                await note.edit(content=WARNING, allowed_mentions=discord.AllowedMentions.none())
+            if not note.pinned:
+                await note.pin(reason="Persistent trap-channel warning")
             async with self._lock:
-                self._settings[str(guild.id)] = {
+                new_settings = dict(self._settings)
+                new_settings[str(guild.id)] = {
                     "enabled": True,
                     "channel_id": target.id,
                     "log_channel_id": log_channel.id,
                     "mod_role_id": mod_role.id,
                     "warning_message_id": note.id
                 }
-                await self._save()
+                await self._save(new_settings)
         except (discord.HTTPException, ValueError, OSError) as exc:
             log.warning("Soft Banned Diddy setup incomplete in guild %s: %s", guild.id, type(exc).__name__)
             # Do not activate the trap on partial setup.
             return await respond(interaction, "Setup was incomplete. Check bot permissions and retry. Existing config was not activated by this attempt.", ephemeral=True)
+        await self._log_action(guild, self._cfg(guild.id), interaction.user.id, 0, "Trap configured")
         verb = "created" if created else "updated"
         await respond(interaction, f"Trap channel {target.mention} {verb} and moved to the top. "
                       f"Quarantine is active; logs go to {log_channel.mention}. "
@@ -255,8 +271,11 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
                 cfg = self._cfg(interaction.guild.id)
                 if not cfg:
                     return await respond(interaction, "This server has no trap configuration.", ephemeral=True)
-                cfg["enabled"] = False
-                await self._save()
+                new_settings = dict(self._settings)
+                new_settings[str(interaction.guild.id)] = dict(cfg, enabled=False)
+                await self._save(new_settings)
+            await self._log_action(interaction.guild, self._cfg(interaction.guild.id),
+                                   interaction.user.id, 0, "Trap disabled")
             await respond(interaction, "Trap enforcement disabled. No channel or quarantine records were deleted.", ephemeral=True)
         except (ValueError, OSError):
             await respond(interaction, "Cannot safely update settings; existing configuration remains unchanged.", ephemeral=True)
