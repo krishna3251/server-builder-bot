@@ -93,13 +93,32 @@ class DiddyModerationTests(unittest.IsolatedAsyncioTestCase):
         self.bot.get_cog.return_value = security
         message = self.message()
         await self.cog._process(message)
-        message.delete.assert_awaited_once()
+        message.delete.assert_awaited_once_with()
         security.quarantine_service.quarantine.assert_awaited_once()
         self.assertEqual(security.quarantine_service.quarantine.await_args.args[:3],
                          (self.guild, self.bot_member, message.author))
         self.assertIn((10, 42), self.cog._recent_quarantines)
         self.cog._log_action.assert_awaited_once()
         self.assertIn('Quarantined', self.cog._log_action.await_args.args[-1])
+
+    async def test_partial_message_delete_does_not_pass_unsupported_reason(self):
+        # discord.py Message/PartialMessage.delete() cannot take a reason kwarg.
+        async def delete_like_discord_py():
+            return None
+
+        security = SimpleNamespace(quarantine_service=SimpleNamespace(
+            quarantine=AsyncMock(return_value={'phase': 'active'})
+        ))
+        self.bot.get_cog.return_value = security
+        message = self.message(identifier=44)
+        message.delete = AsyncMock(side_effect=delete_like_discord_py)
+
+        await self.cog._process(message)
+
+        message.delete.assert_awaited_once_with()
+        security.quarantine_service.quarantine.assert_awaited_once()
+        self.assertIn((10, 44), self.cog._recent_quarantines)
+        self.assertIn("Quarantined", self.cog._log_action.await_args.args[-1])
 
     async def test_partial_quarantine_is_logged_for_review(self):
         security = SimpleNamespace(quarantine_service=SimpleNamespace(
