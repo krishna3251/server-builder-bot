@@ -322,7 +322,7 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         if is_admin(member):
             key = (guild.id, member.id)
             now = time.monotonic()
-            if now - self._staff_replies.get(key, 0) >= REPLY_COOLDOWN:
+            if key not in self._staff_replies or now - self._staff_replies[key] >= REPLY_COOLDOWN:
                 self._staff_replies[key] = now
                 try:
                     await message.channel.send(STAFF_REPLY, allowed_mentions=discord.AllowedMentions.none())
@@ -349,7 +349,7 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         if key in self._inflight:
             await self._log_action(guild, cfg, member.id, message.id, "Deleted; quarantine already in progress")
             return
-        if time.monotonic() - self._recent_quarantines.get(key, 0) < 45:
+        if key in self._recent_quarantines and time.monotonic() - self._recent_quarantines[key] < 45:
             await self._log_action(guild, cfg, member.id, message.id, "Deleted; quarantine recently applied")
             return
         self._inflight.add(key)
