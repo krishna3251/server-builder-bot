@@ -1,8 +1,10 @@
 """Private security console, quarantine commands, channel creation and bot profile."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import discord
@@ -14,6 +16,7 @@ from services.error_service import respond_error
 from services.embed_service import error_embed, success_embed
 from services.moderation_notices import notify_action
 from services.quarantine_service import QuarantineService, DENIED, overwrite_dict
+from services.permission_service import is_above
 from utils.interactions import acknowledged, respond
 
 log = logging.getLogger(__name__)
@@ -85,6 +88,7 @@ class SecurityCog(commands.Cog, name='Security'):
         self.last_profile_error = None
         self.last_channel_error = None
         self.recovering = False
+        self._manual_release_checks: set[tuple[int, int]] = set()
 
     async def cog_load(self):
         self.profile_worker.start()
@@ -315,6 +319,127 @@ class SecurityCog(commands.Cog, name='Security'):
                 if member and record['phase'] != 'releasing':
                     await self.on_member_join(member)
 
+    async def _authorized_manual_release_actor(self, member, marker_role_id, settings):
+        """Resolve a marker removal to a verified administrator/configured moderator.
+
+        A gateway event has no actor. Trust only a recent Discord audit entry that
+        explicitly lists the removed quarantine marker, never a role change alone.
+        """
+        guild = member.guild
+        me = guild.me
+        if me is None or not me.guild_permissions.view_audit_log:
+            log.warning(
+                'Cannot verify manual quarantine release for guild %s member %s: '
+                'bot needs View Audit Log. Staff can use /quarantine_release.',
+                guild.id, member.id,
+            )
+            return None
+
+        staff_roles = {settings.get('staff')}
+        trap = self.bot.get_cog('Soft Banned Diddy')
+        if trap is not None:
+            try:
+                await trap._load()
+                staff_roles.add(trap._cfg(guild.id).get('mod_role_id'))
+            except (ValueError, OSError):
+                log.warning('Could not read configured trap moderator role in guild %s', guild.id)
+        staff_roles.discard(None)
+        staff_roles.discard(0)
+        observed = discord.utils.utcnow()
+
+        for attempt in range(3):
+            try:
+                async for entry in guild.audit_logs(
+                    limit=12, action=discord.AuditLogAction.member_role_update
+                ):
+                    if getattr(getattr(entry, 'target', None), 'id', None) != member.id:
+                        continue
+                    when = getattr(entry, 'created_at', None)
+                    if when is None or not (-5 <= (observed - when).total_seconds() <= 20):
+                        continue
+                    removed = getattr(getattr(entry, 'before', None), 'roles', None) or []
+                    added = getattr(getattr(entry, 'after', None), 'roles', None) or []
+                    if (not any(getattr(role, 'id', None) == marker_role_id for role in removed)
+                            or any(getattr(role, 'id', None) == marker_role_id for role in added)):
+                        continue
+                    user_id = getattr(getattr(entry, 'user', None), 'id', None)
+                    if user_id is None or user_id == me.id or user_id == member.id:
+                        continue
+                    actor = guild.get_member(user_id)
+                    if actor is None:
+                        try:
+                            actor = await guild.fetch_member(user_id)
+                        except (discord.NotFound, discord.Forbidden):
+                            continue
+                    if not is_above(actor, member):
+                        continue
+                    perms = actor.guild_permissions
+                    is_admin = actor.id == guild.owner_id or perms.administrator
+                    is_configured_mod = (
+                        any(role.id in staff_roles for role in actor.roles)
+                        and perms.manage_roles
+                    )
+                    if is_admin or is_configured_mod:
+                        return actor
+            except (discord.Forbidden, discord.HTTPException, AttributeError) as exc:
+                log.warning(
+                    'Cannot inspect quarantine role-removal audit in guild %s: %s',
+                    guild.id, type(exc).__name__,
+                )
+                return None
+            if attempt < 2:
+                # Audit entries can arrive after the member-update gateway event.
+                await asyncio.sleep(0.75)
+        return None
+
+    async def _handle_quarantine_role_change(self, before, after):
+        guild = after.guild
+        key = (guild.id, after.id)
+        if key in self._manual_release_checks:
+            return
+        self._manual_release_checks.add(key)
+        try:
+            async with self.quarantine_service.lock:
+                state = await self.quarantine_service.load()
+                settings = state.get(str(guild.id), {})
+                record = settings.get('members', {}).get(str(after.id))
+                if not record or record.get('phase') == 'releasing':
+                    return
+                marker_id = settings.get('role')
+                # Snapshot only the configured values, never the mutable journal.
+                configured = {'staff': settings.get('staff')}
+            before_ids = {role.id for role in before.roles}
+            after_ids = {role.id for role in after.roles}
+            if marker_id in before_ids and marker_id not in after_ids:
+                actor = await self._authorized_manual_release_actor(after, marker_id, configured)
+                if actor is not None:
+                    try:
+                        failures = await self.quarantine_service.release(guild, actor, after)
+                    except (ValueError, discord.HTTPException, OSError) as exc:
+                        log.warning(
+                            'Verified staff removal by %s could not finish quarantine release '
+                            'for member %s in guild %s: %s',
+                            actor.id, after.id, guild.id, type(exc).__name__,
+                        )
+                        # Existing journal remains for explicit staff recovery.
+                        return
+                    await notify_action(
+                        self.bot, guild, actor, after,
+                        'partial manual quarantine release' if failures else 'manual quarantine release',
+                        'Verified moderator removed the Quarantined marker.',
+                        f'manual-release:{guild.id}:{after.id}:{int(time.time())}',
+                    )
+                    return
+                log.warning(
+                    'Quarantine marker removed for member %s in guild %s without '
+                    'verified staff approval; preserving the quarantine. '
+                    'Use /quarantine_release to authorize a release.',
+                    after.id, guild.id,
+                )
+            await self.on_member_join(after)
+        finally:
+            self._manual_release_checks.discard(key)
+
     @commands.Cog.listener()
     async def on_guild_role_update(self, before, after):
         if before.permissions != after.permissions:
@@ -324,7 +449,11 @@ class SecurityCog(commands.Cog, name='Security'):
     @commands.Cog.listener()
     async def on_member_update(self, before, after):
         if before.roles != after.roles:
-            await self.on_member_join(after)
+            try:
+                await self._handle_quarantine_role_change(before, after)
+            except Exception as exc:
+                self.last_channel_error = f'Member {after.id}: {type(exc).__name__}'
+                log.exception('Quarantine role-change review failed for member %s', after.id)
 
     @commands.Cog.listener()
     async def on_member_join(self, member):

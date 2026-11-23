@@ -96,3 +96,33 @@ trap that was explicitly disabled, and it will not auto-adopt an existing
 The startup check is non-destructive. It reports lost data or missing permissions;
 it cannot repair a Wispbyte disk that wipes files on restart. Permanent retention
 requires storage that survives process/container restarts.
+
+
+## Removing the Quarantined role manually
+
+A member's old roles and channel permissions are stored in the quarantine journal.
+Simply removing the Quarantined marker manually is **not** a complete release.
+The recommended way is still /quarantine_release member:<user>.
+
+If an Administrator or a moderator selected in /quarantine_setup or
+/soft_banned_diddy **manually removes** the Quarantined role, Security now checks
+the Discord audit log for a recent matching role-removal entry. Only when the
+audit log identifies the authorized staff member (and their hierarchy allows
+moderation) does the bot run the regular reversible release: restore the saved
+original roles, restore compatible prior channel overwrites, and clear the
+journal. A partial release retains the journal so staff can retry.
+
+If the actor cannot be verified, is not authorized, the audit entry doesn't
+identify that precise role removal, or the bot lacks View Audit Log,
+the bot maintains quarantine rather than treating an unknown role change as
+staff permission. Use /quarantine_release instead.
+
+For automatic manual release the bot needs View Audit Log, Manage Roles, and
+the usual hierarchy and channel permissions. The moderator requires Manage
+Roles and must hold the configured staff/moderator role. Server owners and
+Administrators are permitted, subject to the normal safe restoration checks.
+
+A manual release never happens merely because the user lacks the marker,
+and nobody is automatically granted a role that has gained new privileges
+since quarantine. Discord audit-log entries may arrive slightly after the
+member-change event; the bot briefly retries verification.
