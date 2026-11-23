@@ -165,10 +165,11 @@ class DiddyModerationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             restarted = SoftBannedDiddy(self.bot)
             restarted.path = Path(directory) / "not-present.json"
-            with patch("cogs.soft_banned_diddy.log") as logger:
+            with self.assertLogs("cogs.soft_banned_diddy", level="WARNING") as log_records:
                 await restarted.on_ready()
-                self.assertTrue(logger.warning.called)
-                self.assertIn("No trap settings file", logger.warning.call_args.args[0])
+            self.assertTrue(any(
+                "No trap settings file" in message for message in log_records.output
+            ))
 
     async def test_restart_audit_respects_explicit_disabled_flag(self):
         self.bot.guilds = [self.guild]
@@ -177,14 +178,13 @@ class DiddyModerationTests(unittest.IsolatedAsyncioTestCase):
             restarted.path = Path(directory) / "soft_banned_diddy.json"
             restarted.path.write_text(json.dumps({'10': {'enabled': False}}), encoding="utf-8")
             restarted._quarantine_ready = AsyncMock()
-            with patch("cogs.soft_banned_diddy.log") as logger:
+            with self.assertLogs("cogs.soft_banned_diddy", level="INFO") as log_records:
                 await restarted.on_ready()
-                restarted._quarantine_ready.assert_not_awaited()
-                self.assertFalse(restarted._cfg(10)["enabled"])
-                self.assertTrue(any(
-                    "intentionally disabled" in str(call.args[0])
-                    for call in logger.info.call_args_list
-                ))
+            restarted._quarantine_ready.assert_not_awaited()
+            self.assertFalse(restarted._cfg(10)["enabled"])
+            self.assertTrue(any(
+                "intentionally disabled" in message for message in log_records.output
+            ))
 
     async def test_repeat_message_does_not_trigger_second_role_change(self):
         security = SimpleNamespace(quarantine_service=SimpleNamespace(
