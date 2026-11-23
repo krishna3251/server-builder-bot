@@ -335,7 +335,9 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
             await self._log_action(guild, cfg, member.id, message.id, "ERROR: cannot delete message")
             return
         try:
-            # discord.Message/PartialMessage.delete accepts delay, not audit-log reason.\n            # Deletion itself does not offer a Discord audit reason; log separately.\n            await message.delete()
+            # discord.Message/PartialMessage.delete accepts delay, not audit-log reason.
+            # Deletion itself does not offer a Discord audit reason; log separately.
+            await message.delete()
         except discord.NotFound:
             return
         except discord.HTTPException:
