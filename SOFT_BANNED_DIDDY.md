@@ -126,3 +126,22 @@ A manual release never happens merely because the user lacks the marker,
 and nobody is automatically granted a role that has gained new privileges
 since quarantine. Discord audit-log entries may arrive slightly after the
 member-change event; the bot briefly retries verification.
+
+
+## Private moderation log embeds
+
+Every trap action now appears as a timestamped Discord embed in the private
+log channel selected by /soft_banned_diddy. It shows:
+
+- **Member:** clickable Discord mention (for example <@123456789012345678>)
+  and the copyable numeric user ID;
+- **Result:** quarantined, partial, failed, exempt, or configured;
+- **Protected channel** and **message ID** (when applicable);
+- **Server name and ID**, timestamp, and a recognizable status color.
+
+Member mentions in embeds are profile links, **not notification pings**.
+Original message text, embeds and attachments are never copied to log entries.
+The bot needs **Embed Links** in its private log channel in addition to View
+Channel and Send Messages. If the channel becomes inaccessible, public, or
+loses Embed Links, it attempts to DM the same embed to the server owner rather
+than exposing the moderation record in a public channel.

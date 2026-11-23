@@ -49,6 +49,87 @@ class DiddyValidationTests(unittest.TestCase):
         self.assertFalse(private_log_channel(channel, moderator))
 
 
+class DiddyEmbedLogTests(unittest.IsolatedAsyncioTestCase):
+    """Staff logs are embeds with linked members, IDs, and privacy-safe delivery."""
+
+    def setUp(self):
+        self.everyone = role(1)
+        self.mod = role(4, moderate_members=True)
+        self.owner = SimpleNamespace(id=11, send=AsyncMock())
+        self.me = SimpleNamespace(id=30)
+        self.guild = SimpleNamespace(
+            id=10, name="Test Server", owner_id=11, owner=self.owner,
+            me=self.me, default_role=self.everyone,
+            roles=[self.everyone, self.mod],
+        )
+        self.channel = Mock(spec=discord.TextChannel)
+        self.channel.guild = self.guild
+        self.channel.overwrites = {}
+        self.channel.send = AsyncMock()
+        self.guild.get_channel = lambda identifier: self.channel if identifier == 23 else None
+        self.guild.get_role = lambda identifier: self.mod if identifier == 4 else None
+        self.channel.permissions_for.side_effect = lambda subject: discord.Permissions(
+            view_channel=subject is self.mod or subject is self.me,
+            send_messages=subject is self.me,
+            embed_links=subject is self.me,
+        )
+        self.bot = Mock()
+        self.bot.fetch_user = AsyncMock(return_value=self.owner)
+        self.cog = SoftBannedDiddy(self.bot)
+        self.cfg = {"channel_id": 22, "log_channel_id": 23, "mod_role_id": 4}
+
+    async def test_quarantine_log_uses_embed_with_member_ping_style_and_id(self):
+        await self.cog._log_action(
+            self.guild, self.cfg, 123456789012345678, 987654321012345678,
+            "Deleted; Quarantined",
+        )
+        self.channel.send.assert_awaited_once()
+        kwargs = self.channel.send.await_args.kwargs
+        self.assertNotIn("content", kwargs)
+        self.assertEqual(kwargs["allowed_mentions"].to_dict(), {"parse": []})
+        embed = kwargs["embed"]
+        self.assertIsInstance(embed, discord.Embed)
+        self.assertIn("quarantined", embed.title.lower())
+        fields = {field.name: field.value for field in embed.fields}
+        self.assertIn("<@123456789012345678>", fields["Member"])
+        self.assertIn("\`123456789012345678\`", fields["Member"])
+        self.assertEqual(fields["Message ID"], "\`987654321012345678\`")
+        self.assertEqual(fields["Protected channel"], "<#22>")
+        self.assertIn("\`10\`", fields["Server"])
+        self.assertIsNotNone(embed.timestamp)
+        self.assertEqual(embed.colour, discord.Colour.green())
+        self.owner.send.assert_not_awaited()
+
+    async def test_error_and_partial_logs_have_distinct_colours(self):
+        from cogs.soft_banned_diddy import trap_log_embed
+        error = trap_log_embed(self.guild, self.cfg, 42, 101, "ERROR: quarantine failed (ValueError)")
+        partial = trap_log_embed(self.guild, self.cfg, 42, 102, "Deleted; PARTIAL quarantine; staff review required")
+        self.assertEqual(error.colour, discord.Colour.red())
+        self.assertEqual(partial.colour, discord.Colour.orange())
+
+    async def test_no_embed_links_falls_back_to_private_owner_embed(self):
+        self.channel.permissions_for.side_effect = lambda subject: discord.Permissions(
+            view_channel=subject is self.mod or subject is self.me,
+            send_messages=subject is self.me,
+            embed_links=False,
+        )
+        await self.cog._log_action(self.guild, self.cfg, 42, 99, "Deleted; Quarantined")
+        self.channel.send.assert_not_awaited()
+        self.owner.send.assert_awaited_once()
+        kwargs = self.owner.send.await_args.kwargs
+        self.assertIsInstance(kwargs["embed"], discord.Embed)
+        self.assertIn("<@42>", kwargs["embed"].fields[0].value)
+        self.assertEqual(kwargs["allowed_mentions"].to_dict(), {"parse": []})
+        self.assertIn("Delivery", {f.name for f in kwargs["embed"].fields})
+
+    async def test_setup_log_identifies_staff_member_not_target(self):
+        await self.cog._log_action(self.guild, self.cfg, 11, 0, "Trap configured")
+        kwargs = self.channel.send.await_args.kwargs
+        fields = {field.name: field.value for field in kwargs["embed"].fields}
+        self.assertIn("Staff member", fields)
+        self.assertNotIn("Message ID", fields)
+        self.assertIn("<@11>", fields["Staff member"])
+
 class DiddyModerationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.bot = Mock()
