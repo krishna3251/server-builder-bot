@@ -151,6 +151,84 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         except (discord.HTTPException, AttributeError):
             log.error("Soft Banned Diddy could not deliver a private log for guild %s", guild.id)
 
+    async def _startup_audit(self) -> None:
+        """Non-destructive restore check: the saved enabled flag is authoritative."""
+        try:
+            await self._load()
+        except (ValueError, OSError) as exc:
+            log.error(
+                "Trap restart check failed to read %s (%s); no configuration was enabled. "
+                "Restore the data file from persistent storage.",
+                self.path, type(exc).__name__,
+            )
+            return
+
+        if not self.path.is_file():
+            log.warning(
+                "No trap settings file at %s. If you configured this before a restart, "
+                "Wispbyte did not preserve this file or BOT_DATA_DIR points elsewhere.",
+                self.path,
+            )
+            return
+
+        configured = sum(bool(cfg.get("enabled")) for cfg in self._settings.values())
+        log.info(
+            "Trap restart check: loaded %d saved servers (%d enabled) from %s; "
+            "saved settings are reused without a slash command.",
+            len(self._settings), configured, self.path,
+        )
+
+        for guild in self.bot.guilds:
+            cfg = self._cfg(guild.id)
+            if not cfg:
+                continue
+            if not cfg.get("enabled", False):
+                log.info("Trap remains intentionally disabled for guild %s.", guild.id)
+                continue
+            channel = guild.get_channel(cfg.get("channel_id", 0))
+            me = guild.me
+            if not isinstance(channel, discord.TextChannel) or me is None:
+                log.error(
+                    "Trap loaded but cannot run in guild %s: saved channel or bot "
+                    "member missing. Run /soft_banned_diddy_status.",
+                    guild.id,
+                )
+                continue
+            perms = channel.permissions_for(me)
+            if not (perms.view_channel and perms.manage_messages):
+                log.error(
+                    "Trap loaded but cannot moderate guild %s: missing View Channel "
+                    "or Manage Messages. Run /soft_banned_diddy_status.",
+                    guild.id,
+                )
+                continue
+            try:
+                ready, reason = await self._quarantine_ready(guild)
+            except (ValueError, OSError, discord.HTTPException) as exc:
+                log.error(
+                    "Trap restored but quarantine journal is unreadable in guild %s "
+                    "(%s). Restore the saved data directory.",
+                    guild.id, type(exc).__name__,
+                )
+                continue
+            if ready:
+                log.info(
+                    "Trap restored automatically for guild %s, channel %s. "
+                    "No setup command required.",
+                    guild.id, channel.id,
+                )
+            else:
+                log.error(
+                    "Trap enabled but quarantine unavailable in guild %s: %s",
+                    guild.id, reason,
+                )
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        # Reload settings once when the bot connects, not only on first message.
+        # Never auto-create or enable a channel merely because its name matches.
+        await self._startup_audit()
+
     @app_commands.command(name="soft_banned_diddy", description="Set up the top trap channel and private moderation logs.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
@@ -292,13 +370,34 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
             return await respond(interaction, "Config unreadable. Enforcement is temporarily unavailable.", ephemeral=True)
         cfg = self._cfg(interaction.guild.id)
         if not cfg:
-            return await respond(interaction, "Not configured. Run /quarantine_setup, then /soft_banned_diddy.", ephemeral=True)
-        ready, reason = await self._quarantine_ready(interaction.guild)
+            return await respond(
+                interaction,
+                "Not configured for this server. Saved settings path: "
+                f"{self.path} (file exists: {self.path.is_file()}). "
+                "If setup worked before a restart, check Wispbyte data persistence and "
+                "BOT_DATA_DIR. Otherwise run /quarantine_setup, then /soft_banned_diddy once.",
+                ephemeral=True,
+            )
+        try:
+            ready, reason = await self._quarantine_ready(interaction.guild)
+        except (ValueError, OSError, discord.HTTPException) as exc:
+            ready, reason = False, f"Cannot read quarantine journal ({type(exc).__name__})"
+        channel = interaction.guild.get_channel(cfg.get("channel_id", 0))
+        me = interaction.guild.me
+        permissions_ok = bool(
+            isinstance(channel, discord.TextChannel) and me
+            and channel.permissions_for(me).view_channel
+            and channel.permissions_for(me).manage_messages
+        )
         await respond(interaction,
                       f"Enabled: {bool(cfg.get('enabled'))}\nChannel: <#{cfg.get('channel_id', 0)}>"
                       f"\nPrivate logs: <#{cfg.get('log_channel_id', 0)}>"
                       f"\nModerator role: <@&{cfg.get('mod_role_id', 0)}>"
-                      f"\nQuarantine ready: {ready} {reason}", ephemeral=True,
+                      f"\nSaved settings file: {self.path} (exists: {self.path.is_file()})"
+                      f"\nChannel/permissions ready: {permissions_ok}"
+                      f"\nQuarantine ready: {ready} {reason}"
+                      "\nNo setup command is needed after restart if the saved files are present and both checks are ready.",
+                      ephemeral=True,
                       allowed_mentions=discord.AllowedMentions.none())
 
     async def _process(self, message: discord.Message) -> None:
