@@ -6,6 +6,7 @@ Moderation records never include message content and are delivered privately.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import time
@@ -59,6 +60,49 @@ def private_log_channel(channel: discord.TextChannel, mod_role: discord.Role) ->
         ) and not is_admin(subject) and channel.permissions_for(subject).view_channel:
             return False
     return True
+
+
+def trap_log_embed(guild: discord.Guild, cfg: dict, member_id: int,
+                   message_id: int, action: str) -> discord.Embed:
+    """Create an easy-to-scan private moderation record, without message content."""
+    is_error = "ERROR:" in action
+    is_partial = "PARTIAL" in action
+    is_quarantine = "Quarantined" in action and not is_error
+    is_exempt = "exempt" in action.lower()
+    title = (
+        "🚨 Moderation action failed" if is_error else
+        "⚠️ Quarantine needs review" if is_partial else
+        "🔒 Member quarantined" if is_quarantine else
+        "🛡️ Administrator exempt" if is_exempt else
+        "📋 Trap-channel moderation log"
+    )
+    colour = (
+        discord.Colour.red() if is_error else
+        discord.Colour.orange() if is_partial else
+        discord.Colour.green() if is_quarantine else
+        discord.Colour.gold() if is_exempt else
+        discord.Colour.blurple()
+    )
+    embed = discord.Embed(
+        title=title,
+        description=action[:1000],
+        colour=colour,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    label = "Staff member" if message_id == 0 else "Member"
+    embed.add_field(name=label, value=f"<@{member_id}>\n**User ID:** \`{member_id}\`", inline=False)
+    channel_id = cfg.get("channel_id")
+    if channel_id:
+        embed.add_field(name="Protected channel", value=f"<#{channel_id}>", inline=True)
+    if message_id:
+        embed.add_field(name="Message ID", value=f"\`{message_id}\`", inline=True)
+    embed.add_field(
+        name="Server",
+        value=f"{discord.utils.escape_markdown(guild.name)[:100]}\nID: \`{guild.id}\`",
+        inline=False,
+    )
+    embed.set_footer(text="Server Builder • Soft Banned Diddy • Private staff log")
+    return embed
 
 
 class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
@@ -129,25 +173,37 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
 
     async def _log_action(self, guild: discord.Guild, cfg: dict, member_id: int,
                           message_id: int, action: str) -> None:
-        # Logs deliberately exclude user messages, attachments and embed content.
-        note = (f"Soft Banned Diddy | {action}\n"
-                f"Guild: {guild.id} | Member: {member_id} | Message: {message_id}")
+        # Do not include original messages, attachments or sensitive content in logs.
+        embed = trap_log_embed(guild, cfg, member_id, message_id, action)
         channel = guild.get_channel(cfg.get("log_channel_id", 0))
         mod_role = guild.get_role(cfg.get("mod_role_id", 0))
-        if isinstance(channel, discord.TextChannel) and mod_role and (
-            private_log_channel(channel, mod_role) and
-            channel.permissions_for(guild.me).send_messages
+        if isinstance(channel, discord.TextChannel) and mod_role and guild.me and (
+            private_log_channel(channel, mod_role)
         ):
-            try:
-                await channel.send(note, allowed_mentions=discord.AllowedMentions.none())
-                return
-            except discord.HTTPException:
-                log.warning("Soft Banned Diddy log delivery failed for guild %s", guild.id)
-        # Permission removal or deletion must not leak sensitive logs into public chat.
+            permissions = channel.permissions_for(guild.me)
+            if permissions.view_channel and permissions.send_messages and permissions.embed_links:
+                try:
+                    await channel.send(
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                except discord.HTTPException:
+                    log.warning("Soft Banned Diddy embed delivery failed for guild %s", guild.id)
+            else:
+                log.warning(
+                    "Soft Banned Diddy log channel lacks View Channel, Send Messages "
+                    "or Embed Links in guild %s", guild.id,
+                )
+        # If the channel is deleted or becomes public, deliver only in a private DM.
+        embed.add_field(
+            name="Delivery",
+            value="Private log channel unavailable or missing Embed Links; sent to the server owner.",
+            inline=False,
+        )
         try:
             owner = guild.owner or await self.bot.fetch_user(guild.owner_id)
-            await owner.send(note + "\nPrivate log channel is unavailable.",
-                             allowed_mentions=discord.AllowedMentions.none())
+            await owner.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         except (discord.HTTPException, AttributeError):
             log.error("Soft Banned Diddy could not deliver a private log for guild %s", guild.id)
 
@@ -254,8 +310,9 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         if not private_log_channel(log_channel, mod_role):
             return await respond(interaction, "The log channel must be private to staff, with access for the selected moderator role.", ephemeral=True)
         if not all((log_channel.permissions_for(me).view_channel,
-                    log_channel.permissions_for(me).send_messages)):
-            return await respond(interaction, "Bot cannot see and write to the selected log channel.", ephemeral=True)
+                    log_channel.permissions_for(me).send_messages,
+                    log_channel.permissions_for(me).embed_links)):
+            return await respond(interaction, "Bot needs View Channel, Send Messages and Embed Links in the selected private log channel.", ephemeral=True)
         ready, reason = await self._quarantine_ready(guild)
         if not ready:
             return await respond(interaction, reason, ephemeral=True)
