@@ -64,3 +64,35 @@ The default path remains the repository-local data folder unless
 BOT_DATA_DIR is set. On an ephemeral host, /home/container/data must itself
 be backed by persistent storage; setting an environment variable does not make
 an ephemeral volume persistent.
+
+
+## After every restart (automatic restoration diagnostics)
+
+You do **not** have to run setup commands again when saved state survives. On
+Discord ready, the bot now loads the existing trap configuration and checks its
+saved enabled flag, channel permissions and quarantine readiness. Look in Wispbyte
+console for:
+
+- `Runtime state: data_dir=... | trap_config_exists=True | quarantine_journal_exists=True`
+- `Trap restored automatically for guild ... No setup command required.`
+
+If a file is missing, the bot logs an explicit warning rather than silently
+activating a similarly named channel. Use the Wispbyte **File Manager** to check
+`/home/container/data/soft_banned_diddy.json` and
+`/home/container/data/quarantine.json` after a restart. A server folder being
+present does **not** guarantee those JSON files exist.
+
+If `trap_config_exists=False`, ensure `BOT_DATA_DIR=/home/container/data`
+is set before launch and that Wispbyte actually preserves that directory; if
+files were deleted, restore your own backup. If the quarantine journal is missing,
+restore its backup before attempting to release previously quarantined users,
+because their original role snapshots cannot safely be recreated from scratch.
+
+Run `/soft_banned_diddy_status` to inspect the saved path, enabled setting,
+channel permissions and quarantine readiness. The bot will **not** auto-enable a
+trap that was explicitly disabled, and it will not auto-adopt an existing
+`#dont-write-there` channel without a saved configuration.
+
+The startup check is non-destructive. It reports lost data or missing permissions;
+it cannot repair a Wispbyte disk that wipes files on restart. Permanent retention
+requires storage that survives process/container restarts.

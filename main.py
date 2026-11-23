@@ -57,6 +57,13 @@ for _d in _DATA_DIRS:
 # ── Logging ───────────────────────────────────────────────────────────────
 setup_logging()
 log = logging.getLogger("bot")
+_runtime_data = pathlib.Path(config.DATA_DIR)
+log.info(
+    "Runtime state: data_dir=%s | trap_config_exists=%s | quarantine_journal_exists=%s",
+    _runtime_data.resolve(),
+    (_runtime_data / "soft_banned_diddy.json").is_file(),
+    (_runtime_data / "quarantine.json").is_file(),
+)
 
 # ── Intents ───────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
