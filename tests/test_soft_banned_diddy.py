@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -136,6 +139,52 @@ class DiddyModerationTests(unittest.IsolatedAsyncioTestCase):
         message.delete.assert_not_awaited()
         self.cog._log_action.assert_awaited_once()
         self.assertIn('ERROR', self.cog._log_action.await_args.args[-1])
+
+    async def test_saved_enabled_trap_works_after_new_cog_instance(self):
+        """A process restart must not require a repeat setup command."""
+        security = SimpleNamespace(quarantine_service=SimpleNamespace(
+            quarantine=AsyncMock(return_value={'phase': 'active'})
+        ))
+        self.bot.get_cog.return_value = security
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "soft_banned_diddy.json"
+            path.write_text(json.dumps(self.cog._settings), encoding="utf-8")
+            restarted = SoftBannedDiddy(self.bot)
+            restarted.path = path
+            restarted._log_action = AsyncMock()
+            message = self.message(identifier=86)
+            await restarted._process(message)
+            self.assertTrue(restarted._loaded)
+            self.assertTrue(restarted._cfg(10)["enabled"])
+            message.delete.assert_awaited_once_with()
+            security.quarantine_service.quarantine.assert_awaited_once()
+            self.assertIn((10, 86), restarted._recent_quarantines)
+
+    async def test_restart_diagnostics_identify_lost_settings_file(self):
+        self.bot.guilds = [self.guild]
+        with tempfile.TemporaryDirectory() as directory:
+            restarted = SoftBannedDiddy(self.bot)
+            restarted.path = Path(directory) / "not-present.json"
+            with patch("cogs.soft_banned_diddy.log") as logger:
+                await restarted.on_ready()
+                self.assertTrue(logger.warning.called)
+                self.assertIn("No trap settings file", logger.warning.call_args.args[0])
+
+    async def test_restart_audit_respects_explicit_disabled_flag(self):
+        self.bot.guilds = [self.guild]
+        with tempfile.TemporaryDirectory() as directory:
+            restarted = SoftBannedDiddy(self.bot)
+            restarted.path = Path(directory) / "soft_banned_diddy.json"
+            restarted.path.write_text(json.dumps({'10': {'enabled': False}}), encoding="utf-8")
+            restarted._quarantine_ready = AsyncMock()
+            with patch("cogs.soft_banned_diddy.log") as logger:
+                await restarted.on_ready()
+                restarted._quarantine_ready.assert_not_awaited()
+                self.assertFalse(restarted._cfg(10)["enabled"])
+                self.assertTrue(any(
+                    "intentionally disabled" in str(call.args[0])
+                    for call in logger.info.call_args_list
+                ))
 
     async def test_repeat_message_does_not_trigger_second_role_change(self):
         security = SimpleNamespace(quarantine_service=SimpleNamespace(
