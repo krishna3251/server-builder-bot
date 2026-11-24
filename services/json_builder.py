@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import Any
 
 import discord
@@ -517,9 +517,16 @@ async def build_server(
     clean_existing: bool = False,
     safe_channel_id: int | None = None,
     created_channel_ids: set[int] | None = None,
+    quarantine=None,
 ) -> tuple[list[str], dict[str, discord.Role]]:
     """Validate, reserve this server, then perform cleanup and creation."""
-    async with build_session(guild.id):
+    lock = quarantine.lock if clean_existing and quarantine is not None else nullcontext()
+    async with build_session(guild.id), lock:
+        if clean_existing and quarantine is not None:
+            state = await quarantine.load()
+            settings = state.get(str(guild.id), {})
+            if settings.get('configured') or settings.get('members') or settings.get('pending_creations'):
+                raise ValueError('Destructive rebuild is unavailable while quarantine resources are configured. Use a build without cleanup.')
         preflight_build(guild, schema, clean_existing=clean_existing)
         cleanup_logs = []
         if clean_existing:

@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from services.quarantine_service import QuarantineService, has_quarantine_record
 from services.template_service import parse_plan, generate_plan
 from services.error_service import SafeView, SafeModal, report_error
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
@@ -1302,10 +1303,13 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
         created_channel_ids: set[int] = set()
         structure_built = False
         try:
+            security = self.bot.get_cog('Security')
+            journal = getattr(security, 'quarantine_service', None)
             logs, role_map = await build_server(
                 guild, schema, progress_msg,
                 created_channel_ids=created_channel_ids,
                 clean_existing=clean_existing, safe_channel_id=safe_channel_id,
+                quarantine=journal if isinstance(journal, QuarantineService) else None,
             )
             structure_built = True
             assign_logs: list[str] = []
@@ -1332,7 +1336,8 @@ class ServerBuilderCog(commands.Cog, name="Server Builder"):
             if auto_role:
                 assigned = 0
                 for member in guild.members:
-                    if member.bot or member.id == interaction.user.id:
+                    if (member.bot or member.id == interaction.user.id
+                            or await has_quarantine_record(self.bot, member)):
                         continue
                     try:
                         await member.add_roles(auto_role, reason="Confirmed server build - auto-assign")

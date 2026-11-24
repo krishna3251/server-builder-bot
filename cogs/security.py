@@ -15,6 +15,11 @@ import config
 from services.error_service import respond_error
 from services.embed_service import error_embed, success_embed
 from services.moderation_notices import notify_action
+from cogs._quarantine_ui import (
+    QuarantineConfirmation, QuarantineDashboard, audit_file, is_quarantine_admin, status_text,
+)
+from services.quarantine_resources import QuarantineResources
+from services.automatic_moderation import private_mod_log
 from services.quarantine_service import QuarantineService, DENIED, overwrite_dict
 from services.permission_service import is_above
 from utils.interactions import acknowledged, respond
@@ -54,7 +59,7 @@ class SecurityConsole(discord.ui.LayoutView):
             discord.ui.TextDisplay('## Security console\n' + text),
             discord.ui.Separator(),
             discord.ui.TextDisplay('### Quarantine\n`/quarantine_setup` prepares the private review room.\n'
-                                   '`/sudo_ban` or `/quarantine` suspends access.\n'
+                                   '`/sudo_ban` or `/quarantine apply` suspends access.\n'
                                    '`/quarantine_release` restores saved access.'),
             discord.ui.TextDisplay('### Server tools\n`/create_channel` creates a text channel, voice channel or category.\n'
                                    '`/butler report` opens your private daily ledger.\n'
@@ -84,14 +89,16 @@ class SecurityCog(commands.Cog, name='Security'):
     def __init__(self, bot):
         self.bot = bot
         self.quarantine_service = QuarantineService(Path(config.DATA_DIR) / 'quarantine.json')
+        self.quarantine_resources = QuarantineResources(self.quarantine_service)
         self.application = None
         self.last_profile_error = None
         self.last_channel_error = None
         self.recovering = False
+        self._last_recovery = 0.0
         self._manual_release_checks: set[tuple[int, int]] = set()
 
     async def cog_load(self):
-        self.profile_worker.start()
+        self.profile_worker.start().set_name("security-profile")
 
     async def cog_unload(self):
         self.profile_worker.cancel()
@@ -183,9 +190,10 @@ class SecurityCog(commands.Cog, name='Security'):
             text += '\nAccess is restricted to the private review room. Use /quarantine_release to restore access.'
         await respond(interaction, embed=(error_embed if partial else success_embed)('Quarantine needs review' if partial else 'Member quarantined', text), ephemeral=True)
 
-    @app_commands.command(name='quarantine', description='Suspend a member’s access and save it for a reversible release.')
+    quarantine_group = app_commands.Group(name='quarantine', description='Manage reversible member quarantine', guild_only=True)
+
+    @quarantine_group.command(name='apply', description='Suspend a member’s access and save it for a reversible release.')
     @app_commands.guild_only()
-    @app_commands.default_permissions(moderate_members=True, manage_roles=True)
     @app_commands.checks.has_permissions(moderate_members=True, manage_roles=True)
     @acknowledged(ephemeral=True)
     async def quarantine(self, interaction: discord.Interaction, member: discord.Member, reason: str = 'Staff review'):
@@ -212,6 +220,173 @@ class SecurityCog(commands.Cog, name='Security'):
         await notify_action(self.bot, interaction.guild, interaction.user, member,
                             'partial quarantine release' if failures else 'quarantine release', 'Staff review completed', interaction.id)
         await respond(interaction, f'{len(failures)} channels still need restoration. Fix permissions and retry.' if failures else f'Saved access restored for account {member.id}.', ephemeral=True)
+
+    async def quarantine_protected_resources(self, guild):
+        protected = {config.TICKET_LOG_CHANNEL_ID, config.SUPPORT_ROLE_ID, *config.LEVEL_ROLES.values()}
+        trap = self.bot.get_cog('Soft Banned Diddy')
+        if trap is not None:
+            try:
+                await trap._load()
+            except (OSError, ValueError) as exc:
+                raise ValueError('Trap configuration is unreadable. Cleanup cannot verify protected resources.') from exc
+            cfg = trap._cfg(guild.id)
+            protected.update(cfg.get(key) for key in ('channel_id', 'log_channel_id', 'mod_role_id'))
+        for name in ('Verification', 'Dashboard'):
+            cog = self.bot.get_cog(name)
+            if cog is None:
+                continue
+            cfg = cog.settings.get(guild.id)
+            protected.update(value for key, value in cfg.items() if key.endswith('_id') and isinstance(value, int))
+            for section in ('auto_roles', 'welcome'):
+                protected.update(value for key, value in cfg.get(section, {}).items()
+                                 if key.endswith('_id') and isinstance(value, int))
+        tickets = self.bot.get_cog('TicketSystem')
+        if tickets is not None:
+            cfg = await tickets.config_manager.get_guild(guild.id)
+            protected.update(value for key, value in cfg.items() if key.endswith('_id') and isinstance(value, int))
+        return protected - {0, None}
+
+    async def quarantine_report(self, interaction, section):
+        report = await self.quarantine_resources.discovery(
+            interaction.guild, history=section in {'audit', 'permissions', 'resources'},
+        )
+        trap = self.bot.get_cog('Soft Banned Diddy')
+        report['trap_resources'] = []
+        if trap is not None:
+            try:
+                await trap._load()
+                cfg = trap._cfg(interaction.guild_id)
+                report['trap_resources'] = sorted(cfg[key] for key in ('channel_id', 'log_channel_id', 'mod_role_id')
+                                                  if cfg.get(key))
+            except (OSError, ValueError):
+                report['issues'].append('Trap configuration could not be loaded.')
+        if section == 'permissions':
+            data = {key: report[key] for key in ('canonical', 'permissions', 'issues', 'failures', 'member_failures')}
+        elif section == 'resources':
+            data = {key: report[key] for key in ('canonical', 'managed', 'uncertain', 'holders', 'missing',
+                                                'previous', 'pending_creations', 'log_channel', 'trap_resources')}
+        else:
+            data = report
+        await respond(interaction, status_text(report), file=audit_file(section, data), ephemeral=True,
+                      allowed_mentions=discord.AllowedMentions.none())
+
+    async def quarantine_preview(self, interaction, operation):
+        guild = interaction.guild
+        try:
+            if operation == 'cleanup':
+                protected = await self.quarantine_protected_resources(guild)
+                preview = await self.quarantine_resources.cleanup_plan(guild, protected)
+                count = len(preview['candidates'])
+                text = (f'{count} verified obsolete resources eligible for deletion. The report lists '
+                        'affected overwrites and resources kept because they are assigned or protected.' if count
+                        else 'No verified obsolete resources are eligible for cleanup.')
+                view = QuarantineConfirmation(interaction, self, operation, preview) if count else None
+                audit = await self.quarantine_resources.discovery(guild)
+                file = audit_file(operation, {**preview, 'uncertain_preserved': audit['uncertain'],
+                                               'assigned_roles': audit['holders']})
+            else:
+                preview = await self.quarantine_resources.discovery(guild)
+                summary = ('Repair canonical resources and channel permissions?' if operation == 'repair'
+                           else f"Move {len(preview['pending'])} tracked members to the current marker?")
+                text = summary + '\n' + status_text(preview)
+                view = QuarantineConfirmation(interaction, self, operation, preview)
+                file = audit_file(operation, preview)
+        except (ValueError, OSError, discord.HTTPException) as exc:
+            return await respond(interaction, str(exc) if isinstance(exc, ValueError)
+                                 else 'Could not verify resources. Check bot access and saved data.', ephemeral=True)
+        await respond(interaction, text, view=view, file=file, ephemeral=True,
+                      allowed_mentions=discord.AllowedMentions.none())
+
+    async def run_quarantine_operation(self, interaction, operation, preview=None):
+        guild = interaction.guild
+        if not is_quarantine_admin(interaction):
+            raise ValueError('Administrator access is required.')
+        if operation == 'cleanup':
+            protected = await self.quarantine_protected_resources(guild)
+            deleted, snapshot = await self.quarantine_resources.cleanup(guild, interaction.user, preview, protected)
+            planned = len(preview['candidates'])
+            text = f'Deleted {len(deleted)} of {planned} resources.'
+            if len(deleted) < planned:
+                text += ' Cleanup stopped after a state or permission change. Re-audit before proceeding.'
+            return f'{text} Snapshot: {snapshot or "none"}.', audit_file('cleanup-result', deleted)
+        if preview is not None:
+            current = await self.quarantine_resources.discovery(guild)
+            if current != preview:
+                raise ValueError('Quarantine state changed. Open a fresh preview before continuing.')
+        if operation == 'migrate':
+            members, failed = await self.quarantine_resources.migrate(guild)
+            return (f'Migrated {len(members)} members. {len(failed)} require review.',
+                    audit_file('migration-result', {'migrated': members, 'failed': failed}))
+        if operation == 'sync':
+            async with self.quarantine_service.lock:
+                state = await self.quarantine_service.load()
+                if not state.get(str(guild.id), {}).get('configured'):
+                    raise ValueError('Run /quarantine_setup first.')
+        await self.quarantine_service.setup(guild, create=operation == 'repair')
+        report = await self.quarantine_resources.discovery(guild)
+        return status_text(report), audit_file(operation, report)
+
+    async def quarantine_write(self, interaction, operation):
+        try:
+            text, file = await self.run_quarantine_operation(interaction, operation)
+        except ValueError as exc:
+            return await respond(interaction, str(exc), ephemeral=True)
+        await respond(interaction, text, file=file, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @quarantine_group.command(name='audit', description='Audit resources, assignments and effective permissions')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_audit(self, interaction: discord.Interaction):
+        await self.quarantine_report(interaction, 'audit')
+
+    @quarantine_group.command(name='status', description='Show quarantine health and active members')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_status(self, interaction: discord.Interaction):
+        await self.quarantine_report(interaction, 'status')
+
+    @quarantine_group.command(name='permissions', description='Inspect quarantine permissions and access conflicts')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_permissions(self, interaction: discord.Interaction):
+        await self.quarantine_report(interaction, 'permissions')
+
+    @quarantine_group.command(name='resources', description='List canonical and bot-managed resources')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_resources_command(self, interaction: discord.Interaction):
+        await self.quarantine_report(interaction, 'resources')
+
+    @quarantine_group.command(name='repair', description='Repair or replace missing canonical resources')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_repair(self, interaction: discord.Interaction):
+        await self.quarantine_write(interaction, 'repair')
+
+    @quarantine_group.command(name='sync', description='Reconcile permissions for existing quarantine resources')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_sync(self, interaction: discord.Interaction):
+        await self.quarantine_write(interaction, 'sync')
+
+    @quarantine_group.command(name='migrate', description='Preview and confirm active quarantine migrations')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_migrate(self, interaction: discord.Interaction):
+        await self.quarantine_preview(interaction, 'migrate')
+
+    @quarantine_group.command(name='cleanup', description='Preview and confirm obsolete resource cleanup')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_cleanup(self, interaction: discord.Interaction):
+        await self.quarantine_preview(interaction, 'cleanup')
+
+    @quarantine_group.command(name='dashboard', description='Open private quarantine management controls')
+    @app_commands.check(is_quarantine_admin)
+    @acknowledged(ephemeral=True)
+    async def quarantine_dashboard(self, interaction: discord.Interaction):
+        report = await self.quarantine_resources.discovery(interaction.guild)
+        await respond(interaction, status_text(report), view=QuarantineDashboard(interaction, self), ephemeral=True)
 
     @app_commands.command(name='create_channel', description='Create a text channel, voice channel or category.')
     @app_commands.guild_only()
@@ -293,33 +468,57 @@ class SecurityCog(commands.Cog, name='Security'):
 
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before, after):
-        if before.overwrites != after.overwrites or before.category_id != after.category_id:
+        if before.overwrites != after.overwrites or getattr(before, 'category_id', None) != getattr(after, 'category_id', None):
             await self.on_guild_channel_create(after)
 
     @commands.Cog.listener()
     async def on_ready(self):
-        if self.recovering:
+        if self.recovering or time.monotonic() - self._last_recovery < 30:
             return
         self.recovering = True
         try:
             await self.recover()
         finally:
             self.recovering = False
+            self._last_recovery = time.monotonic()
+
+    @commands.Cog.listener()
+    async def on_resumed(self):
+        await self.on_ready()
 
     async def recover(self):
-        # Reconcile channels and active records after a restart or disconnection.
         for guild in self.bot.guilds:
-            for channel in guild.channels:
-                await self.on_guild_channel_create(channel)
-            async with self.quarantine_service.lock:
-                state = await self.quarantine_service.load()
-                records = dict(state.get(str(guild.id), {}).get('members', {}))
-            for identifier, record in records.items():
-                member = guild.get_member(int(identifier))
-                if member and record['phase'] != 'releasing':
-                    await self.on_member_join(member)
+            if guild.unavailable:
+                continue
+            try:
+                health = await self.quarantine_resources.discovery(guild)
+                log.info('Quarantine startup guild=%s configured=%s missing=%s conflicts=%s members=%s migrations=%s errors=%s',
+                         guild.id, health['configured'], health['missing'], len(health['permissions']),
+                         len(health['members']), len(health['pending']), health['issues'])
+                if not health['configured'] or health['missing']:
+                    continue
+                await self.quarantine_service.setup(guild, create=False)
+                async with self.quarantine_service.lock:
+                    state = await self.quarantine_service.load()
+                    settings = state.get(str(guild.id), {})
+                    records = dict(settings.get('members', {}))
+                for identifier, record in records.items():
+                    member = guild.get_member(int(identifier))
+                    if not member or record['phase'] == 'releasing' or identifier in health['pending']:
+                        continue
+                    marker = record.get('marker', health['canonical']['role'])
+                    if record['phase'] == 'active' and marker not in {role.id for role in member.roles}:
+                        actor = await self._authorized_manual_release_actor(member, marker, settings, since=record.get('confirmed_at'))
+                        if actor:
+                            await self.quarantine_service.release(guild, actor, member, expected_marker=marker)
+                            continue
+                    if record['phase'] != 'active' or marker not in {role.id for role in member.roles}:
+                        await self.on_member_join(member)
+            except (ValueError, OSError, discord.HTTPException) as exc:
+                self.last_channel_error = f'Guild {guild.id}: {type(exc).__name__}'
+                log.warning('Quarantine startup review failed for guild %s: %s', guild.id, type(exc).__name__)
 
-    async def _authorized_manual_release_actor(self, member, marker_role_id, settings):
+    async def _authorized_manual_release_actor(self, member, marker_role_id, settings, *, since=None):
         """Resolve a marker removal to a verified administrator/configured moderator.
 
         A gateway event has no actor. Trust only a recent Discord audit entry that
@@ -350,37 +549,41 @@ class SecurityCog(commands.Cog, name='Security'):
         for attempt in range(3):
             try:
                 async for entry in guild.audit_logs(
-                    limit=12, action=discord.AuditLogAction.member_role_update
+                    limit=100 if since else 12, action=discord.AuditLogAction.member_role_update
                 ):
                     if getattr(getattr(entry, 'target', None), 'id', None) != member.id:
                         continue
                     when = getattr(entry, 'created_at', None)
-                    if when is None or not (-5 <= (observed - when).total_seconds() <= 20):
+                    if when is None or (when.timestamp() < since if since else not (
+                        -5 <= (observed - when).total_seconds() <= 20
+                    )):
                         continue
                     removed = getattr(getattr(entry, 'before', None), 'roles', None) or []
                     added = getattr(getattr(entry, 'after', None), 'roles', None) or []
-                    if (not any(getattr(role, 'id', None) == marker_role_id for role in removed)
-                            or any(getattr(role, 'id', None) == marker_role_id for role in added)):
+                    if any(getattr(role, 'id', None) == marker_role_id for role in added):
+                        if since:
+                            return None
                         continue
-                    user_id = getattr(getattr(entry, 'user', None), 'id', None)
+                    if not any(getattr(role, 'id', None) == marker_role_id for role in removed):
+                        continue
+                    user_id = getattr(entry, 'user_id', None) or getattr(getattr(entry, 'user', None), 'id', None)
                     if user_id is None or user_id == me.id or user_id == member.id:
-                        continue
+                        return None
                     actor = guild.get_member(user_id)
                     if actor is None:
                         try:
                             actor = await guild.fetch_member(user_id)
                         except (discord.NotFound, discord.Forbidden):
-                            continue
+                            return None
                     if not is_above(actor, member):
-                        continue
+                        return None
                     perms = actor.guild_permissions
                     is_admin = actor.id == guild.owner_id or perms.administrator
                     is_configured_mod = (
                         any(role.id in staff_roles for role in actor.roles)
                         and perms.manage_roles
                     )
-                    if is_admin or is_configured_mod:
-                        return actor
+                    return actor if is_admin or is_configured_mod else None
             except (discord.Forbidden, discord.HTTPException, AttributeError) as exc:
                 log.warning(
                     'Cannot inspect quarantine role-removal audit in guild %s: %s',
@@ -405,7 +608,9 @@ class SecurityCog(commands.Cog, name='Security'):
                 record = settings.get('members', {}).get(str(after.id))
                 if not record or record.get('phase') == 'releasing':
                     return
-                marker_id = settings.get('role')
+                marker_id = record.get('marker', settings.get('role'))
+                if record.get('replacement_marker'):
+                    return
                 # Snapshot only the configured values, never the mutable journal.
                 configured = {'staff': settings.get('staff')}
             before_ids = {role.id for role in before.roles}
@@ -414,7 +619,7 @@ class SecurityCog(commands.Cog, name='Security'):
                 actor = await self._authorized_manual_release_actor(after, marker_id, configured)
                 if actor is not None:
                     try:
-                        failures = await self.quarantine_service.release(guild, actor, after)
+                        failures = await self.quarantine_service.release(guild, actor, after, expected_marker=marker_id)
                     except (ValueError, discord.HTTPException, OSError) as exc:
                         log.warning(
                             'Verified staff removal by %s could not finish quarantine release '
@@ -436,15 +641,32 @@ class SecurityCog(commands.Cog, name='Security'):
                     'Use /quarantine_release to authorize a release.',
                     after.id, guild.id,
                 )
-            await self.on_member_join(after)
+                embed = discord.Embed(
+                    title='Unverified quarantine marker removal',
+                    description=f'Account <@{after.id}> • ID {after.id}\nMarker {marker_id} • Guild {guild.id}',
+                    timestamp=discord.utils.utcnow(),
+                )
+                await private_mod_log(guild, embed)
+            if marker_id not in after_ids or after_ids - before_ids:
+                await self.on_member_join(after)
         finally:
             self._manual_release_checks.discard(key)
 
     @commands.Cog.listener()
     async def on_guild_role_update(self, before, after):
-        if before.permissions != after.permissions:
-            for member in after.members:
-                await self.on_member_join(member)
+        if before.permissions == after.permissions:
+            return
+        async with self.quarantine_service.lock:
+            state = await self.quarantine_service.load()
+            settings = state.get(str(after.guild.id), {})
+            tracked = settings.get('members', {})
+            if after.id == settings.get('role'):
+                if not self.quarantine_service.valid_marker(after.guild, after):
+                    log.warning('Unsafe canonical quarantine marker guild=%s role=%s', after.guild.id, after.id)
+                return
+            affected = [member for member in after.members if str(member.id) in tracked]
+        for member in affected:
+            await self.on_member_join(member)
 
     @commands.Cog.listener()
     async def on_member_update(self, before, after):

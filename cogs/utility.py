@@ -48,7 +48,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "`/slowmode` · `/lock` · `/unlock`\n"
         "`/automod exception` · `/automod recent-timeouts`\n"
         "`/automod_status` · `/automod_exception` · `/automod_reset` for the bot's link and GIF filter.\n"
-        "`/security` · `/quarantine_setup` · `/quarantine` · `/sudo_ban` · `/quarantine_release`\n\n"
+        "`/security` · `/quarantine_setup` · `/quarantine apply` · `/quarantine dashboard` · `/sudo_ban` · `/quarantine_release`\n\n"
         "Moderation commands require the relevant server permissions and respect role hierarchy.",
     ),
     "community": (
@@ -74,7 +74,8 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
         "🎩 Server butler",
         "`/butler status` — administrators: check collection and permissions\n"
         "`/butler report [date]` — bot owner: private daily activity ledger\n\n"
-        "Repeat @everyone/@here messages within three hours are removed, including those from administrators and the server owner. "
+        "`/butler exception` — manage channel exceptions. `/butler antiping` — choose a mode and cooldown.\n"
+        "By default, repeat mass mentions within three hours are removed for any account outside exempt channels. "
         "Courtesy DMs are throttled. The bot owner receives private incident, audit and daily reports. "
         "Voice reports track presence, not audio; unobserved history is marked incomplete.",
     ),

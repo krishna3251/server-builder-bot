@@ -26,7 +26,7 @@ class ButlerStore:
         try:
             if (
                 not self.initialized
-                or conn.execute("PRAGMA user_version").fetchone()[0] != 1
+                or conn.execute("PRAGMA user_version").fetchone()[0] < 2
             ):
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript("""
@@ -44,7 +44,14 @@ class ButlerStore:
                     CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,guild INTEGER,recipient INTEGER,kind TEXT,payload TEXT,status TEXT,attempts INTEGER,due REAL,created REAL,sent REAL);
                     CREATE INDEX IF NOT EXISTS delivery_due ON outbox(status,due);
                 """)
-                conn.execute("PRAGMA user_version=1")
+                # Existing ledgers do not contain delivery reasons or distinguish
+                # accepted mentions from violations. Preserve their timestamps.
+                for table, column in (("outbox", "failure TEXT"), ("pings", "allowed INTEGER DEFAULT 1")):
+                    fields = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    if column.split()[0] not in fields:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+                conn.execute("CREATE TABLE IF NOT EXISTS antiping_policy(guild INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+                conn.execute("PRAGMA user_version=2")
                 conn.commit()
                 self.initialized = True
         except BaseException:
@@ -62,7 +69,7 @@ class ButlerStore:
                     if now - self.last_prune >= 3600:
                         cutoff = now - self.retention
                         conn.execute("DELETE FROM events WHERE at<?", (cutoff,))
-                        conn.execute("DELETE FROM pings WHERE at<?", (now - 10800,))
+                        conn.execute("DELETE FROM pings WHERE at<?", (now - 86400,))
                         conn.execute("DELETE FROM ping_seen WHERE at<?", (cutoff,))
                         conn.execute("DELETE FROM cooldowns WHERE until<?", (now,))
                         conn.execute(
@@ -147,13 +154,13 @@ class ButlerStore:
             # Keep the queue bounded while prioritizing the owner's ledger over
             # low-priority courtesy notices during a very busy period.
             removed = conn.execute(
-                "UPDATE outbox SET status='failed' WHERE id=(SELECT id FROM outbox WHERE status='pending' AND kind IN ('warning','incident') ORDER BY created LIMIT 1)"
+                "UPDATE outbox SET status='failed',failure='queue_full' WHERE id=(SELECT id FROM outbox WHERE status='pending' AND kind IN ('warning','incident') ORDER BY created LIMIT 1)"
             ).rowcount
             if not removed:
                 return False
         return (
             conn.execute(
-                "INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+                "INSERT OR IGNORE INTO outbox(id,guild,recipient,kind,payload,status,attempts,due,created) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     key,
                     guild,
@@ -213,7 +220,7 @@ class ButlerStore:
         await self.pause(guild)
         await self.run(
             lambda conn: conn.execute(
-                "UPDATE outbox SET status='failed' WHERE guild=? AND status='pending'",
+                "UPDATE outbox SET status='failed',failure='guild_unavailable' WHERE guild=? AND status='pending'",
                 (guild,),
             ).rowcount
         )
@@ -340,48 +347,57 @@ class ButlerStore:
 
         await self.run(work)
 
-    async def ping(self, guild, user, name, message, count):
+    async def policy(self, guild, defaults, update=None):
+        def work(conn):
+            row = conn.execute("SELECT data FROM antiping_policy WHERE guild=?", (guild,)).fetchone()
+            policy = dict(defaults) if row is None else {**defaults, **json.loads(row[0])}
+            if update is not None:
+                update(policy)
+                conn.execute(
+                    "INSERT OR REPLACE INTO antiping_policy VALUES(?,?)", (guild, json.dumps(policy))
+                )
+            return policy
+
+        return await self.run(work)
+
+    async def ping(self, guild, user, name, message, seconds):
         now = self.clock()
+        key = f"ping:{message}:1"
 
         def work(conn):
-            row = conn.execute(
-                "SELECT count FROM ping_seen WHERE id=?", (message,)
+            # The write serializes the decision even if multiple SQLite clients
+            # open this ledger. A duplicate can still report policy ownership.
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO ping_seen VALUES(?,1,?)", (message, now)
+            ).rowcount
+            if not inserted:
+                violation = conn.execute("SELECT 1 FROM events WHERE id=?", (key,)).fetchone()
+                return {"duplicate": True} if violation else None
+            accepted = not conn.execute(
+                "SELECT 1 FROM pings WHERE guild=? AND user=? AND at>? AND allowed=1 LIMIT 1",
+                (guild, user, now - seconds),
             ).fetchone()
-            old = row[0] if row else 0
-            if count <= old:
+            conn.execute(
+                "INSERT INTO pings(id,guild,user,at,count,allowed) VALUES(?,?,?,?,1,?)",
+                (key, guild, user, now, accepted),
+            )
+            if accepted:
                 return None
-            conn.execute(
-                "INSERT OR REPLACE INTO ping_seen VALUES(?,?,?)", (message, count, now)
-            )
-            key = f"ping:{message}:{count}"
-            conn.execute(
-                "INSERT INTO pings VALUES(?,?,?,?,?)",
-                (key, guild, user, now, count - old),
-            )
             total = conn.execute(
-                "SELECT COALESCE(SUM(count),0) FROM pings WHERE guild=? AND user=? AND at>?",
-                (guild, user, now - 10800),
+                "SELECT COUNT(*) FROM pings WHERE guild=? AND user=? AND at>?",
+                (guild, user, now - seconds),
             ).fetchone()[0]
-            if total <= 1:
-                return None
-            notice = self._cooldown(conn, f"ping-notice:{guild}:{user}", now, 10800)
+            notice = self._cooldown(conn, f"ping-notice:{guild}:{user}", now, seconds)
             self._event(
-                conn,
-                key,
-                guild,
-                user,
-                name,
-                "ping_violation",
-                now,
-                target=message,
+                conn, key, guild, user, name, "ping_violation", now, target=message,
                 details={"mentions_in_window": total, "deleted": "pending"},
             )
-            return {"key": key, "notice": notice, "total": total}
+            return {"key": key, "notice": notice, "total": total, "seconds": seconds}
 
         return await self.run(work)
 
     async def complete_ping(
-        self, guild, user, name, guild_name, decision, deleted, reason, *, dm_user=True
+        self, guild, user, name, guild_name, decision, deleted, reason, *, dm_user=True, warn_only=False
     ):
         now = self.clock()
 
@@ -390,6 +406,8 @@ class ButlerStore:
                 "mentions_in_window": decision["total"],
                 "deleted": deleted,
                 "delete_result": reason,
+                "cooldown_seconds": decision["seconds"],
+                "warn_only": warn_only,
             }
             conn.execute(
                 "UPDATE events SET details=? WHERE id=?",
@@ -514,8 +532,8 @@ class ButlerStore:
 
         def expire(conn):
             conn.execute(
-                "UPDATE outbox SET status='failed' WHERE kind IN ('warning','incident') AND status='pending' AND created<?",
-                (now - 10800,),
+                "UPDATE outbox SET status='failed',failure='expired' WHERE status='pending' AND created < ? - CASE WHEN kind IN ('warning','incident') THEN 10800 ELSE 172800 END",
+                (now,),
             )
             return [
                 dict(r)
@@ -537,11 +555,11 @@ class ButlerStore:
     async def delivered(self, key):
         await self.run(
             lambda conn: conn.execute(
-                "UPDATE outbox SET status='sent',sent=? WHERE id=?", (self.clock(), key)
+                "UPDATE outbox SET status='sent',sent=?,failure=NULL WHERE id=?", (self.clock(), key)
             ).rowcount
         )
 
-    async def failed(self, key, permanent=False):
+    async def failed(self, key, reason="unexpected", *, permanent=False, retry_after=0):
         now = self.clock()
 
         def work(conn):
@@ -549,17 +567,33 @@ class ButlerStore:
                 "SELECT attempts FROM outbox WHERE id=?", (key,)
             ).fetchone()
             attempts = (row[0] if row else 0) + 1
+            terminal = permanent or attempts >= 3
             conn.execute(
-                "UPDATE outbox SET attempts=?,status=?,due=? WHERE id=?",
+                "UPDATE outbox SET attempts=?,status=?,due=?,failure=? WHERE id=?",
                 (
                     attempts,
-                    "failed" if permanent or attempts >= 3 else "pending",
-                    now + 60 * 5 ** (attempts - 1),
+                    "failed" if terminal else "pending",
+                    now + max(retry_after, 60 * 5 ** (attempts - 1)),
+                    reason,
                     key,
                 ),
             )
 
-        await self.run(work)
+            return terminal
+
+        return await self.run(work)
+
+    async def delivery_health(self, guild):
+        return await self.run(lambda conn: [
+            (row["status"], row["failure"], row["total"])
+            for row in conn.execute(
+                "SELECT status,failure,COUNT(*) AS total FROM outbox WHERE guild=? GROUP BY status,failure",
+                (guild,),
+            )
+        ])
+
+    async def health(self):
+        return await self.run(lambda conn: conn.execute("PRAGMA quick_check(1)").fetchone()[0])
 
     async def report(self, guild, start, end):
         now = self.clock()

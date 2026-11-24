@@ -14,6 +14,8 @@ The bot creates #dont-write-there (or uses the explicitly selected one), places 
 
 **Owner and Administrators:** are exempt from deletion and quarantine. The bot replies "Malik, kyun likh rahe ho? 👀" at most once per administrator per 20 seconds to avoid a flood; each exempt post still gets a private action log. Other bots/webhooks are ignored.
 
+Butler channel exceptions control mass-mention enforcement and Privileged Spam Guard. The trap applies its own configured channel and staff rules. For overlapping detections, the trap owns the incident for regular members.
+
 ## Commands
 
 - /soft_banned_diddy log_channel:<private-text-channel> mod_role:<staff-role> [channel:<existing-text-channel>] — configure or update
@@ -23,11 +25,11 @@ The bot creates #dont-write-there (or uses the explicitly selected one), places 
 
 ## Required access
 
-The bot needs Manage Channels, Manage Roles, Manage Messages, View Channel, Send Messages and Read Message History in the relevant channels. Its highest role must outrank the quarantine role and the member being quarantined. Audit the live bot permissions and channel position after enabling.
+The bot needs Manage Channels, Manage Roles, Manage Messages, View Channel, Send Messages and Read Message History in the relevant channels. Grant Pin Messages for setup to pin the warning. Its highest role must outrank the quarantine role and the member being quarantined. Audit the live bot permissions and channel position after enabling.
 
 Logs contain guild, member, and message IDs and an action/result **but never message text**. If the configured log channel becomes unavailable or public, the cog attempts to notify the guild owner by DM instead of exposing logs publicly.
 
-The persistent settings file is data/soft_banned_diddy.json. Keep this file with the deployment's normal persistent storage if the host wipes local files. The quarantine journal is managed separately by /quarantine_setup.
+The persistent settings file is data/soft_banned_diddy.json. Keep this file with the deployment's normal persistent storage if the host wipes local files. The quarantine journal is managed by /quarantine_setup and the /quarantine command group. See the [moderation audit](MODERATION_AUDIT.md) for repair, migration and cleanup.
 
 ### Safety limits
 

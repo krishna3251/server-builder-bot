@@ -25,7 +25,7 @@ from utils.paginator import Paginator
 from services.moderation_notices import notify_action
 from services.spam_guard import PrivilegedSpamGuard
 from services.automatic_moderation import (privileged_spam_mode, trusted_channel_ids,
-                                           is_trusted_channel, log_automatic_removal)
+                                           is_trusted_channel, log_automatic_removal, butler_cog, coordinator, private_mod_log, trap_owns)
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
 from utils.helpers import parse_duration
@@ -61,27 +61,7 @@ def _warn_key(guild_id: int, user_id: int) -> str:
 
 
 async def _mod_log(guild: discord.Guild, embed: discord.Embed) -> None:
-    """Send an embed to the configured mod-log channel, if it exists."""
-    if not config.MOD_LOG_CHANNEL_ID:
-        return
-    ch = guild.get_channel(config.MOD_LOG_CHANNEL_ID)
-    if ch and isinstance(ch, discord.TextChannel):
-        if ch.permissions_for(guild.default_role).view_channel:
-            log.warning("Public moderation log skipped: guild=%s channel=%s", guild.id, ch.id)
-            return
-        for target, overwrite in ch.overwrites.items():
-            if overwrite.view_channel is not True:
-                continue
-            permissions = getattr(target, 'guild_permissions', getattr(target, 'permissions', discord.Permissions.none()))
-            if target.id not in (guild.owner_id, guild.me.id) and not (
-                permissions.administrator or permissions.manage_guild or permissions.moderate_members
-            ):
-                log.warning("Moderation log with nonstaff access skipped: guild=%s channel=%s", guild.id, ch.id)
-                return
-        try:
-            await ch.send(embed=embed)
-        except discord.HTTPException:
-            pass
+    await private_mod_log(guild, embed)
 
 
 async def _dm_user(user: discord.User | discord.Member, embed: discord.Embed) -> None:
@@ -184,7 +164,12 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if self.spam_mode == "off" or is_trusted_channel(message.channel, self.spam_trusted_channels):
+        if message.guild is None or self.spam_mode == "off" or is_trusted_channel(message.channel, self.spam_trusted_channels):
+            return
+        butler = butler_cog(self.bot)
+        if butler and await butler.service.exempt(message.guild.id, message.channel):
+            return
+        if await trap_owns(self.bot, message):
             return
         batch, alert = self.spam_guard.observe(message)
         if not batch:
@@ -209,9 +194,22 @@ class ModerationCog(commands.Cog, name="Moderation"):
         # history purge could also pick up innocent messages between copies.
         by_channel = {}
         for item in batch:
-            by_channel.setdefault(item.channel, []).append(item)
+            if butler and (
+                await butler.service.exempt(guild.id, item.channel) or
+                (item.mention_everyone and await butler.usable(guild.id) and await butler.service.mention(item))
+            ):
+                continue
+            if coordinator(self.bot).claim(item, "Privileged spam guard"):
+                by_channel.setdefault(item.channel, []).append(item)
         missed = 0
         for channel, items in by_channel.items():
+            if isinstance(guild, discord.Guild) and (
+                guild.me is None or not channel.permissions_for(guild.me).manage_messages
+            ):
+                missed += len(items)
+                for item in items:
+                    await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission")
+                continue
             if len(items) > 1 and isinstance(channel, (discord.TextChannel, discord.Thread)):
                 try:
                     await channel.delete_messages(items)
@@ -223,7 +221,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
                     for item in items:
                         await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission")
                     continue
-                except discord.HTTPException:
+                except (discord.HTTPException, discord.RateLimited):
                     # A concurrent delete or failed batch must not skip surviving copies.
                     pass
             for item in items:
@@ -232,7 +230,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
                     result = "Deleted"
                 except discord.NotFound:
                     result = "Already absent"
-                except discord.HTTPException:
+                except (discord.HTTPException, discord.RateLimited):
                     missed += 1
                     result = "Deletion failed"
                 await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", result)

@@ -23,6 +23,9 @@ from test_command_workflows import FakeInteraction
 class Role:
     def __init__(self, identifier, position, **perms):
         self.id, self.position = identifier, position
+        self.name = f"role-{identifier}"
+        self.members = []
+        self.delete = AsyncMock()
         self.permissions = discord.Permissions(**perms)
         self.managed = False
     def is_default(self):
@@ -73,6 +76,7 @@ class SecurityFixture:
         self.guild.me = Mock(id=3, top_role=self.bot_role, guild_permissions=discord.Permissions(manage_roles=True, manage_channels=True, move_members=True))
         self.members = {2: self.target}
         self.guild.get_member = self.members.get
+        self.guild.members = list(self.members.values())
         self.guild.get_role = self.roles.get
         self.channel = Channel(50, self.guild, {self.target: discord.PermissionOverwrite(view_channel=True, attach_files=True)})
         self.channels = {50: self.channel}
@@ -81,6 +85,7 @@ class SecurityFixture:
         async def create_role(**kwargs):
             role = Role(60, 1)
             self.roles[60] = role
+            self.guild.roles = list(self.roles.values())
             return role
         async def create_channel(*args, **kwargs):
             channel = Channel(70 + len(self.channels), self.guild, kwargs.get('overwrites'))
@@ -141,6 +146,8 @@ class QuarantineTests(SecurityFixture, unittest.IsolatedAsyncioTestCase):
         record = await self.service.quarantine(self.guild, self.actor, self.target, 'review')
         self.assertEqual(record['phase'], 'partial')
         self.assertEqual(record['failed_channels'], [50])
+        # Simulate an earlier successful restriction while the API is now failing.
+        self.channel.overwrites[self.target] = discord.PermissionOverwrite(view_channel=False)
         self.assertEqual(await self.service.release(self.guild, self.actor, self.target), [50])
         self.assertIn('2', (await self.service.load())['10']['members'])
         self.channel.set_permissions.side_effect = self.channel.set_overwrite

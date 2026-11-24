@@ -15,6 +15,7 @@ import config
 from core.interaction import safe_defer, safe_followup, safe_send
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from services.guild_settings import GuildSettings
+from services.quarantine_service import has_quarantine_record
 from services.permission_service import bot_can_act, can_assign_role
 from utils.interactions import acknowledged
 
@@ -238,9 +239,8 @@ class VerificationCog(commands.Cog, name="Verification"):
 
         return logs
 
-    @staticmethod
     async def _mark_existing_members_verified(
-        guild: discord.Guild,
+        self, guild: discord.Guild,
         verified_role: discord.Role,
         unverified_role: discord.Role,
     ) -> tuple[int, int]:
@@ -248,7 +248,8 @@ class VerificationCog(commands.Cog, name="Verification"):
         failed = 0
         for member in guild.members:
             if (member.bot or not bot_can_act(guild, member)
-                    or verified_role in member.roles or unverified_role in member.roles):
+                    or verified_role in member.roles or unverified_role in member.roles
+                    or await has_quarantine_record(self.bot, member)):
                 continue
             try:
                 await member.add_roles(verified_role, reason="Verification setup - existing member")
@@ -343,6 +344,10 @@ class VerificationCog(commands.Cog, name="Verification"):
         member = interaction.user
         if member.bot:
             await safe_send(interaction, "Bots cannot verify through this panel.", ephemeral=True)
+            return
+
+        if await has_quarantine_record(self.bot, member):
+            await safe_send(interaction, "Verification is paused while your quarantine record is under review.", ephemeral=True)
             return
 
         guild_config = self._guild_config(guild.id)
@@ -451,7 +456,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
-        if member.bot:
+        if member.bot or await has_quarantine_record(self.bot, member):
             return
         guild_config = self._guild_config(member.guild.id)
         if not guild_config.get("enabled"):

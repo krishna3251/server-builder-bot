@@ -92,10 +92,10 @@ class DiddyEmbedLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("quarantined", embed.title.lower())
         fields = {field.name: field.value for field in embed.fields}
         self.assertIn("<@123456789012345678>", fields["Member"])
-        self.assertIn("\`123456789012345678\`", fields["Member"])
-        self.assertEqual(fields["Message ID"], "\`987654321012345678\`")
+        self.assertIn("`123456789012345678`", fields["Member"])
+        self.assertEqual(fields["Message ID"], "`987654321012345678`")
         self.assertEqual(fields["Protected channel"], "<#22>")
-        self.assertIn("\`10\`", fields["Server"])
+        self.assertIn("`10`", fields["Server"])
         self.assertIsNotNone(embed.timestamp)
         self.assertEqual(embed.colour, discord.Colour.green())
         self.owner.send.assert_not_awaited()
@@ -273,7 +273,13 @@ class DiddyModerationTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.bot.get_cog.return_value = security
         await self.cog._process(self.message())
-        await self.cog._process(self.message())
+        duplicate = self.message()
+        await self.cog._process(duplicate)
+        duplicate.delete.assert_not_awaited()
+        new_message = self.message()
+        new_message.id += 1
+        await self.cog._process(new_message)
+        new_message.delete.assert_awaited_once()
         self.assertEqual(security.quarantine_service.quarantine.await_count, 1)
         self.assertEqual(self.cog._log_action.await_count, 2)
 

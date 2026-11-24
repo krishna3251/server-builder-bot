@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,8 @@ from discord.ext import commands
 import config
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from services.moderation_notices import notify_action
+from services.automatic_moderation import butler_cog, coordinator, trap_owns
+from services.permission_service import bot_can_act
 from utils.interactions import acknowledged, respond
 from utils.paginator import Paginator
 from utils.storage import write_json_atomic
@@ -51,7 +53,7 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._image_windows: dict[tuple[int, int], deque[tuple[float, int]]] = defaultdict(deque)
+        self._image_windows: OrderedDict[tuple[int, int], deque[tuple[float, int]]] = OrderedDict()
         self._offenses: dict[str, Any] = {}
         self._settings: dict[str, Any] = {}
         self._loaded = False
@@ -145,8 +147,15 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
 
     def _count_recent_images(self, guild_id: int, user_id: int, image_count: int) -> int:
         now = time.monotonic()
-        window = self._image_windows[(guild_id, user_id)]
         cutoff = now - IMAGE_WINDOW_SECONDS
+        key = (guild_id, user_id)
+        window = self._image_windows.pop(key, deque())
+        while self._image_windows:
+            oldest = next(iter(self._image_windows.values()))
+            if len(self._image_windows) < 4096 and oldest and oldest[-1][0] >= cutoff:
+                break
+            self._image_windows.popitem(last=False)
+        self._image_windows[key] = window
         while window and window[0][0] < cutoff:
             window.popleft()
         if image_count:
@@ -223,12 +232,12 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
                     f"{message.author.mention}, your message was {action}.\nReason: **{reason}**",
                 ),
                 delete_after=10,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         except discord.HTTPException:
             pass
 
     async def _handle_violation(self, message: discord.Message, reason: str) -> None:
-        from services.automatic_moderation import log_automatic_removal
         guild = message.guild
         if guild is None or not isinstance(message.author, discord.Member):
             return
@@ -236,24 +245,29 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
         member = guild.get_member(message.author.id) or message.author
         if self._is_message_exempt(guild, message.channel, member):
             return
-        try:
-            await message.delete()
-        except discord.NotFound:
+        if await trap_owns(self.bot, message):
             return
-        except discord.HTTPException as error:
-            log.warning("AutoMod could not remove a message in guild %s (HTTP %s)", guild.id, error.status)
+        butler = butler_cog(self.bot)
+        if butler and message.mention_everyone and await butler.usable(guild.id):
+            if await butler.service.mention(message):
+                return
+        if await coordinator(self.bot).remove(message, "Local AutoMod", reason) != "Deleted":
             return
 
-        await log_automatic_removal(message, "Local AutoMod", reason, "Deleted")
         count = await self._record_offense(message, reason)
         if not count:
             return
         timed_out = False
         member = guild.get_member(member.id) or member
         until = discord.utils.utcnow() + datetime.timedelta(minutes=REPEAT_TIMEOUT_MINUTES)
-        if count >= 2 and not self._is_message_exempt(guild, message.channel, member) and (
-            member.timed_out_until is None or member.timed_out_until < until
-        ):
+        bot_permitted = not isinstance(guild, discord.Guild) or (
+            guild.me and guild.me.guild_permissions.moderate_members and bot_can_act(guild, member)
+        )
+        if (count >= 2 and bot_permitted
+                and not coordinator(self.bot).recent_native_timeout(guild.id, member.id)
+                and not self._is_message_exempt(guild, message.channel, member) and (
+            member.timed_out_until is None or member.timed_out_until <= discord.utils.utcnow()
+        )):
             try:
                 await member.timeout(until, reason=f"AutoMod repeat offense: {reason}")
                 timed_out = True

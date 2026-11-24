@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 import config
+from services.automatic_moderation import coordinator, private_mod_log
 from services.automod_service import AutoModService, AutoModSettingsError, accepts_channels, has_timeout, recent_timeouts
 from services.error_service import respond_error
 from utils.interactions import acknowledged, defer_response, respond
+
+
+log = logging.getLogger(__name__)
 
 
 def rule_status(rule: discord.AutoModRule) -> str:
@@ -159,8 +164,32 @@ class AutoModCog(commands.Cog, name="AutoMod"):
         guild_only=True, default_permissions=discord.Permissions(manage_guild=True),
     )
 
-    def __init__(self) -> None:
+    def __init__(self, bot=None) -> None:
+        self.bot = bot
         self.service = AutoModService()
+
+    @commands.Cog.listener()
+    async def on_automod_action(self, execution: discord.AutoModAction):
+        guild = execution.guild
+        if guild is None:
+            return
+        action = execution.action.type
+        channel, message = execution.channel_id, execution.message_id
+        key = f"message:{guild.id}:{message}" if message else f"native:{guild.id}:{execution.rule_id}:{execution.user_id}"
+        if self.bot and action == discord.AutoModRuleActionType.timeout:
+            coordinator(self.bot).record_native_timeout(guild.id, execution.user_id)
+        log.info("Native AutoMod guild=%s user=%s channel=%s message=%s rule=%s action=%s",
+                 guild.id, execution.user_id, channel, message, execution.rule_id, action.name)
+        embed = discord.Embed(
+            title="Discord native AutoMod",
+            description=f"Rule {execution.rule_id} • Discord applied {action.name.replace('_', ' ')}",
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="User", value=f"<@{execution.user_id}> • {execution.user_id}")
+        embed.add_field(name="Channel", value=f"<#{channel}> • {channel}" if channel else "Unavailable")
+        embed.add_field(name="Message ID", value=str(message) if message else "Unavailable")
+        embed.add_field(name="Correlation ID", value=key, inline=False)
+        await private_mod_log(guild, embed)
 
     @automod.command(name="exception", description="Open AutoMod exceptions or change a rule using a role or channel mention.")
     @app_commands.describe(
@@ -250,4 +279,4 @@ class AutoModCog(commands.Cog, name="AutoMod"):
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(AutoModCog())
+    await bot.add_cog(AutoModCog(bot))

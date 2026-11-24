@@ -1,6 +1,7 @@
 """Entry point — initialises the bot, loads cogs, and starts the event loop."""
 
 import asyncio
+from collections import Counter
 import datetime
 import logging
 import os
@@ -71,6 +72,7 @@ intents.message_content = True
 intents.members = True
 intents.presences = False
 intents.moderation = True
+intents.auto_moderation_execution = True
 intents.voice_states = True
 
 
@@ -95,7 +97,7 @@ class ServerBot(commands.Bot):
         """Load all cogs dynamically from the cogs/ directory."""
         log.info("Release: %s v%s | source=krishna3251/server-builder-bot", config.BOT_NAME, config.BOT_VERSION)
         cog_dir = pathlib.Path("cogs")
-        for cog_file in cog_dir.glob("*.py"):
+        for cog_file in sorted(cog_dir.glob("*.py")):
             if cog_file.name.startswith("_"):
                 continue
             ext = f"cogs.{cog_file.stem}"
@@ -107,6 +109,19 @@ class ServerBot(commands.Bot):
                 log.info("Loaded cog: %s", ext)
             except Exception as exc:
                 self.extension_errors[ext] = report_error(exc, context=f"Loading {ext}")
+
+        registered = [command.qualified_name for command in self.tree.walk_commands()]
+        duplicates = sorted(name for name, count in Counter(registered).items() if count > 1)
+        listeners = Counter(
+            event for cog in self.cogs.values() for event, _ in cog.get_listeners()
+        )
+        log.info(
+            "Startup inventory cogs=%s failed=%s command_paths=%s duplicates=%s moderation_listeners=%s",
+            sorted(self.cogs), sorted(self.extension_errors), len(registered), duplicates,
+            {event: listeners[event] for event in (
+                "on_message", "on_raw_message_edit", "on_member_update", "on_automod_action",
+            )},
+        )
 
         # A sync outage should be visible in logs but must not hide the original
         # connection/startup error by crashing setup_hook without a traceback.
@@ -126,6 +141,13 @@ class ServerBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)  # type: ignore[union-attr]
         log.info("Guilds: %d | Latency: %.0fms", len(self.guilds), self.latency * 1000)
+        expected_workers = {"server-butler", "reminder-queue", "restore-ticket-deletions",
+                            "analytics-json-writer", "security-profile"}
+        active_names = Counter(task.get_name() for task in asyncio.all_tasks()
+                               if task.get_name() in expected_workers)
+        duplicates = [name for name, count in active_names.items() if count > 1]
+        log.info("Startup workers=%s duplicate_workers=%s sync_error=%s",
+                 dict(active_names), duplicates, self.command_sync_error)
 
 
 bot = ServerBot()

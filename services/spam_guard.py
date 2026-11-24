@@ -53,6 +53,8 @@ class PrivilegedSpamGuard:
         window = self.windows.setdefault(key, AccountWindow(now))
         self.windows.move_to_end(key)
         window.last_seen = now
+        if len(self.windows) > 256:
+            self.windows.popitem(last=False)
         samples = window.samples
         while samples and samples[0].at <= now - 30:
             samples.popleft()

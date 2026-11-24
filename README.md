@@ -36,11 +36,7 @@ See [DAMU feature comparison and settings import](DAMU_MIGRATION.md) for the add
 
 ## Admin and owner spam protection
 
-The moderation cog automatically watches new messages from the server owner and human members with Administrator. It checks each account across channels and threads in the same server. It selects three copies of the same nonempty text within 30 seconds (ignoring case and extra whitespace), three actual `@everyone` or `@here` pings within 15 seconds, or eight messages within eight seconds. It deletes messages matching those windows, including the first copies. Fast legitimate conversations can also meet the flood threshold.
-
-Grant the bot **View Channel** and **Manage Messages** wherever cleanup is needed, and enable the Message Content Intent. Its role can stay in its current position. Detection uses recent events in memory and starts fresh on restart. The bot can only clean up while connected and permitted to delete messages. Already delivered notifications may still be visible.
-
-The bot alerts the affected account and the server owner by DM, and posts incident counts to the configured `MOD_LOG_CHANNEL_ID`. Alerts are limited to one per account per server per minute. Failed removals appear in the hosting logs even when DMs are closed.
+Privileged Spam Guard tracks repeated text, actual mass mentions and rapid message bursts from the server owner and administrators. It uses **alert-only** mode by default. Set `PRIVILEGED_SPAM_MODE=delete` to opt into removal or `off` to disable it. The guard honors Butler channel exceptions and the baseline `AUTO_MOD_TRUSTED_CHANNEL_IDS` list. The alert includes incident counts and IDs, with a one-minute per-account throttle.
 
 ### Discord AutoMod exceptions
 
@@ -48,12 +44,12 @@ The bot alerts the affected account and the server owner by DM, and posts incide
 - To use mentions directly, pass the `rule` plus a `role` or `channel` to `/automod exception`. Use `remove: True` to remove those entries. A role or channel exemption applies to the selected rule. Add it to each rule that needs it.
 - Run `/automod recent-timeouts member: @member` to check up to five matching entries from Discord's recent audit logs. The result identifies the native rule or the account that applied the timeout, with the reason when recorded. Match the rule that acted before changing exceptions.
 
-Both the moderator and bot need **Manage Server** for exception settings and **Moderate Members** to change a timeout rule. The timeout lookup requires the moderator and bot to have **View Audit Log**. Server Builder's privileged spam guard defaults to alert-only; Butler can delete qualifying non-admin mass mentions. Timeout actions can come from Discord AutoMod, the bot's manual or warning-based moderation commands, or another app with the required permissions.
+Both the moderator and bot need **Manage Server** for exception settings and **Moderate Members** to change a timeout rule. The timeout lookup requires the moderator and bot to have **View Audit Log**. Server Builder's privileged spam guard defaults to alert-only; Butler applies the same cooldown to all accounts. Timeout actions can come from Discord AutoMod, the bot's manual or warning-based moderation commands, or another app with the required permissions.
 
 ## Requirements
 
 - Python 3.10+
-- discord.py >= 2.3.0
+- discord.py >= 2.6.0, < 3.0
 - See [requirements.txt](requirements.txt) for full list
 
 ## Project Structure
@@ -114,7 +110,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the original 57-command audit, verified checks and limitations; the server butler adds two commands documented below. [UPDATE_REPORT.md](UPDATE_REPORT.md) preserves the earlier review.
+See [COMMAND_AUDIT.md](COMMAND_AUDIT.md) for the current command inventory and [MODERATION_AUDIT.md](MODERATION_AUDIT.md) for the feature audit and deployment steps. [UPDATE_REPORT.md](UPDATE_REPORT.md) preserves the earlier review.
 
 
 ### JSON examples and command recovery
@@ -129,17 +125,14 @@ Shop XP Boost purchases now enable double message XP for one hour, stacking time
 
 ## Server butler
 
-Repeat `@everyone`/`@here` messages within three hours may be removed for non-exempt users, with a polite, rate-limited DM. Administrators and server owners are exempt. Privileged-account spam detection defaults to alert-only (no message deletion). Set `PRIVILEGED_SPAM_MODE=off` to disable detection or `delete` to explicitly opt into cleanup. Set `BUTLER_ANTI_PING_DELETE=false` to disable Butler deletion, and `AUTO_MOD_TRUSTED_CHANNEL_IDS` to comma-separated channel IDs (including announcement channels) exempt from both policies. Restart after configuration changes. Set `MOD_LOG_CHANNEL_ID` to a private staff channel for per-message automatic moderation receipts; console receipts also include IDs and results. The bot owner receives private incident/audit notices,
-today's first-start snapshot and a daily ledger of joins, departures and each
-person's observed voice joins/time. Ordinary message text and voice audio are
-not collected. Missing historical activity is clearly marked as unknown.
+Butler allows one actual Discord mass-mention message per author and server every three hours by default. The same policy applies to members, moderators, administrators and the owner. An edit that introduces a mass mention uses the same rules. Discord announces mass mentions before the bot can remove a message, so removal cannot retract an already delivered notification.
 
-Use `/butler status` (administrator/owner) and `/butler report` (bot owner).
-Reports default to **00:05 Asia/Kolkata** for the previous day. Keep `data/`
-persistent, allow owner DMs, and grant Manage Messages and View Audit Log.
-See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) and [.env.example](.env.example) for
-setup, retention, first-report behavior and limitations. The first real report
-requires the updated bot to be deployed and connected to Discord.
+- `/butler exception add channel` and `remove` manage channel exceptions. Categories extend to their channels and threads inherit their parent exceptions. Removed channels can be cleared by ID.
+- `/butler exception list` shows saved IDs. `clear` requires confirmation. Exempt messages do not use the allowance.
+- `/butler antiping mode` selects Delete, Warn only or Disabled. `/butler antiping cooldown` accepts 1–1,440 minutes. Administrator or owner access is required to change policy.
+- `/butler status` shows the active policy, permission checks and notification health. `/butler report [date]` privately exports the ledger for the application or configured report owner.
+
+The ledger contains join/leave, voice-presence and moderation metadata. Reports default to **00:05 Asia/Kolkata**, covering the preceding day. Set `MOD_LOG_CHANNEL_ID` to a private staff channel for action receipts and undelivered incident notices. See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) for retention and coverage and [.env.example](.env.example) for defaults.
 
 ## Private security and quarantine
 
@@ -151,14 +144,19 @@ The bot uses Discord Components V2 for the command center, main builder panel, s
 | `/builder_panel` | Open the new builder panel, including channel creation. |
 | `/security` | Open the administrator's private permission and recovery status. |
 | `/quarantine_setup staff_role` | Create a hidden category, review channel and marker role, then add restrictions to existing channels. The staff role is optional. Repeat to repair a partial setup. |
-| `/quarantine member reason` | Suspend editable roles and channel access, saving a durable recovery record. |
+| `/quarantine apply member reason` | Suspend editable roles and channel access, saving a durable recovery record. |
 | `/sudo_ban member reason` | Apply the same reversible quarantine. The member stays in the guild. |
 | `/quarantine_release member` | Restore saved roles and channel access. Repeat after fixing permissions if release is partial. |
+| `/quarantine dashboard` | Open a private administrator dashboard. |
+| `/quarantine audit`, `status`, `permissions`, `resources` | Read canonical IDs, effective access, member phases, failures and ownership evidence. |
+| `/quarantine repair`, `sync` | Repair settings. Sync uses existing resources. Repair can reuse verified resources or replace missing ones. |
+| `/quarantine migrate` | Preview and confirm moving active records to a repaired marker. |
+| `/quarantine cleanup` | Preview verified obsolete resources, then explicitly confirm deletion. |
 | `/butler status` | Check private reporting and activity collection. |
 | `/butler report [date]` | Bot owner only, privately open the activity ledger. |
 | `/bot_profile` | Bot application owner only, refresh the dynamic public description and presence. |
 
-Quarantine setup requires Administrator on the caller. Apply/release requires Moderate Members and Manage Roles on the caller, plus the normal actor/target hierarchy checks. The bot needs View Channel, Send Messages, Read Message History, Manage Channels and Manage Roles and must outrank every role it suspends or restores. Existing role order is preserved. The owner is protected. Targets with privileged everyone/managed/uneditable roles are refused. The quarantine marker has zero guild permissions and is neither hoisted nor mentionable. Deleted resources can be recreated by rerunning setup.
+Quarantine setup requires Administrator on the caller. Apply/release requires Moderate Members and Manage Roles on the caller, plus the normal actor/target hierarchy checks. The bot needs View Channel, Send Messages, Read Message History, Manage Channels and Manage Roles and must outrank every role it suspends or restores. Existing role order is preserved. The owner is protected. Targets with privileged everyone/managed/uneditable roles are refused. The quarantine marker has zero guild permissions and is neither hoisted nor mentionable. Deleted resources can be replaced through setup or repair. Existing records migrate through the confirmed migration command.
 
 Per-member channel overwrites enforce quarantine even where other roles explicitly allow access. Channels created during quarantine and members who leave/rejoin are reconciled. Voice disconnection additionally needs Move Members. Failed restrictions produce a partial result, which can be retried. Roles that gained permissions during quarantine require staff review before restoration. Changes to overwrite fields made independently by staff are preserved on release when they differ from the bot's last applied values.
 
@@ -169,3 +167,6 @@ Moderation command replies are ephemeral. The configured moderation log is skipp
 `BOT_CREATOR_NAME=luffyanna` supplies the public creator credit. The application description and presence refresh every 15 minutes with the version and server count. Private incident counts stay in private reports. These updates use the application description API, and require a running bot with a valid token.
 
 Keep `data/quarantine.json` and `data/butler.sqlite3` on persistent storage and run one bot process for these local stores. After restart, active records and channel restrictions are reconciled. Partial releases remain recorded for explicit staff completion. Hidden channels are marked incomplete and never used for permission snapshots. Discord API writes span multiple requests, so an interruption can leave a partial operation. Review `/security`, `/butler status` and hosting logs before treating a partial result as complete.
+
+
+Use [the Wispbyte deployment steps and moderation audit](MODERATION_AUDIT.md#wispbyte-deployment) for the persistent data path, permissions and rollback details.

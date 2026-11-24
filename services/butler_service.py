@@ -8,13 +8,15 @@ import io
 import json
 import logging
 import os
+from collections import OrderedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from aiohttp import ClientConnectionError
 
 from services.butler_store import ButlerStore
-from services.automatic_moderation import env_enabled, trusted_channel_ids, is_trusted_channel, log_automatic_removal
+from services.automatic_moderation import (coordinator, env_enabled, is_trusted_channel,
+    log_automatic_removal, private_mod_log, trap_owns, trusted_channel_ids)
 
 log = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -38,6 +40,7 @@ class ButlerSettings:
     guild_ids: frozenset = frozenset()
     anti_ping_delete: bool = True
     trusted_channels: frozenset[int] = frozenset()
+    mode: str | None = None
 
     @classmethod
     def from_env(cls):
@@ -50,7 +53,8 @@ class ButlerSettings:
             )
             zone = "UTC"
         scope = os.getenv("BUTLER_GUILD_IDS", "").strip()
-        ids = frozenset(int(x.strip()) for x in scope.split(",") if x.strip().isdigit())
+        from config import configured_id
+        ids = frozenset(value for item in scope.split(",") if (value := configured_id(item, "BUTLER_GUILD_IDS")))
         if scope and not ids:
             log.warning(
                 "BUTLER_GUILD_IDS has no valid IDs; no servers will be collected"
@@ -67,6 +71,7 @@ class ButlerSettings:
             ids,
             env_enabled("BUTLER_ANTI_PING_DELETE"),
             trusted_channel_ids(),
+            os.getenv("BUTLER_ANTI_PING_MODE", "").strip().lower() or None,
         )
 
 
@@ -93,12 +98,16 @@ class ButlerService:
             path, retention_days=self.settings.retention_days, clock=self.clock
         )
         self.owner_id = self.settings.owner_id
+        self._app_owner = None
+        self._owner_checked_at = 0
         self.guilds = set()
         self.delivery_lock = asyncio.Lock()
         self.audit_lock = asyncio.Lock()
         self.last_error = None
         self.audit_cursor = {}
         self.audit_capped = set()
+        self._policies = OrderedDict()
+        self._policy_lock = asyncio.Lock()
 
     def enabled(self, guild):
         return self.settings.enabled and (
@@ -114,13 +123,14 @@ class ButlerService:
         return await self.bot.is_owner(user)
 
     async def resolve_owner(self):
-        if not self.owner_id:
-            self.owner_id = await self.resolve_application_owner()
-        return self.owner_id
+        return self.owner_id or await self.resolve_application_owner()
 
     async def resolve_application_owner(self):
-        app = await self.bot.application_info()
-        return app.team.owner_id if app.team else app.owner.id
+        if self._app_owner is None or self.clock() - self._owner_checked_at >= 300:
+            app = await self.bot.application_info()
+            self._app_owner = app.team.owner_id if app.team else app.owner.id
+            self._owner_checked_at = self.clock()
+        return self._app_owner
 
     @staticmethod
     def voices(guild):
@@ -158,60 +168,56 @@ class ButlerService:
         await self.collect_audit(guild, start, initial=True)
         await self.store.enqueue_report(guild.id, str(self.today()), "initial")
 
+    async def policy(self, guild_id, update=None):
+        mode = self.settings.mode
+        if mode not in {"delete", "warn", "disabled"}:
+            mode = "delete" if self.settings.anti_ping_delete else "disabled"
+        defaults = {"mode": mode, "seconds": 10800,
+                    "exceptions": sorted(self.settings.trusted_channels)}
+        async with self._policy_lock:
+            key = (guild_id, self.settings)
+            if update is None and key in self._policies:
+                self._policies.move_to_end(key)
+                return self._policies[key]
+            policy = await self.store.policy(guild_id, defaults, update)
+            self._policies[key] = policy
+            if len(self._policies) > 256:
+                self._policies.popitem(last=False)
+            return policy
+
+    async def exempt(self, guild_id, channel):
+        return is_trusted_channel(channel, (await self.policy(guild_id))["exceptions"])
+
     async def mention(self, message):
         guild = message.guild
-        if (
-            guild is None
-            or not self.enabled(guild.id)
-            or message.author.id == getattr(self.bot.user, "id", None)
-        ):
-            return
-        if not message.mention_everyone or not self.settings.anti_ping_delete:
-            return
-        if is_trusted_channel(getattr(message, "channel", None), self.settings.trusted_channels):
-            return
-        # Do not delete privileged users' posts, including raw message edits.
-        author = message.author
-        if author.id == guild.owner_id:
-            return
-        member = guild.get_member(author.id) or author
-        permissions = getattr(member, "guild_permissions", None)
-        if permissions is None:
-            # Unknown privileges: fail safely rather than delete a possible admin post.
-            return
-        if permissions.administrator:
-            return
-        # Discord notifies once per message, even if the token is repeated.
-        # Its parsed flag also distinguishes real mentions from plain literals.
-        count = 1
+        if (guild is None or not self.enabled(guild.id) or not message.mention_everyone
+                or message.author.id == getattr(self.bot.user, "id", None)):
+            return False
+        policy = await self.policy(guild.id)
+        if policy["mode"] == "disabled" or is_trusted_channel(
+            getattr(message, "channel", None), policy["exceptions"]
+        ) or await trap_owns(self.bot, message):
+            return False
         decision = await self.store.ping(
-            guild.id, message.author.id, message.author.display_name, message.id, count
+            guild.id, message.author.id, message.author.display_name, message.id, policy["seconds"]
         )
         if decision is None:
-            return
-        deleted = False
-        reason = "deleted"
-        try:
-            await message.delete()
-            deleted = True
-        except discord.NotFound:
-            deleted = True
-            reason = "already deleted"
-        except discord.Forbidden:
-            reason = "missing Manage Messages permission"
-        except discord.HTTPException:
-            reason = "Discord deletion failed"
+            return False
+        if decision.get("duplicate"):
+            return True
+        rule = f"Repeat mass mention within {duration(policy['seconds'])}"
+        warn_only = policy["mode"] == "warn"
+        if warn_only:
+            reason = "Warn only"
+            await log_automatic_removal(message, "Butler anti-ping", rule, reason)
+        else:
+            reason = await coordinator(self.bot).remove(message, "Butler anti-ping", rule)
         await self.store.complete_ping(
-            guild.id,
-            message.author.id,
-            message.author.display_name,
-            guild.name,
-            decision,
-            deleted,
-            reason,
+            guild.id, message.author.id, message.author.display_name, guild.name,
+            decision, reason in {"Deleted", "Already absent"}, reason, warn_only=warn_only,
             dm_user=not message.author.bot and not message.webhook_id,
         )
-        await log_automatic_removal(message, "Butler anti-ping", "Repeat mass mention within three hours", reason)
+        return True
 
     @staticmethod
     def audit_flags(entry):
@@ -417,21 +423,23 @@ class ButlerService:
             jobs = await self.store.due(limit)
             for job in jobs:
                 if not self.enabled(job["guild"]):
-                    await self.store.failed(job["id"], permanent=True)
+                    await self.store.failed(job["id"], "disabled_guild", permanent=True)
                     continue
                 if job["guild"] not in self.guilds:
                     getter = getattr(self.bot, "get_guild", lambda identifier: None)
                     if getter(job["guild"]) is None:
-                        await self.store.failed(job["id"], permanent=True)
+                        await self.store.failed(job["id"], "guild_unavailable", permanent=True)
                     else:
                         await self.store.postpone(job["id"])
                     continue
-                payload = json.loads(job["payload"])
                 try:
+                    payload = json.loads(job["payload"])
                     if job["kind"] == "moderation" and not job["recipient"]:
                         recipient = await self.resolve_application_owner()
                     else:
                         recipient = job["recipient"] or await self.resolve_owner()
+                    if not isinstance(recipient, int) or recipient <= 0:
+                        raise ValueError("Missing delivery recipient")
                     user = self.bot.get_user(recipient) or await self.bot.fetch_user(
                         recipient
                     )
@@ -455,31 +463,56 @@ class ButlerService:
                             text = payload["summary"]
                         elif job["kind"] == "warning":
                             text = (
-                                f"A small housekeeping request from {payload['server']}: please keep @everyone/@here to once every three hours. "
+                                f"Please keep mass mentions in {payload['server']} to once every {duration(payload.get('cooldown_seconds', 10800))}. "
                                 + (
                                     "I removed the repeat-mention message. "
                                     if payload["deleted"]
-                                    else "I could not remove it automatically; please tidy it up. "
+                                    else ("" if payload.get("warn_only") else "I could not remove it automatically; please tidy it up. ")
                                 )
-                                + "Thank you for helping keep the server calm. Administrators, the server owner and configured trusted channels are exempt."
+                                + "Thank you for helping keep the server calm. Configured channels are exempt."
                             )
                         elif job["kind"] == "incident":
-                            text = f"Housekeeping report • Server {job['guild']}: {payload['name']} ({payload['user']}) repeated a mass mention. Deletion: {payload['delete_result']}. Further incidents will be counted in the daily ledger; I will avoid repeated DMs during this three-hour window."
+                            text = f"Housekeeping report • Server {job['guild']}: {payload['name']} ({payload['user']}) repeated a mass mention. Deletion: {payload['delete_result']}. Further incidents will be counted in the daily ledger; I will avoid repeated DMs during this cooldown window."
                         else:
                             text = f"Audit review requested • Observed {datetime.fromtimestamp(job['created'],self.zone).isoformat(timespec='minutes')} • Server {job['guild']}: actor {payload['name']} ({payload['user']}), action {payload['action']}, target {payload['target']}. Recent same-action entries: {payload['recent_count']}. {'; '.join(payload['flags']) or 'Elevated activity in a ten-minute window'}. This may be legitimate administration; please review before taking action."
                         await user.send(
                             text[:1900], allowed_mentions=discord.AllowedMentions.none()
                         )
                     await self.store.delivered(job["id"])
-                except (discord.Forbidden, discord.NotFound):
-                    await self.store.failed(job["id"], permanent=True)
-                    self.last_error = (
-                        "A private delivery was blocked; check owner ID/DM settings."
-                    )
                 except Exception as exc:
-                    await self.store.failed(job["id"])
-                    self.last_error = f"Private delivery failed: {type(exc).__name__}"
-                    log.warning(
-                        "Butler private delivery failed: %s", type(exc).__name__
-                    )
+                    reason, permanent, retry_after = delivery_failure(exc)
+                    terminal = await self.store.failed(job["id"], reason, permanent=permanent, retry_after=retry_after)
+                    self.last_error = f"Private delivery failed: {reason}"
+                    log.warning("Butler delivery guild=%s kind=%s job=%s reason=%s",
+                                job["guild"], job["kind"], job["id"], reason)
+                    guild = getattr(self.bot, "get_guild", lambda identifier: None)(job["guild"])
+                    if terminal and guild and job["kind"] in {"warning", "incident", "moderation"}:
+                        embed = discord.Embed(
+                            title="Private moderation notification failed",
+                            description=f"Delivery type: {job['kind']}\nReason: {reason}\nCorrelation: {job['id']}",
+                            timestamp=discord.utils.utcnow(),
+                        )
+                        await private_mod_log(guild, embed)
                 await asyncio.sleep(0.25)
+
+
+def delivery_failure(exc):
+    if isinstance(exc, discord.RateLimited):
+        return "rate_limited", False, exc.retry_after
+    if isinstance(exc, discord.NotFound):
+        return "missing_user" if exc.code in (0, 10013) else "discord_not_found", True, 0
+    if isinstance(exc, discord.Forbidden):
+        return "closed_dms" if exc.code == 50007 else "missing_permissions", True, 0
+    if isinstance(exc, discord.HTTPException):
+        if exc.status == 429:
+            try:
+                retry = float(exc.response.headers.get("Retry-After", "0"))
+            except (AttributeError, ValueError, TypeError):
+                retry = 0
+            return "rate_limited", False, retry
+        return "discord_api_error", exc.status < 500, 0
+    if isinstance(exc, (TimeoutError, ClientConnectionError, OSError)):
+        return "connection_failure", False, 0
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "invalid_configuration", True, 0
+    return "unexpected_error", False, 0

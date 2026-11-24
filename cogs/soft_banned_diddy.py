@@ -6,6 +6,7 @@ Moderation records never include message content and are delivered privately.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import datetime
 import json
 import logging
@@ -17,6 +18,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
+from services.automatic_moderation import coordinator
 from utils.interactions import acknowledged, respond
 from utils.storage import write_json_atomic
 
@@ -90,15 +92,20 @@ def trap_log_embed(guild: discord.Guild, cfg: dict, member_id: int,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
     label = "Staff member" if message_id == 0 else "Member"
-    embed.add_field(name=label, value=f"<@{member_id}>\n**User ID:** \`{member_id}\`", inline=False)
+    embed.add_field(name=label, value=f"<@{member_id}>\n**User ID:** `{member_id}`", inline=False)
     channel_id = cfg.get("channel_id")
     if channel_id:
         embed.add_field(name="Protected channel", value=f"<#{channel_id}>", inline=True)
+    embed.add_field(name="Module", value="Soft Banned Diddy")
+    embed.add_field(name="Exception", value="Administrator/owner" if is_exempt else "No")
+    if guild.me:
+        embed.add_field(name="Actor", value=f"<@{guild.me.id}> • {guild.me.id}")
     if message_id:
-        embed.add_field(name="Message ID", value=f"\`{message_id}\`", inline=True)
+        embed.add_field(name="Correlation ID", value=f"message:{guild.id}:{message_id}")
+        embed.add_field(name="Message ID", value=f"`{message_id}`", inline=True)
     embed.add_field(
         name="Server",
-        value=f"{discord.utils.escape_markdown(guild.name)[:100]}\nID: \`{guild.id}\`",
+        value=f"{discord.utils.escape_markdown(guild.name)[:100]}\nID: `{guild.id}`",
         inline=False,
     )
     embed.set_footer(text="Server Builder • Soft Banned Diddy • Private staff log")
@@ -114,8 +121,8 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         self._loaded = False
         self._load_retry_at = 0.0
         self._inflight: set[tuple[int, int]] = set()
-        self._recent_quarantines: dict[tuple[int, int], float] = {}
-        self._staff_replies: dict[tuple[int, int], float] = {}
+        self._recent_quarantines: OrderedDict[tuple[int, int], float] = OrderedDict()
+        self._staff_replies: OrderedDict[tuple[int, int], float] = OrderedDict()
 
     async def _load(self) -> None:
         if self._loaded:
@@ -324,9 +331,11 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         target = channel or guild.get_channel(saved.get("channel_id", 0))
         if target is not None and not isinstance(target, discord.TextChannel):
             target = None
-        if target and (target.id == log_channel.id or target.id in (
-            (await self._security().quarantine_service.load()).get(str(guild.id), {}).get("room", 0),
-        )):
+        journal = self._security().quarantine_service
+        async with journal.lock:
+            state = (await journal.load()).get(str(guild.id), {})
+            reserved = {state.get("room"), state.get("category"), state.get("role")}
+        if target and target.id in reserved | {log_channel.id}:
             return await respond(interaction, "Choose a different channel from logs and quarantine review.", ephemeral=True)
         if target is None and any(c.name == CHANNEL_NAME for c in guild.text_channels):
             return await respond(interaction, "A channel named dont-write-there already exists. Select it using the channel option to confirm reuse.", ephemeral=True)
@@ -367,6 +376,10 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
                         note = candidate
                 except discord.NotFound:
                     pass
+            if note is None or not note.pinned:
+                perms = target.permissions_for(me)
+                if not getattr(perms, "pin_messages", perms.manage_messages):
+                    return await respond(interaction, "The bot needs Pin Messages to publish the trap warning.", ephemeral=True)
             if note is None:
                 note = await target.send(WARNING, allowed_mentions=discord.AllowedMentions.none())
             elif note.content != WARNING:
@@ -457,6 +470,25 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
                       ephemeral=True,
                       allowed_mentions=discord.AllowedMentions.none())
 
+    @staticmethod
+    def _remember(cache, key):
+        cache[key] = time.monotonic()
+        cache.move_to_end(key)
+        if len(cache) > 2048:
+            cache.popitem(last=False)
+
+    async def owns_message(self, message):
+        if message.guild is None or message.author.bot:
+            return False
+        try:
+            await self._load()
+        except (ValueError, OSError):
+            return False
+        settings = self._cfg(message.guild.id)
+        if not settings.get("enabled") or message.channel.id != settings.get("channel_id"):
+            return False
+        return not isinstance(message.author, discord.Member) or not is_admin(message.author)
+
     async def _process(self, message: discord.Message) -> None:
         guild = message.guild
         if guild is None or message.author.bot:
@@ -479,7 +511,7 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
             key = (guild.id, member.id)
             now = time.monotonic()
             if key not in self._staff_replies or now - self._staff_replies[key] >= REPLY_COOLDOWN:
-                self._staff_replies[key] = now
+                self._remember(self._staff_replies, key)
                 try:
                     await message.channel.send(STAFF_REPLY, allowed_mentions=discord.AllowedMentions.none())
                 except discord.HTTPException:
@@ -490,14 +522,10 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
         if not me or not message.channel.permissions_for(me).manage_messages:
             await self._log_action(guild, cfg, member.id, message.id, "ERROR: cannot delete message")
             return
-        try:
-            # discord.Message/PartialMessage.delete accepts delay, not audit-log reason.
-            # Deletion itself does not offer a Discord audit reason; log separately.
-            await message.delete()
-        except discord.NotFound:
-            return
-        except discord.HTTPException:
-            await self._log_action(guild, cfg, member.id, message.id, "ERROR: message deletion failed")
+        result = await coordinator(self.bot).remove(message, "Soft Banned Diddy", "Posted in configured trap channel")
+        if result != "Deleted":
+            if result not in {"Already absent", "Already handled by another listener"}:
+                await self._log_action(guild, cfg, member.id, message.id, f"ERROR: {result}")
             return
         security = self._security()
         if security is None:
@@ -515,7 +543,7 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
             record = await security.quarantine_service.quarantine(
                 guild, me, member, f"Posted in {CHANNEL_NAME} (message {message.id})")
             if record.get("phase") == "active":
-                self._recent_quarantines[key] = time.monotonic()
+                self._remember(self._recent_quarantines, key)
             outcome = "Quarantined" if record.get("phase") == "active" else "PARTIAL quarantine; staff review required"
         except (ValueError, discord.HTTPException, OSError) as exc:
             log.warning("Trap quarantine failed in guild %s: %s", guild.id, type(exc).__name__)
@@ -533,7 +561,7 @@ class SoftBannedDiddy(commands.Cog, name="Soft Banned Diddy"):
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
-        if not payload.guild_id:
+        if not payload.guild_id or "content" not in payload.data:
             return
         try:
             await self._load()

@@ -40,6 +40,10 @@ class LocalAutoModTests(unittest.IsolatedAsyncioTestCase):
         self.author.bot = False
         self.author.guild_permissions = discord.Permissions.none()
         self.author.roles = []
+        self.author.top_role.position = 1
+        self.guild.owner_id = 1
+        self.guild.me.id = 999
+        self.guild.me.top_role.__gt__.return_value = True
         self.author.timed_out_until = None
         self.author.timeout = AsyncMock()
         self.guild.get_member.return_value = self.author
@@ -48,7 +52,8 @@ class LocalAutoModTests(unittest.IsolatedAsyncioTestCase):
         self.cog._send_channel_notice = AsyncMock()
 
     def message(self, channel):
-        return SimpleNamespace(guild=self.guild, author=self.author, channel=channel,
+        channel.permissions_for = Mock(return_value=discord.Permissions(manage_messages=True))
+        return SimpleNamespace(guild=self.guild, author=self.author, channel=channel, mention_everyone=False,
                                id=100, content="https://tenor.com/view/wave", attachments=[], delete=AsyncMock())
 
     async def test_status_acknowledges_before_loading_settings(self):
@@ -93,9 +98,13 @@ class LocalAutoModTests(unittest.IsolatedAsyncioTestCase):
         self.guild.me.guild_permissions = discord.Permissions(manage_messages=True, moderate_members=True)
         await self.cog.automod_status.callback(self.cog, self.interaction, True)
         await self.cog.on_message(message)
+        message = self.message(message.channel)
+        message.id = 101
         self.author.timed_out_until = discord.utils.utcnow() + timedelta(hours=1)
         await self.cog.on_message(message)
         self.author.timeout.assert_not_awaited()
+        message = self.message(message.channel)
+        message.id = 102
         self.author.timed_out_until = None
         notice = AsyncMock()
         with patch.dict(self.cog._handle_violation.__func__.__globals__, notify_action=notice):

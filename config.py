@@ -1,5 +1,6 @@
 """Bot configuration — reads from .env and exposes typed constants."""
 
+import logging
 import os
 from dotenv import load_dotenv
 
@@ -28,14 +29,22 @@ MONGO_URI: str = os.getenv("MONGO_URI", "")
 GIPHY_API_KEY: str = os.getenv("GIPHY_API_KEY", "").strip()
 
 # ── Channel / Role IDs ───────────────────────────────────────────────────────
-MOD_LOG_CHANNEL_ID: int = int(os.getenv("MOD_LOG_CHANNEL_ID", "").strip() or "0")
-TICKET_LOG_CHANNEL_ID: int = int(os.getenv("TICKET_LOG_CHANNEL_ID", "0"))
-SUPPORT_ROLE_ID: int = int(os.getenv("SUPPORT_ROLE_ID", "0"))
+def configured_id(value: str, setting: str) -> int:
+    value = value.strip()
+    if not value or value == "0":
+        return 0
+    if value.isascii() and value.isdigit() and len(value) <= 20 and int(value) < 2**64:
+        return int(value)
+    logging.getLogger(__name__).warning("Ignoring invalid Discord ID in %s", setting)
+    return 0
 
-# ── Developer IDs ─────────────────────────────────────────────────────────
-DEV_IDS: list[int] = [
-    int(i.strip()) for i in os.getenv("DEV_IDS", "").split(",") if i.strip()
-]
+
+MOD_LOG_CHANNEL_ID = configured_id(os.getenv("MOD_LOG_CHANNEL_ID", ""), "MOD_LOG_CHANNEL_ID")
+TICKET_LOG_CHANNEL_ID = configured_id(os.getenv("TICKET_LOG_CHANNEL_ID", ""), "TICKET_LOG_CHANNEL_ID")
+SUPPORT_ROLE_ID = configured_id(os.getenv("SUPPORT_ROLE_ID", ""), "SUPPORT_ROLE_ID")
+DEV_IDS = [identifier for value in os.getenv("DEV_IDS", "").split(",")
+           if (identifier := configured_id(value, "DEV_IDS"))]
+
 
 # ── AI Settings ───────────────────────────────────────────────────────────
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/chat/completions"

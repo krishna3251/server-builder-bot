@@ -54,6 +54,7 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
             voice_channels=[],
             stage_channels=[],
             get_member=Mock(return_value=None),
+            get_channel=Mock(return_value=None),
             me=NS(guild_permissions=discord.Permissions.none()),
             unavailable=False,
         )
@@ -145,14 +146,75 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         await self.service.mention(second)
         second.delete.assert_awaited_once()
 
-    async def test_administrators_and_server_owner_are_exempt(self):
+    async def test_administrators_and_server_owner_share_the_same_enforcement(self):
         for uid in (1, 2, 42):
-            for mid in (uid * 10, uid * 10 + 1):
-                message = self.message(mid, uid)
-                message.author.guild_permissions.administrator = uid != 2
-                await self.service.mention(message)
-                message.delete.assert_not_awaited()
+            first = self.message(uid * 10, uid)
+            second = self.message(uid * 10 + 1, uid)
+            first.author.guild_permissions.administrator = uid != 2
+            second.author.guild_permissions.administrator = uid != 2
+            await self.service.mention(first)
+            await self.service.mention(second)
+            first.delete.assert_not_awaited()
+            second.delete.assert_awaited_once()
+
+    async def test_category_and_thread_exceptions_persist_and_do_not_consume_allowance(self):
+        await self.service.policy(10, lambda policy: policy.update(exceptions=[123]))
+        restarted = ButlerService(self.bot, self.store.path, self.settings, clock=lambda: self.now)
+        for identifier, channel in enumerate((NS(id=456, category_id=123),
+                                              NS(id=789, parent=NS(id=456, category_id=123))), 1):
+            exempt = self.message(identifier)
+            exempt.channel = channel
+            await restarted.mention(exempt)
+            exempt.delete.assert_not_awaited()
+        first, second = self.message(3), self.message(4)
+        await restarted.mention(first)
+        await restarted.mention(second)
+        first.delete.assert_not_awaited()
+        second.delete.assert_awaited_once()
+
+    async def test_warn_mode_and_custom_cooldown_use_last_allowed_message(self):
+        await self.service.policy(10, lambda policy: policy.update(mode="warn", seconds=60))
+        first, second, third = (self.message(index) for index in (1, 2, 3))
+        await self.service.mention(first)
+        self.now += 59
+        self.assertTrue(await self.service.mention(second))
+        self.now += 1
+        self.assertFalse(await self.service.mention(third))
+        for message in (first, second, third):
+            message.delete.assert_not_awaited()
+
+    async def test_raw_edit_consults_actual_discord_flag_and_is_deduplicated(self):
+        cog = ButlerCog(self.bot)
+        cog.service = self.service
+        cog.ledger_ready = True
+        cog.ready.set()
+        await self.service.mention(self.message(1))
+        edited = self.message(2)
+        channel = NS(id=77, fetch_message=AsyncMock(return_value=edited))
+        self.bot.get_channel = Mock(return_value=channel)
+        payload = NS(guild_id=10, channel_id=77, message_id=2,
+                     data={"content": "@everyone", "mention_everyone": False})
+        await cog.on_raw_message_edit(payload)
+        channel.fetch_message.assert_not_awaited()
+        payload.data["mention_everyone"] = True
+        await cog.on_raw_message_edit(payload)
+        await cog.on_raw_message_edit(payload)
+        edited.delete.assert_awaited_once()
+
+    async def test_closed_dm_and_rate_limit_have_durable_reasons(self):
+        await self.service.mention(self.message(1))
+        await self.service.mention(self.message(2))
+        self.member_dm.send.side_effect = discord.Forbidden(
+            NS(status=403, reason="Forbidden"), {"code": 50007, "message": "closed"}
+        )
+        self.owner.send.side_effect = discord.RateLimited(1000)
+        await self.service.deliver()
+        self.assertIn(("failed", "closed_dms", 1), await self.store.delivery_health(10))
+        self.assertIn(("pending", "rate_limited", 1), await self.store.delivery_health(10))
+        self.now += 999
         self.assertEqual(await self.store.due(), [])
+        self.now += 1
+        self.assertEqual(len(await self.store.due()), 1)
 
     async def test_trusted_channels_and_threads_are_exempt(self):
         self.service.settings = replace(self.settings, trusted_channels=frozenset({123}))
@@ -539,6 +601,7 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_raw_departure_is_recorded_without_member_cache(self):
         cog = ButlerCog(self.bot)
         cog.service = self.service
+        cog.ledger_ready = True
         cog.ready.set()
         await cog.on_raw_member_remove(NS(guild_id=10, user=NS(id=1)))
         self.assertEqual((await self.data())["counts"]["leave"], 1)

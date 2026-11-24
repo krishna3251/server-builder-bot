@@ -78,64 +78,117 @@ Validation checks structure and known limits. It cannot guarantee a correct desi
 
 ## Command inventory
 
-Every command below passed registration, signature serialization, and shared acknowledgment checks. The targeted tests above cover actual simulated paths; rows do not imply a live API test.
+18 cogs load offline and register 110 executable slash commands.
 
-| Command | Inputs | Offline status |
-| --- | --- | --- |
-| `/ai` | `prompt` | Registered; acknowledgment enabled |
-| `/ai_persona` | `set` | Registered; acknowledgment enabled |
-| `/ai_reset` | None | Registered; acknowledgment enabled |
-| `/analytics commands` | None | Registered; acknowledgment enabled |
-| `/analytics members` | None | Registered; acknowledgment enabled |
-| `/analytics messages` | None | Registered; acknowledgment enabled |
-| `/avatar` | `user` | Registered; acknowledgment enabled |
-| `/balance` | None | Registered; acknowledgment enabled |
-| `/ban` | `user`, `reason`, `delete_days` | Registered; acknowledgment enabled |
-| `/banner` | `user` | Registered; acknowledgment enabled |
-| `/botinfo` | None | Registered; acknowledgment enabled |
-| `/builder_panel` | None | Registered; acknowledgment enabled |
-| `/buy` | `item` | Registered; acknowledgment enabled |
-| `/cancel_delete` | None | Registered; acknowledgment enabled |
-| `/channel_summaries` | None | Registered; acknowledgment enabled |
-| `/clear` | `amount`, `user` | Registered; acknowledgment enabled |
-| `/clearwarnings` | `user` | Registered; acknowledgment enabled |
-| `/daily` | None | Registered; acknowledgment enabled |
-| `/diagnostics` | None | Registered; acknowledgment enabled |
-| `/generate_server` | `theme`, `preview` | Registered; acknowledgment enabled |
-| `/help` | None | Registered; acknowledgment enabled |
-| `/inventory` | None | Registered; acknowledgment enabled |
-| `/invite` | None | Registered; acknowledgment enabled |
-| `/json_example` | None | Registered; acknowledgment enabled |
-| `/json_validate` | `json_file`, `json_text` | Registered; acknowledgment enabled |
-| `/kick` | `user`, `reason` | Registered; acknowledgment enabled |
-| `/leaderboard` | `type` | Registered; acknowledgment enabled |
-| `/lock` | `channel` | Registered; acknowledgment enabled |
-| `/mute` | `user`, `duration`, `reason` | Registered; acknowledgment enabled |
-| `/pay` | `user`, `amount` | Registered; acknowledgment enabled |
-| `/ping` | None | Registered; acknowledgment enabled |
-| `/poll` | `question`, `options` | Registered; acknowledgment enabled |
-| `/rank` | `user` | Registered; acknowledgment enabled |
-| `/remind` | `time`, `message` | Registered; acknowledgment enabled |
-| `/reminder_cancel` | `reference` | Registered; acknowledgment enabled |
-| `/reminders` | None | Registered; acknowledgment enabled |
-| `/roleinfo` | `role` | Registered; acknowledgment enabled |
-| `/server_json` | `template` | Registered; acknowledgment enabled |
-| `/serverinfo` | None | Registered; acknowledgment enabled |
-| `/setup_custom` | `json_text`, `json_file`, `clean_existing` | Registered; acknowledgment enabled |
-| `/setup_server` | `template`, `clean_existing` | Registered; acknowledgment enabled |
-| `/setup_tickets` | `title`, `description`, `support_role`, `mod_role`, `log_channel`, `ticket_category`, `ticket_image` | Registered; acknowledgment enabled |
-| `/setxp` | `user`, `xp` | Registered; acknowledgment enabled |
-| `/shop` | None | Registered; acknowledgment enabled |
-| `/slowmode` | `channel`, `seconds` | Registered; acknowledgment enabled |
-| `/sync_commands` | None | Registered; acknowledgment enabled |
-| `/ticket_blacklist add` | `user` | Registered; acknowledgment enabled |
-| `/ticket_blacklist list` | None | Registered; acknowledgment enabled |
-| `/ticket_blacklist remove` | `user` | Registered; acknowledgment enabled |
-| `/unban` | `user_id` | Registered; acknowledgment enabled |
-| `/unlock` | `channel` | Registered; acknowledgment enabled |
-| `/unmute` | `user` | Registered; acknowledgment enabled |
-| `/uptime` | None | Registered; acknowledgment enabled |
-| `/userinfo` | `user` | Registered; acknowledgment enabled |
-| `/warn` | `user`, `reason` | Registered; acknowledgment enabled |
-| `/warnings` | `user` | Registered; acknowledgment enabled |
-| `/work` | None | Registered; acknowledgment enabled |
+| Command | Inputs |
+| --- | --- |
+| `/ai` | `prompt` |
+| `/ai_persona` | `set` |
+| `/ai_reset` | None |
+| `/analytics commands` | None |
+| `/analytics members` | None |
+| `/analytics messages` | None |
+| `/automod exception` | `rule`, `role`, `channel`, `remove` |
+| `/automod recent-timeouts` | `member` |
+| `/automod_exception` | `action`, `target`, `id_value`, `role`, `channel` |
+| `/automod_reset` | `user` |
+| `/automod_status` | `enabled` |
+| `/autorole_setup` | `human_role`, `bot_role` |
+| `/avatar` | `user` |
+| `/balance` | None |
+| `/ban` | `user`, `reason`, `delete_days` |
+| `/banner` | `user` |
+| `/bot_profile` | None |
+| `/botinfo` | None |
+| `/builder_bypass_add` | `member` |
+| `/builder_bypass_list` | None |
+| `/builder_bypass_remove` | `member` |
+| `/builder_panel` | None |
+| `/butler antiping cooldown` | `minutes` |
+| `/butler antiping mode` | `mode` |
+| `/butler exception add` | `channel` |
+| `/butler exception clear` | None |
+| `/butler exception list` | None |
+| `/butler exception remove` | `channel`, `channel_id` |
+| `/butler report` | `date` |
+| `/butler status` | None |
+| `/buy` | `item` |
+| `/cancel_delete` | None |
+| `/channel_summaries` | None |
+| `/clear` | `amount`, `user` |
+| `/clearwarnings` | `user` |
+| `/commands_channel_setup` | `channel` |
+| `/create_channel` | `name`, `kind`, `category`, `private` |
+| `/daily` | None |
+| `/damu` | None |
+| `/damu_doctor` | None |
+| `/damu_status` | None |
+| `/dashboard_status` | None |
+| `/diagnostics` | None |
+| `/example_template` | None |
+| `/generate_server` | `theme`, `preview` |
+| `/help` | None |
+| `/inventory` | None |
+| `/invite` | None |
+| `/json_example` | None |
+| `/json_validate` | `json_file`, `json_text` |
+| `/kick` | `user`, `reason` |
+| `/leaderboard` | `type` |
+| `/lock` | `channel` |
+| `/mass_role` | `action`, `target`, `role` |
+| `/mute` | `user`, `duration`, `reason` |
+| `/pay` | `user`, `amount` |
+| `/perm_sync_check` | `template`, `json_text`, `json_file` |
+| `/ping` | None |
+| `/poll` | `question`, `options` |
+| `/quarantine apply` | `member`, `reason` |
+| `/quarantine audit` | None |
+| `/quarantine cleanup` | None |
+| `/quarantine dashboard` | None |
+| `/quarantine migrate` | None |
+| `/quarantine permissions` | None |
+| `/quarantine repair` | None |
+| `/quarantine resources` | None |
+| `/quarantine status` | None |
+| `/quarantine sync` | None |
+| `/quarantine_release` | `member` |
+| `/quarantine_setup` | `staff_role` |
+| `/rank` | `user` |
+| `/remind` | `time`, `message` |
+| `/reminder_cancel` | `reference` |
+| `/reminders` | None |
+| `/roleinfo` | `role` |
+| `/security` | None |
+| `/send_rules` | `channel`, `title`, `rules`, `image`, `footer` |
+| `/server_analyze` | None |
+| `/server_json` | `template` |
+| `/server_manager` | None |
+| `/server_templates` | None |
+| `/serverinfo` | None |
+| `/setup_custom` | `json_text`, `json_file`, `clean_existing` |
+| `/setup_paste_json` | `json_text` |
+| `/setup_server` | `template`, `clean_existing` |
+| `/setup_tickets` | `title`, `description`, `support_role`, `mod_role`, `log_channel`, `ticket_category`, `ticket_image` |
+| `/setupverification` | `verification_channel`, `verified_role`, `unverified_role`, `auto_create`, `embed_title`, `embed_description`, `button_text`, `verification_log_channel`, `account_age_check`, `min_account_age_days`, `lock_public_channels` |
+| `/setxp` | `user`, `xp` |
+| `/shop` | None |
+| `/slowmode` | `channel`, `seconds` |
+| `/soft_banned_diddy` | `log_channel`, `mod_role`, `channel` |
+| `/soft_banned_diddy_disable` | None |
+| `/soft_banned_diddy_status` | None |
+| `/sudo_ban` | `member`, `reason` |
+| `/sync_commands` | None |
+| `/template_details` | `template` |
+| `/ticket_blacklist add` | `user` |
+| `/ticket_blacklist list` | None |
+| `/ticket_blacklist remove` | `user` |
+| `/unban` | `user_id` |
+| `/unlock` | `channel` |
+| `/unmute` | `user` |
+| `/uptime` | None |
+| `/userinfo` | `user` |
+| `/verification_status` | None |
+| `/warn` | `user`, `reason` |
+| `/warnings` | `user` |
+| `/welcome_setup` | `channel`, `title`, `description`, `footer`, `thumbnail_url`, `image`, `use_giphy`, `giphy_query` |
+| `/work` | None |

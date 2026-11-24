@@ -2,11 +2,17 @@
 
 The upgrade is specific to `krishna3251/server-builder-bot`, baseline `a4c46532331d66c9ada9a42de6639f5bb4ea6208`. The existing nine cogs, server-builder checks, moderation hierarchy, tickets, economy, XP, AI, analytics and reminders remain. The baseline passed 56 offline tests.
 
+## Current policy
+
+The repository audit updated Butler to persist per-server modes, cooldowns and channel exceptions in SQLite. Use the `/butler exception` and `/butler antiping` groups as an administrator or server owner. A warning-only policy records repeat mentions and sends the normal rate-limited warning without deleting the message. A repeat violation does not extend the allowance window. Channel and category exceptions also apply to inherited thread traffic. Guild configuration overrides the environment defaults once saved.
+
+The delivery queue now records a failure category and uses Discord's retry timing for rate limits. A private moderation channel can receive a metadata-only incident fallback after terminal failure. Existing failures in old SQLite files have no reason field and are reported as legacy unknown.
+
 ## Behavior
 
 - One actual mass-mention **message** per author/server in a rolling three hours. `@everyone` and `@here` share the limit across channels. Discord's parsed `mention_everyone` flag determines whether a message contains a real mass mention; ordinary literals do not count. Multiple tokens in one message still cause one notification/message. A duplicate gateway event or edit of the same message does not spend another allowance.
-- The second and later messages are deleted. There is no administrator, developer, bot-owner or server-owner exemption. The bot ignores its own messages; other bots/webhooks are subject to removal but do not receive courtesy DMs.
-- A polite butler-style DM asks the member to stop. At most one courtesy/incident notice per author/server per rolling three-hour cooldown is queued; further violations still appear in the daily ledger. Failed deletion is recorded and the DM does not falsely claim it succeeded. Deletion cannot undo a notification Discord already sent.
+- Under the default Delete mode, repeat messages outside configured channel exceptions are removed. Staff and owner accounts use the same policy. The bot ignores its own messages; other bots/webhooks are subject to removal but do not receive courtesy DMs.
+- A polite butler-style DM asks the member to stop. At most one courtesy/incident notice per author/server per configured cooldown is queued; further violations still appear in the daily ledger. Failed deletion is recorded and the DM does not falsely claim it succeeded. Deletion cannot undo a notification Discord already sent.
 - The bot owner receives a separate private incident notice, bounded audit-review alerts, a first-start **today** snapshot, and daily ledgers for the preceding local day. No incident reports are posted publicly if DMs fail.
 - Joins and departures list member IDs/names/times. Raw member-removal events cover uncached members. On startup, up to 2,000 currently cached members' join timestamps from today can be imported and deduplicated.
 - Per-person voice/stage reports count actual voice joins, channel moves, and observed channel-presence duration. Mute/deafen changes do not count as new joins. Sessions are clipped at each reporting-day boundary. Mute, AFK, deafness and stage audience time still count as **presence**, not speaking time, attendance quality or audio.
@@ -61,7 +67,7 @@ Expiry cleanup runs lazily while the store is used. Guild IDs/names and first-ob
 
 A crash after Discord accepted a DM but before its sent receipt commits can duplicate that DM after restart. No exactly-once external-delivery claim is made. If persistence fails, the butler reports degradation rather than pretending deletion/reporting succeeded. Existing features remain separate. A blocked DM cannot be forced; status/manual report are the recovery paths.
 
-## Validation
+## Historical validation
 
 - Baseline: **56 tests passed** before changes.
 - Updated suite: **100 tests passed** on Python 3.12; compile checks and `git diff --check` passed.

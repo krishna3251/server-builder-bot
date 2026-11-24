@@ -16,6 +16,7 @@ from discord.ext import commands
 import config
 from services.embed_service import error_embed, info_embed, success_embed
 from services.guild_settings import GuildSettings
+from services.quarantine_service import has_quarantine_record
 from services.permission_service import bot_can_act, can_assign_role, is_above
 from utils.interactions import acknowledged, respond
 
@@ -128,7 +129,7 @@ class DashboardCog(commands.Cog, name="Dashboard"):
         )
 
     async def _apply_join_role(self, member: discord.Member, role_id: int, reason: str) -> bool:
-        if not role_id:
+        if not role_id or await has_quarantine_record(self.bot, member):
             return False
 
         role = member.guild.get_role(role_id)
