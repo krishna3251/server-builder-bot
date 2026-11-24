@@ -14,6 +14,7 @@ import discord
 from aiohttp import ClientConnectionError
 
 from services.butler_store import ButlerStore
+from services.automatic_moderation import env_enabled, trusted_channel_ids, is_trusted_channel, log_automatic_removal
 
 log = logging.getLogger(__name__)
 UTC = timezone.utc
@@ -35,6 +36,8 @@ class ButlerSettings:
     report_minute: int = 5
     retention_days: int = 30
     guild_ids: frozenset = frozenset()
+    anti_ping_delete: bool = True
+    trusted_channels: frozenset[int] = frozenset()
 
     @classmethod
     def from_env(cls):
@@ -62,6 +65,8 @@ class ButlerSettings:
             integer_env("BUTLER_REPORT_MINUTE", 5, 0, 59),
             integer_env("BUTLER_RETENTION_DAYS", 30, 7, 90),
             ids,
+            env_enabled("BUTLER_ANTI_PING_DELETE"),
+            trusted_channel_ids(),
         )
 
 
@@ -161,7 +166,20 @@ class ButlerService:
             or message.author.id == getattr(self.bot.user, "id", None)
         ):
             return
-        if not message.mention_everyone:
+        if not message.mention_everyone or not self.settings.anti_ping_delete:
+            return
+        if is_trusted_channel(getattr(message, "channel", None), self.settings.trusted_channels):
+            return
+        # Do not delete privileged users' posts, including raw message edits.
+        author = message.author
+        if author.id == guild.owner_id:
+            return
+        member = guild.get_member(author.id) or author
+        permissions = getattr(member, "guild_permissions", None)
+        if permissions is None:
+            # Unknown privileges: fail safely rather than delete a possible admin post.
+            return
+        if permissions.administrator:
             return
         # Discord notifies once per message, even if the token is repeated.
         # Its parsed flag also distinguishes real mentions from plain literals.
@@ -193,6 +211,7 @@ class ButlerService:
             reason,
             dm_user=not message.author.bot and not message.webhook_id,
         )
+        await log_automatic_removal(message, "Butler anti-ping", "Repeat mass mention within three hours", reason)
 
     @staticmethod
     def audit_flags(entry):
@@ -442,7 +461,7 @@ class ButlerService:
                                     if payload["deleted"]
                                     else "I could not remove it automatically; please tidy it up. "
                                 )
-                                + "Thank you for helping keep the server calm. This courtesy applies equally to members, administrators and the server owner."
+                                + "Thank you for helping keep the server calm. Administrators, the server owner and configured trusted channels are exempt."
                             )
                         elif job["kind"] == "incident":
                             text = f"Housekeeping report • Server {job['guild']}: {payload['name']} ({payload['user']}) repeated a mass mention. Deletion: {payload['delete_result']}. Further incidents will be counted in the daily ledger; I will avoid repeated DMs during this three-hour window."

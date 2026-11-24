@@ -76,10 +76,37 @@ class DetectionTests(GuardFixture, unittest.TestCase):
 
 
 class ListenerTests(GuardFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_alert_default_preserves_admin_messages(self):
+        from cogs.moderation import ModerationCog
+        with patch.dict('os.environ', {'PRIVILEGED_SPAM_MODE': 'alert'}):
+            cog = ModerationCog(Mock())
+        messages = [self.message() for _ in range(3)]
+        with patch('cogs.moderation._dm_user', new_callable=AsyncMock), patch('cogs.moderation._mod_log', new_callable=AsyncMock) as log:
+            for msg in messages:
+                await cog.on_message(msg)
+            for msg in messages:
+                msg.delete.assert_not_awaited()
+            self.channel.delete_messages.assert_not_awaited()
+            self.assertIn('No messages were removed', log.await_args.args[1].description)
+
+    async def test_off_and_trusted_channels_preserve_messages(self):
+        from cogs.moderation import ModerationCog
+        for mode, ids in (('off', frozenset()), ('delete', frozenset({123}))):
+            cog = ModerationCog(Mock())
+            cog.spam_mode = mode
+            cog.spam_trusted_channels = ids
+            self.channel.id = 123
+            for _ in range(3):
+                msg = self.message()
+                await cog.on_message(msg)
+                msg.delete.assert_not_awaited()
+            self.channel.delete_messages.assert_not_awaited()
+
     async def test_channel_failure_does_not_stop_other_cleanup_or_alerts(self):
         from cogs.moderation import ModerationCog
 
         cog = ModerationCog(Mock())
+        cog.spam_mode = "delete"
         forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Denied")
         self.channel.delete_messages.side_effect = forbidden
         thread = Mock(spec=discord.Thread)
@@ -102,6 +129,7 @@ class ListenerTests(GuardFixture, unittest.IsolatedAsyncioTestCase):
         from cogs.moderation import ModerationCog
 
         cog = ModerationCog(Mock())
+        cog.spam_mode = "delete"
         error = discord.NotFound(SimpleNamespace(status=404, reason="Not found"), "gone")
         self.channel.delete_messages.side_effect = error
         messages = [self.message(author=self.owner) for _ in range(3)]

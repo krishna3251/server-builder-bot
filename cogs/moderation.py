@@ -24,6 +24,8 @@ from utils.storage import write_json_atomic
 from utils.paginator import Paginator
 from services.moderation_notices import notify_action
 from services.spam_guard import PrivilegedSpamGuard
+from services.automatic_moderation import (privileged_spam_mode, trusted_channel_ids,
+                                           is_trusted_channel, log_automatic_removal)
 from services.permission_service import bot_can_act, is_above
 from utils.decorators import guild_only, mod_only
 from utils.helpers import parse_duration
@@ -164,6 +166,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.spam_guard = PrivilegedSpamGuard()
+        self.spam_mode = privileged_spam_mode()
+        self.spam_trusted_channels = trusted_channel_ids()
 
     async def _can_edit_channel(self, interaction: discord.Interaction, channel: discord.TextChannel, permission: str) -> bool:
         for member, label in ((interaction.user, "You"), (channel.guild.me, "I")):
@@ -180,11 +184,27 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
+        if self.spam_mode == "off" or is_trusted_channel(message.channel, self.spam_trusted_channels):
+            return
         batch, alert = self.spam_guard.observe(message)
         if not batch:
             return
         guild = message.guild
         assert guild is not None
+        if self.spam_mode == "alert":
+            if alert:
+                embed = warning_embed("Possible privileged-account spam (alert only)",
+                    f"Account: <@{message.author.id}> • ID: {message.author.id}\n"
+                    f"Channel: <#{message.channel.id}> • Message ID: {message.id}\n"
+                    f"Flagged messages: {len(batch)}. No messages were removed.\n"
+                    "Review this activity if it was unexpected.")
+                log.warning("Privileged-account spam alert only: guild=%s author=%s matched=%s",
+                            guild.id, message.author.id, len(batch))
+                await _mod_log(guild, embed)
+                await _dm_user(message.author, embed)
+                if guild.owner is not None and guild.owner_id != message.author.id:
+                    await _dm_user(guild.owner, embed)
+            return
         # Delete by captured ID, even in different channels or threads. A channel
         # history purge could also pick up innocent messages between copies.
         by_channel = {}
@@ -195,9 +215,13 @@ class ModerationCog(commands.Cog, name="Moderation"):
             if len(items) > 1 and isinstance(channel, (discord.TextChannel, discord.Thread)):
                 try:
                     await channel.delete_messages(items)
+                    for item in items:
+                        await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Bulk deletion accepted")
                     continue
                 except discord.Forbidden:
                     missed += len(items)
+                    for item in items:
+                        await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission")
                     continue
                 except discord.HTTPException:
                     # A concurrent delete or failed batch must not skip surviving copies.
@@ -205,10 +229,13 @@ class ModerationCog(commands.Cog, name="Moderation"):
             for item in items:
                 try:
                     await item.delete()
+                    result = "Deleted"
                 except discord.NotFound:
-                    pass
+                    result = "Already absent"
                 except discord.HTTPException:
                     missed += 1
+                    result = "Deletion failed"
+                await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", result)
         if missed:
             log.warning("Spam cleanup incomplete: guild=%s author=%s unconfirmed=%s",
                         guild.id, message.author.id, missed)

@@ -228,6 +228,7 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
             pass
 
     async def _handle_violation(self, message: discord.Message, reason: str) -> None:
+        from services.automatic_moderation import log_automatic_removal
         guild = message.guild
         if guild is None or not isinstance(message.author, discord.Member):
             return
@@ -243,6 +244,7 @@ class LocalAutoModCog(commands.Cog, name="Local AutoMod"):
             log.warning("AutoMod could not remove a message in guild %s (HTTP %s)", guild.id, error.status)
             return
 
+        await log_automatic_removal(message, "Local AutoMod", reason, "Deleted")
         count = await self._record_offense(message, reason)
         if not count:
             return

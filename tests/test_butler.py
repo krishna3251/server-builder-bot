@@ -74,7 +74,7 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
                 id=uid,
                 display_name="Viewer",
                 bot=bot,
-                guild_permissions=NS(administrator=True),
+                guild_permissions=NS(administrator=False),
             ),
             mention_everyone=actual,
             content="@everyone",
@@ -145,12 +145,31 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         await self.service.mention(second)
         second.delete.assert_awaited_once()
 
-    async def test_administrators_server_owner_and_bot_owner_are_not_exempt(self):
+    async def test_administrators_and_server_owner_are_exempt(self):
         for uid in (1, 2, 42):
-            await self.service.mention(self.message(uid * 10, uid))
-            second = self.message(uid * 10 + 1, uid)
-            await self.service.mention(second)
-            second.delete.assert_awaited_once()
+            for mid in (uid * 10, uid * 10 + 1):
+                message = self.message(mid, uid)
+                message.author.guild_permissions.administrator = uid != 2
+                await self.service.mention(message)
+                message.delete.assert_not_awaited()
+        self.assertEqual(await self.store.due(), [])
+
+    async def test_trusted_channels_and_threads_are_exempt(self):
+        self.service.settings = replace(self.settings, trusted_channels=frozenset({123}))
+        for mid, channel in enumerate((NS(id=123), NS(id=456, parent_id=123)), 1):
+            message = self.message(mid)
+            message.channel = channel
+            await self.service.mention(message)
+            message.delete.assert_not_awaited()
+        self.assertEqual(await self.store.due(), [])
+
+    async def test_disabled_anti_ping_preserves_messages(self):
+        self.service.settings = replace(self.settings, anti_ping_delete=False)
+        for mid in (1, 2):
+            message = self.message(mid)
+            await self.service.mention(message)
+            message.delete.assert_not_awaited()
+        self.assertEqual(await self.store.due(), [])
 
     async def test_rolling_three_hours_and_restart_preserve_policy(self):
         await self.service.mention(self.message(1))

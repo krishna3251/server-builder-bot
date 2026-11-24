@@ -13,6 +13,7 @@ from discord.ext import commands
 
 import config
 from services.butler_service import ButlerService, day_bounds
+from services.automatic_moderation import privileged_spam_mode
 from utils.interactions import acknowledged, respond
 
 log = logging.getLogger(__name__)
@@ -237,7 +238,9 @@ class ButlerCog(commands.Cog, name="Server Butler"):
         text = (
             f"Butler enabled here: {self.service.enabled(interaction.guild_id)}\n"
             f"Collector ready: {self.ready.is_set() and interaction.guild_id in self.service.guilds}\n"
-            "Mass mentions: one message per member/server every three hours; administrators and the owner are included.\n"
+            f"Mass-mention deletion: {'ON' if settings.anti_ping_delete else 'OFF'}; one per non-exempt member/server every three hours. Admins and server owner exempt.\n"
+            f"Trusted channel IDs: {', '.join(map(str, sorted(settings.trusted_channels))) or 'none'}\n"
+            f"Privileged spam mode: {privileged_spam_mode()} (alert keeps messages).\n"
             f"Daily ledger: {settings.report_hour:02}:{settings.report_minute:02} {settings.timezone_name} for the previous day.\n"
             f"Retention: {settings.retention_days} days. First-start report: today's available data.\n"
             f"Manage Messages: {perms.manage_messages} · View Audit Log: {perms.view_audit_log}\n"

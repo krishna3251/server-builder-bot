@@ -48,7 +48,7 @@ The bot alerts the affected account and the server owner by DM, and posts incide
 - To use mentions directly, pass the `rule` plus a `role` or `channel` to `/automod exception`. Use `remove: True` to remove those entries. A role or channel exemption applies to the selected rule. Add it to each rule that needs it.
 - Run `/automod recent-timeouts member: @member` to check up to five matching entries from Discord's recent audit logs. The result identifies the native rule or the account that applied the timeout, with the reason when recorded. Match the rule that acted before changing exceptions.
 
-Both the moderator and bot need **Manage Server** for exception settings and **Moderate Members** to change a timeout rule. The timeout lookup requires the moderator and bot to have **View Audit Log**. Server Builder's privileged spam guard and Butler delete qualifying messages. Timeout actions can come from Discord AutoMod, the bot's manual or warning-based moderation commands, or another app with the required permissions.
+Both the moderator and bot need **Manage Server** for exception settings and **Moderate Members** to change a timeout rule. The timeout lookup requires the moderator and bot to have **View Audit Log**. Server Builder's privileged spam guard defaults to alert-only; Butler can delete qualifying non-admin mass mentions. Timeout actions can come from Discord AutoMod, the bot's manual or warning-based moderation commands, or another app with the required permissions.
 
 ## Requirements
 
@@ -129,9 +129,7 @@ Shop XP Boost purchases now enable double message XP for one hour, stacking time
 
 ## Server butler
 
-Repeat `@everyone`/`@here` messages within three hours are removed, with a polite,
-rate-limited DM asking the sender to stop. Administrators and the server owner
-follow the same rule. The bot owner receives private incident/audit notices,
+Repeat `@everyone`/`@here` messages within three hours may be removed for non-exempt users, with a polite, rate-limited DM. Administrators and server owners are exempt. Privileged-account spam detection defaults to alert-only (no message deletion). Set `PRIVILEGED_SPAM_MODE=off` to disable detection or `delete` to explicitly opt into cleanup. Set `BUTLER_ANTI_PING_DELETE=false` to disable Butler deletion, and `AUTO_MOD_TRUSTED_CHANNEL_IDS` to comma-separated channel IDs (including announcement channels) exempt from both policies. Restart after configuration changes. Set `MOD_LOG_CHANNEL_ID` to a private staff channel for per-message automatic moderation receipts; console receipts also include IDs and results. The bot owner receives private incident/audit notices,
 today's first-start snapshot and a daily ledger of joins, departures and each
 person's observed voice joins/time. Ordinary message text and voice audio are
 not collected. Missing historical activity is clearly marked as unknown.
