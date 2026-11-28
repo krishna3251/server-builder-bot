@@ -134,6 +134,12 @@ Butler allows one actual Discord mass-mention message per author and server ever
 
 The ledger contains join/leave, voice-presence, audit and moderation metadata. The server owner and Discord application owner (team owner for team apps) each get a private summary and TXT attachment at **00:05 Asia/Kolkata** by default, covering the preceding day. When both roles belong to one account, the bot sends one copy. Delivery and retries are tracked per recipient. Optional `MOD_LOG_CHANNEL_ID` enables private in-server action receipts. See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) for retention and coverage and [.env.example](.env.example) for defaults.
 
+## Maintenance tools
+
+- `/maintenance access channel [member] [action]` compares a member's permissions with the bot's and explains the relevant role, overwrite, timeout, or thread restriction. Requires Administrator in that server.
+- `/maintenance delivery [action] [reference]` shows your last successful report and recent failures. Use `test` for a private test DM or `retry` with a failed report reference from the last 48 hours. Each owner manages their own inbox.
+- `/maintenance inbox [reference] [state]` lists urgent audit and repeat-ping incidents. The server and Discord application owners can acknowledge, resolve, or reopen incidents. Both owners share each incident's reference and state. The activity ledger must be enabled for owner tools.
+
 ## Private security and quarantine
 
 The bot uses Discord Components V2 for the command center, main builder panel, security console and compact command results. Existing ticket, shop, JSON and detailed build controls keep their specialized workflows. Install `discord.py>=2.6.0,<3.0` from `requirements.txt`.

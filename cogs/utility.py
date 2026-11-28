@@ -25,6 +25,7 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
     "overview": (
         "🤖 Command center",
         "**Server health** · `/diagnostics` · `/server_analyze`\n"
+        "**Maintenance** · `/maintenance access` · `/maintenance delivery` · `/maintenance inbox`\n"
         "**Private owner reports** · `/butler status` · `/butler report`\n"
         "**Member levels** · `/rank` · `/xp_leaderboard`\n\n"
         "Choose a category for more commands.",

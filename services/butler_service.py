@@ -127,9 +127,10 @@ class ButlerService:
         return self.owner_id or await self.resolve_application_owner()
 
     async def can_read_report(self, guild, user):
-        if user.id in {guild.owner_id, self.settings.owner_id}:
-            return True
-        return user.id == await self.resolve_application_owner()
+        return user.id == self.settings.owner_id or await self.is_guild_or_app_owner(guild, user)
+
+    async def is_guild_or_app_owner(self, guild, user):
+        return user.id == guild.owner_id or user.id == await self.resolve_application_owner()
 
     async def resolve_application_owner(self):
         if self._app_owner is None or self.clock() - self._owner_checked_at >= 300:
@@ -513,6 +514,9 @@ class ButlerService:
                             text = f"Housekeeping report • Server {job['guild']}: {payload['name']} ({payload['user']}) repeated a mass mention. Deletion: {payload['delete_result']}. Further incidents will be counted in the daily ledger; I will avoid repeated DMs during this cooldown window."
                         else:
                             text = f"Audit review requested • Observed {datetime.fromtimestamp(job['created'],self.zone).isoformat(timespec='minutes')} • Server {job['guild']}: actor {payload['name']} ({payload['user']}), action {payload['action']}, target {payload['target']}. Recent same-action entries: {payload['recent_count']}. {'; '.join(payload['flags']) or 'Elevated activity in a ten-minute window'}. This may be legitimate administration; please review before taking action."
+                        if job["kind"] in {"incident", "audit_alert"}:
+                            reference = job["id"].removesuffix(":guild-owner")
+                            text = f"{text[:1500]}\nInbox reference: `{reference}` · Open /maintenance inbox in that server."
                         await user.send(
                             text[:1900], allowed_mentions=discord.AllowedMentions.none()
                         )

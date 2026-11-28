@@ -79,7 +79,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
             for path in Path('cogs').glob('*.py'):
                 if not path.name.startswith('_'):
                     await bot.load_extension('cogs.' + path.stem)
-        self.assertEqual(len(bot.extensions), 18)
+        self.assertEqual(len(bot.extensions), 19)
         all_commands = list(bot.tree.walk_commands())
         for command in all_commands:
             with self.subTest(command=command.qualified_name):
@@ -90,6 +90,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(bot.tree.get_command('json_example'))
         self.assertIsNotNone(bot.tree.get_command('json_validate'))
         self.assertIsNotNone(bot.tree.get_command('xp_leaderboard'))
+        self.assertEqual({command.name for command in bot.tree.get_command('maintenance').commands},
+                         {'access', 'delivery', 'inbox'})
         self.assertIsNotNone(bot.tree.get_command('automod').get_command('exception'))
         for name in ('automod_exception', 'automod_reset', 'automod_status', 'autorole_setup',
                      'builder_bypass_add', 'builder_bypass_list', 'builder_bypass_remove', 'commands_channel_setup',
