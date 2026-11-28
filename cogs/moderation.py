@@ -22,7 +22,7 @@ import config
 from services.embed_service import error_embed, info_embed, success_embed, warning_embed
 from utils.storage import write_json_atomic
 from utils.paginator import Paginator
-from services.moderation_notices import notify_action
+from services.moderation_notices import notify_action, record_action
 from services.spam_guard import PrivilegedSpamGuard
 from services.automatic_moderation import (privileged_spam_mode, trusted_channel_ids,
                                            is_trusted_channel, log_automatic_removal, butler_cog, coordinator, private_mod_log, trap_owns)
@@ -208,18 +208,18 @@ class ModerationCog(commands.Cog, name="Moderation"):
             ):
                 missed += len(items)
                 for item in items:
-                    await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission")
+                    await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission", bot=self.bot)
                 continue
             if len(items) > 1 and isinstance(channel, (discord.TextChannel, discord.Thread)):
                 try:
                     await channel.delete_messages(items)
                     for item in items:
-                        await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Bulk deletion accepted")
+                        await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Bulk deletion accepted", bot=self.bot)
                     continue
                 except discord.Forbidden:
                     missed += len(items)
                     for item in items:
-                        await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission")
+                        await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", "Missing permission", bot=self.bot)
                     continue
                 except (discord.HTTPException, discord.RateLimited):
                     # A concurrent delete or failed batch must not skip surviving copies.
@@ -233,7 +233,7 @@ class ModerationCog(commands.Cog, name="Moderation"):
                 except (discord.HTTPException, discord.RateLimited):
                     missed += 1
                     result = "Deletion failed"
-                await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", result)
+                await log_automatic_removal(item, "Privileged spam guard", "Privileged-account spam threshold", result, bot=self.bot)
         if missed:
             log.warning("Spam cleanup incomplete: guild=%s author=%s unconfirmed=%s",
                         guild.id, message.author.id, missed)
@@ -428,6 +428,8 @@ class ModerationCog(commands.Cog, name="Moderation"):
         await respond(interaction, embed=em)
 
         log_em = warning_embed("Member Warned", f"**{user}** by {interaction.user.mention}\nReason: {reason}\nTotal: {count}")
+        await record_action(self.bot, interaction.guild, interaction.user.id, user.id, "warning",
+                            f"Warning #{count} saved", f"warning:{interaction.id}")
         await _mod_log(interaction.guild, log_em)
 
         # Escalate every third warning without reducing an active timeout.

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import discord
 from discord import app_commands
@@ -12,6 +13,7 @@ import config
 from services.automatic_moderation import coordinator, private_mod_log
 from services.automod_service import AutoModService, AutoModSettingsError, accepts_channels, has_timeout, recent_timeouts
 from services.error_service import respond_error
+from services.moderation_notices import record_action
 from utils.interactions import acknowledged, defer_response, respond
 
 
@@ -180,6 +182,10 @@ class AutoModCog(commands.Cog, name="AutoMod"):
             coordinator(self.bot).record_native_timeout(guild.id, execution.user_id)
         log.info("Native AutoMod guild=%s user=%s channel=%s message=%s rule=%s action=%s",
                  guild.id, execution.user_id, channel, message, execution.rule_id, action.name)
+        event_id = message or execution.alert_system_message_id or time.time_ns()
+        await record_action(self.bot, guild, 0, execution.user_id, f"Discord AutoMod · {action.name}",
+                            f"Rule {execution.rule_id} | Channel {channel or 'unavailable'} | Message {message or 'unavailable'}",
+                            f"native:{guild.id}:{event_id}:{execution.rule_id}:{action.name}")
         embed = discord.Embed(
             title="Discord native AutoMod",
             description=f"Rule {execution.rule_id} • Discord applied {action.name.replace('_', ' ')}",

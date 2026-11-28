@@ -12,7 +12,7 @@ from utils.modern_ui import ModernResultView, embed_text
 
 READ_COMMANDS = {
     'ping', 'serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'uptime',
-    'botinfo', 'diagnostics', 'balance', 'leaderboard', 'inventory', 'rank',
+    'botinfo', 'diagnostics', 'balance', 'leaderboard', 'inventory', 'rank', 'xp_leaderboard',
     'messages', 'members', 'commands', 'warnings', 'list', 'reminders',
 }
 

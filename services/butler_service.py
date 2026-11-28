@@ -19,6 +19,7 @@ from services.automatic_moderation import (coordinator, env_enabled, is_trusted_
     log_automatic_removal, private_mod_log, trap_owns, trusted_channel_ids)
 
 log = logging.getLogger(__name__)
+OWNER_DELIVERIES = frozenset({"initial", "daily", "audit_alert", "incident"})
 UTC = timezone.utc
 
 
@@ -124,6 +125,11 @@ class ButlerService:
 
     async def resolve_owner(self):
         return self.owner_id or await self.resolve_application_owner()
+
+    async def can_read_report(self, guild, user):
+        if user.id in {guild.owner_id, self.settings.owner_id}:
+            return True
+        return user.id == await self.resolve_application_owner()
 
     async def resolve_application_owner(self):
         if self._app_owner is None or self.clock() - self._owner_checked_at >= 300:
@@ -321,15 +327,18 @@ class ButlerService:
             microsecond=0,
         )
         guilds = await self.store.guilds()
+        report_dates = []
         for guild in guilds:
             if not self.enabled(guild["id"]) or guild["id"] not in self.guilds:
                 continue
             for age in range(1, min(7, self.settings.retention_days) + 1):
                 day = now.date() - timedelta(days=age)
-                start, end = day_bounds(day, self.zone)
+                _, end = day_bounds(day, self.zone)
                 if end <= guild["first_seen"] or age == 1 and now < due:
                     continue
-                await self.store.enqueue_report(guild["id"], str(day), "daily")
+                report_dates.append((guild["id"], str(day)))
+        if report_dates:
+            await self.store.enqueue_daily_reports(report_dates)
 
     async def report(self, guild, day):
         start, end = day_bounds(day, self.zone)
@@ -339,17 +348,17 @@ class ButlerService:
     def render(self, data, day, start, end):
         guild = data["guild"]
         counts = data["counts"]
-        title = f"Your server's daily ledger — {day}"
+        title = f"Server maintenance report — {day}"
         description = (
-            f"At your service. Here is the recorded activity for **{discord.utils.escape_markdown(guild['name'])[:100]}**.\n"
-            f"Joins: **{counts.get('join',0)}** · Departures: **{counts.get('leave',0)}** · Repeat-ping messages: **{counts.get('ping_violation',0)}**\n"
-            f"Moderation actions: **{counts.get('moderation',0)}** · Audit entries: **{counts.get('audit',0)}** · Observed voice time: **{duration(data['voice_total_seconds'])}**\n"
-            f"Timezone: {self.settings.timezone_name}. Observed online coverage: {duration(data['coverage_seconds'])}.\n"
-            "The attached ledger names participants and shows per-person voice counts/time. History before tracking or during downtime may be incomplete."
+            f"**{discord.utils.escape_markdown(guild['name'])[:100]}** · {self.settings.timezone_name}\n"
+            f"**Activity** · {counts.get('join',0)} joins · {counts.get('leave',0)} departures · {duration(data['voice_total_seconds'])} in voice\n"
+            f"**Review** · {counts.get('audit',0)} audit entries · {counts.get('moderation',0)} recorded enforcement actions · {counts.get('ping_violation',0)} repeat pings\n"
+            f"**Coverage** · {duration(data['coverage_seconds'])} observed online · {guild['audit_status']}\n"
+            "Open the TXT attachment for timestamps, actors, targets, and review flags."
         )
         embed = discord.Embed(title=title, description=description, color=0x5865F2)
         embed.set_footer(
-            text="Private bot-owner report • Metadata only • No message bodies or voice audio"
+            text="Private owner report · Activity and audit metadata"
         )
 
         def stamp(value):
@@ -358,20 +367,26 @@ class ButlerService:
             )
 
         lines = [
-            title,
-            f"Server: {guild['name']} ({guild['id']})",
-            f"Timezone: {self.settings.timezone_name}",
+            "SERVER MAINTENANCE REPORT",
+            f"{day} | {self.settings.timezone_name}",
+            f"Server: {json.dumps(guild['name'], ensure_ascii=False)} ({guild['id']})",
             f"Period: {stamp(start)} to {stamp(end)} (end exclusive)",
             f"Generated: {stamp(self.clock())}",
+            "",
+            "AT A GLANCE",
+            f"Activity: {counts.get('join',0)} joins | {counts.get('leave',0)} departures | {duration(data['voice_total_seconds'])} in voice",
+            f"Review: {counts.get('audit',0)} audit entries | {counts.get('moderation',0)} recorded enforcement actions | {counts.get('ping_violation',0)} repeat pings",
+            f"Audit coverage: {guild['audit_status']}",
+            f"Delivery queue status: {data['delivery']}",
+            "",
+            "COLLECTION COVERAGE",
             f"Tracking began: {stamp(guild['first_seen'])}",
             f"Online coverage observed in this day: {duration(data['coverage_seconds'])}",
             "Coverage: departures and voice time before tracking/during disconnection are unknown, not zero.",
             "Current-member join timestamps are imported from cache on startup (at most 2,000); those members may already have left again after import.",
             "Voice time means presence in a voice/stage channel, including mute/AFK; it does not measure speaking, audio or attention.",
             "Startup voice occupants have unknown join time; count 0 new joins until an actual join event is seen.",
-            f"Audit coverage: {guild['audit_status']}",
-            "Audit summaries are observations, not proof of malicious intent. Reasons, message contents and tokens are not retained.",
-            f"Delivery queue status: {data['delivery']}",
+            "Audit flags are for review. Discord audit reasons, message bodies, and voice audio are excluded.",
             "",
             f"JOIN/LEAVE EVENTS — joins {counts.get('join',0)}, departures {counts.get('leave',0)} (first 1,000 details)",
         ]
@@ -405,9 +420,10 @@ class ButlerService:
             lines.append(
                 f"{stamp(row['at'])} | {json.dumps(row['name'],ensure_ascii=False)} ({row['user']}) | {row['action']} | target {row['target']} | review: {', '.join(json.loads(row['details']).get('flags',[])) or 'no configured flag'}"
             )
-        lines += ["", "BOT MODERATION ACTIONS — first 500"]
+        lines += ["", "ENFORCEMENT OUTCOMES — first 500"]
         for row in data.get("moderation", []):
-            lines.append(f"{stamp(row['at'])} | {row['action']} | actor {row['user']} | target {row['target']} | {json.dumps(json.loads(row['details']).get('summary',''), ensure_ascii=False)}")
+            actor = row['user'] or 'Discord'
+            lines.append(f"{stamp(row['at'])} | {row['action']} | actor {actor} | target {row['target']} | {json.dumps(json.loads(row['details']).get('summary',''), ensure_ascii=False)}")
         text = "\n".join(lines)
         if len(text.encode()) > 256000:
             text = (
@@ -421,6 +437,7 @@ class ButlerService:
             return
         async with self.delivery_lock:
             jobs = await self.store.due(limit)
+            reports = {}
             for job in jobs:
                 if not self.enabled(job["guild"]):
                     await self.store.failed(job["id"], "disabled_guild", permanent=True)
@@ -434,7 +451,26 @@ class ButlerService:
                     continue
                 try:
                     payload = json.loads(job["payload"])
-                    if job["kind"] == "moderation" and not job["recipient"]:
+                    if job["kind"] in OWNER_DELIVERIES:
+                        guild = self.bot.get_guild(job["guild"])
+                        if guild is None or guild.unavailable or not guild.owner_id:
+                            await self.store.postpone(job["id"])
+                            continue
+                        application_owner = await self.resolve_application_owner()
+                        if not isinstance(application_owner, int) or application_owner <= 0:
+                            raise ValueError("Missing application owner for private delivery")
+                        guild_owner = guild.owner_id
+                        if job["recipient"] is None:
+                            sibling = await self.store.assign_owner_delivery(job, application_owner, guild_owner)
+                            if sibling:
+                                jobs.append(sibling)
+                            recipient = application_owner
+                        elif job["recipient"] in {application_owner, guild_owner}:
+                            recipient = job["recipient"]
+                        else:
+                            await self.store.failed(job["id"], "owner_changed", permanent=True)
+                            continue
+                    elif job["kind"] == "moderation" and not job["recipient"]:
                         recipient = await self.resolve_application_owner()
                     else:
                         recipient = job["recipient"] or await self.resolve_owner()
@@ -445,11 +481,13 @@ class ButlerService:
                     )
                     if job["kind"] in {"initial", "daily"}:
                         day = datetime.strptime(payload["day"], "%Y-%m-%d").date()
-                        embed, text = await self.report(job["guild"], day)
+                        key = (job["guild"], day)
+                        if key not in reports:
+                            reports[key] = await self.report(*key)
+                        embed, text = reports[key]
                         if job["kind"] == "initial":
-                            embed.title = (
-                                f"At your service — today's first ledger ({day})"
-                            )
+                            embed = embed.copy()
+                            embed.title = f"Today's first ledger — {day}"
                         await user.send(
                             embed=embed,
                             file=discord.File(
