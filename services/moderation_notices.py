@@ -7,6 +7,17 @@ import discord
 log = logging.getLogger(__name__)
 
 
+async def record_action(bot, guild, actor_id, target_id, action, detail, identifier):
+    """Include routine enforcement outcomes in the owners' digest without an immediate DM."""
+    try:
+        cog = getattr(bot, 'get_cog', lambda _: None)('Server Butler')
+        service = getattr(cog, 'service', None)
+        if service is not None and service.enabled(guild.id):
+            await service.store.moderation(identifier, guild.id, actor_id, target_id, action, detail, ())
+    except Exception:
+        log.exception('Could not record moderation outcome: guild=%s action=%s', guild.id, action)
+
+
 async def notify_action(bot, guild, actor, target, action, reason, identifier):
     summary = (f'Private moderation notice • {guild.name} ({guild.id})\n'
                f'Action: {action}\nModerator ID: {actor.id}\nMember ID: {target.id}\n'

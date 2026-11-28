@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 from cogs.butler import ButlerCog
+from cogs.automod import AutoModCog
 from services.butler_service import ButlerService, ButlerSettings, day_bounds
 from services.butler_store import ButlerStore
 
@@ -27,11 +28,12 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.tmp.cleanup)
         self.now = datetime(2026, 11, 10, 12, tzinfo=UTC).timestamp()
         self.owner = NS(id=42, send=AsyncMock())
+        self.guild_owner = NS(id=2, send=AsyncMock())
         self.member_dm = NS(id=1, send=AsyncMock())
         self.bot = NS(
             user=NS(id=999),
             get_user=Mock(
-                side_effect=lambda uid: self.owner if uid == 42 else self.member_dm
+                side_effect={42: self.owner, 2: self.guild_owner, 1: self.member_dm}.get
             ),
             fetch_user=AsyncMock(return_value=self.owner),
             application_info=AsyncMock(return_value=NS(team=None, owner=NS(id=42))),
@@ -59,6 +61,7 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
             unavailable=False,
         )
         self.bot.guilds = [self.guild]
+        self.bot.get_guild = Mock(side_effect=lambda uid: self.guild if uid == self.guild.id else None)
         await self.store.begin(10, "Test Server", [])
         self.service.guilds.add(10)
 
@@ -338,7 +341,7 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         self.member_dm.send.assert_not_awaited()
         self.bot.application_info.assert_awaited_once()
         kwargs = self.owner.send.call_args.kwargs
-        self.assertIn("today's first ledger", kwargs["embed"].title)
+        self.assertIn("Today's first ledger", kwargs["embed"].title)
         self.assertIn("before tracking", kwargs["file"].fp.getvalue().decode())
         self.assertEqual(
             kwargs["allowed_mentions"].to_dict(),
@@ -358,6 +361,56 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         jobs = await self.store.due()
         self.assertEqual(len(jobs), 1)
         self.assertEqual(json.loads(jobs[0]["payload"])["day"], "2026-11-10")
+
+    async def test_daily_delivery_reaches_both_owners_even_when_one_dm_is_closed(self):
+        await self.store.enqueue_report(10, str(self.service.today()), "daily")
+        self.owner.send.side_effect = discord.Forbidden(NS(status=403, reason="Forbidden"), "DM closed")
+        with patch.object(self.service, "report", wraps=self.service.report) as render:
+            await self.service.deliver()
+            await self.service.deliver()
+        render.assert_awaited_once()
+        self.owner.send.assert_awaited_once()
+        self.guild_owner.send.assert_awaited_once()
+        file = self.guild_owner.send.call_args.kwargs["file"]
+        self.assertIn("SERVER MAINTENANCE REPORT", file.fp.getvalue().decode())
+        self.assertEqual((await self.data())["delivery"], {"failed": 1, "sent": 1})
+
+    async def test_daily_delivery_is_deduplicated_for_an_owner_of_both(self):
+        self.guild.owner_id = self.owner.id
+        await self.store.enqueue_report(10, str(self.service.today()), "daily")
+        await self.service.deliver()
+        await self.service.deliver()
+        self.owner.send.assert_awaited_once()
+        self.guild_owner.send.assert_not_awaited()
+
+    async def test_queued_report_is_not_sent_to_former_guild_owner(self):
+        await self.store.enqueue_report(10, str(self.service.today()), "daily")
+        job, = await self.store.due()
+        await self.store.assign_owner_delivery(job, self.owner.id, self.guild_owner.id)
+        self.guild.owner_id = 3
+        await self.service.deliver()
+        self.owner.send.assert_awaited_once()
+        self.guild_owner.send.assert_not_awaited()
+        self.assertIn(("failed", "owner_changed", 1), await self.store.delivery_health(10))
+
+    async def test_only_owners_and_explicit_operator_can_read_report(self):
+        self.assertTrue(await self.service.can_read_report(self.guild, self.guild_owner))
+        self.assertTrue(await self.service.can_read_report(self.guild, self.owner))
+        self.assertFalse(await self.service.can_read_report(self.guild, NS(id=1, guild_permissions=discord.Permissions.all())))
+        self.service.settings = replace(self.settings, owner_id=1)
+        self.assertTrue(await self.service.can_read_report(self.guild, self.member_dm))
+
+    async def test_native_automod_records_metadata_without_dm_or_message_body(self):
+        self.bot.get_cog = Mock(return_value=NS(service=self.service))
+        execution = NS(guild=self.guild, user_id=1, channel_id=30, message_id=60,
+                       rule_id=70, action=NS(type=discord.AutoModRuleActionType.block_message),
+                       content="SYNTHETIC_PRIVATE_BODY")
+        await AutoModCog(self.bot).on_automod_action(execution)
+        entries = (await self.data())["moderation"]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Rule 70", entries[0]["details"])
+        self.assertNotIn(execution.content, entries[0]["details"])
+        self.assertEqual(await self.store.due(), [])
 
     async def test_indian_timezone_day_is_not_the_utc_day(self):
         zone = ZoneInfo("Asia/Kolkata")
@@ -529,6 +582,7 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(jobs[0]["payload"])["recent_count"], 3)
         await self.service.deliver()
         self.assertIn("may be legitimate", self.owner.send.call_args.args[0])
+        self.assertEqual(self.owner.send.call_args.args, self.guild_owner.send.call_args.args)
 
     async def test_no_message_contents_or_audit_reasons_are_stored(self):
         first = self.message(1)
@@ -629,22 +683,21 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
             command=None,
         )
 
-    async def test_only_bot_owner_can_open_private_report_even_via_callback(self):
+    async def test_only_authorized_owners_can_open_private_report_via_callback(self):
         cog = ButlerCog(self.bot)
         cog.service = self.service
         cog.ready.set()
         event = self.interaction(8, admin=True)
         await ButlerCog.report.callback(cog, event)
         self.assertIn(
-            "Only the bot owner",
+            "server owner, bot application owner",
             event.edit_original_response.call_args.kwargs["content"],
         )
-        event = self.interaction(42)
-        await ButlerCog.report.callback(cog, event)
-        self.assertIsNotNone(
-            event.edit_original_response.call_args.kwargs["attachments"]
-        )
-        event.response.defer.assert_awaited_once()
+        for owner_id in (42, self.guild.owner_id):
+            event = self.interaction(owner_id)
+            await ButlerCog.report.callback(cog, event)
+            self.assertIsNotNone(event.edit_original_response.call_args.kwargs["attachments"])
+            event.response.defer.assert_awaited_once()
 
     async def test_report_invalid_dates_and_retention_are_validated(self):
         cog = ButlerCog(self.bot)

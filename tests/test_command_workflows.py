@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import discord
 from discord.ext import commands
@@ -89,6 +89,7 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(all_commands), 54)
         self.assertIsNotNone(bot.tree.get_command('json_example'))
         self.assertIsNotNone(bot.tree.get_command('json_validate'))
+        self.assertIsNotNone(bot.tree.get_command('xp_leaderboard'))
         self.assertIsNotNone(bot.tree.get_command('automod').get_command('exception'))
         for name in ('automod_exception', 'automod_reset', 'automod_status', 'autorole_setup',
                      'builder_bypass_add', 'builder_bypass_list', 'builder_bypass_remove', 'commands_channel_setup',
@@ -97,6 +98,24 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
                      'setup_paste_json', 'setupverification', 'template_details', 'verification_status', 'welcome_setup'):
             self.assertIsNotNone(bot.tree.get_command(name), name)
         await bot.close()
+
+    async def test_direct_xp_leaderboard_uses_guild_xp_and_acknowledges_first(self):
+        from cogs.leveling import LevelingCog
+
+        interaction = FakeInteraction()
+        interaction.guild.get_member = Mock(return_value=SimpleNamespace(display_name='A *member*'))
+
+        async def read(guild_id):
+            self.assertEqual(guild_id, interaction.guild.id)
+            interaction.response.defer.assert_awaited_once()
+            return [(10, 400, 2)]
+
+        with patch.object(level_service, 'get_leaderboard', side_effect=read):
+            await LevelingCog.xp_leaderboard.callback(LevelingCog(None), interaction)
+        embed = interaction.edit_original_response.call_args.kwargs['embed']
+        self.assertIn('Lv. **2**', embed.description)
+        self.assertIn('400 XP', embed.description)
+        self.assertIn('/rank', embed.footer.text)
 
     async def test_balance_acknowledges_before_storage_then_finishes_original(self):
         from cogs.economy import EconomyCog
@@ -194,7 +213,8 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         interaction.edit_original_response.assert_awaited_once()
 
     async def test_diagnostics_handles_not_ready_latency(self):
-        bot = SimpleNamespace(is_ready=lambda: False, latency=float('nan'), extensions={}, extension_errors={})
+        bot = SimpleNamespace(is_ready=lambda: False, latency=float('nan'), extensions={}, extension_errors={},
+                              tree=SimpleNamespace(walk_commands=lambda: ()), persistent_views=[])
         interaction = FakeInteraction()
         await UtilityCog.diagnostics.callback(UtilityCog(bot), interaction)
         self.assertIn('N/A', interaction.edit_original_response.call_args.kwargs['embed'].fields[0].value)

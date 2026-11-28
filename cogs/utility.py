@@ -24,8 +24,10 @@ from utils.helpers import format_number, parse_duration
 _HELP_PAGES: dict[str, tuple[str, str]] = {
     "overview": (
         "🤖 Command center",
-        "Choose a category from the menu to explore the bot. Admin tools are permission-gated, "
-        "and some commands only work inside a server.",
+        "**Server health** · `/diagnostics` · `/server_analyze`\n"
+        "**Private owner reports** · `/butler status` · `/butler report`\n"
+        "**Member levels** · `/rank` · `/xp_leaderboard`\n\n"
+        "Choose a category for more commands.",
     ),
     "builder": (
         "🧱 Server builder",
@@ -60,9 +62,8 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
     "economy": (
         "💰 Economy & leveling",
         "`/balance` · `/daily` · `/work` · `/pay`\n"
-        "`/leaderboard` · `/shop` · `/buy` · `/inventory`\n"
-        "`/rank` · `/setxp`\n\n"
-        "The shop has an interactive catalogue. Purchases are recorded in your server inventory.",
+        "**Levels and XP** — `/rank` · `/xp_leaderboard` · `/setxp` (admin)\n"
+        "**Coins and shop** — `/leaderboard` · `/shop` · `/buy` · `/inventory`",
     ),
     "ai": (
         "✨ AI assistant",
@@ -73,10 +74,10 @@ _HELP_PAGES: dict[str, tuple[str, str]] = {
     "butler": (
         "🎩 Server butler",
         "`/butler status` — administrators: check collection and permissions\n"
-        "`/butler report [date]` — bot owner: private daily activity ledger\n\n"
+        "`/butler report [date]` — owners: private activity and audit report\n\n"
         "`/butler exception` — manage channel exceptions. `/butler antiping` — choose a mode and cooldown.\n"
         "By default, repeat mass mentions within three hours are removed for any account outside exempt channels. "
-        "Courtesy DMs are throttled. The bot owner receives private incident, audit and daily reports. "
+        "Courtesy DMs are throttled. The server owner and bot application owner receive private incident, audit and daily reports. "
         "Voice reports track presence, not audio; unobserved history is marked incomplete.",
     ),
     "utility": (
@@ -205,6 +206,8 @@ class UtilityCog(commands.Cog, name="Utility"):
         em.add_field(name="Ticket configuration", value="MongoDB configured (connection not verified)" if config.MONGO_URI.strip() else "Local JSON mode (persistent storage required)", inline=True)
         sync_error = getattr(self.bot, 'command_sync_error', None)
         em.add_field(name='Slash command sync', value=f'⚠️ Failed: `{sync_error}` · developer can run /sync_commands' if sync_error else 'No sync failure recorded (check hosting logs for startup details)', inline=False)
+        commands_loaded = sum(isinstance(command, app_commands.Command) for command in self.bot.tree.walk_commands())
+        em.add_field(name="Runtime command inventory", value=f"{commands_loaded} executable slash paths · {len(self.bot.persistent_views)} persistent views", inline=False)
         loaded = sorted(self.bot.extensions)
         em.add_field(name="Loaded modules", value="\n".join(f"✅ {name.removeprefix('cogs.')}" for name in loaded) or "None", inline=True)
         failed = getattr(self.bot, "extension_errors", {})

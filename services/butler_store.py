@@ -522,6 +522,36 @@ class ButlerStore:
             )
         )
 
+    async def enqueue_daily_reports(self, report_dates):
+        now = self.clock()
+
+        def work(conn):
+            for guild, day in report_dates:
+                self._enqueue(conn, f"daily:{guild}:{day}", guild, None, "daily", {"day": day}, now)
+
+        await self.run(work)
+
+    async def assign_owner_delivery(self, job, application_owner, guild_owner):
+        """Give each owner a durable delivery record before attempting either DM."""
+        def work(conn):
+            changed = conn.execute(
+                "UPDATE outbox SET recipient=? WHERE id=? AND recipient IS NULL AND status='pending'",
+                (application_owner, job['id']),
+            ).rowcount
+            if not changed or application_owner == guild_owner:
+                return None
+            # Each accepted owner event reserves at most one additional delivery.
+            # Copy its original deadline and age so a restart never extends retention.
+            sibling = f"{job['id']}:guild-owner"
+            conn.execute(
+                """INSERT INTO outbox(id,guild,recipient,kind,payload,status,attempts,due,created)
+                   SELECT ?,guild,?,kind,payload,'pending',0,due,created FROM outbox WHERE id=?""",
+                (sibling, guild_owner, job['id']),
+            )
+            return dict(conn.execute("SELECT * FROM outbox WHERE id=?", (sibling,)).fetchone())
+
+        return await self.run(work)
+
     async def guilds(self):
         return await self.run(
             lambda conn: [dict(r) for r in conn.execute("SELECT * FROM guilds")]

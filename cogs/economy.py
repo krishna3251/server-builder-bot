@@ -308,15 +308,8 @@ class EconomyCog(commands.Cog, name="Economy"):
         lb_type = type.value if type else "coins"
 
         if lb_type == "xp":
-            from services import level_service
-            entries = await level_service.get_leaderboard(interaction.guild.id)
-            lines: list[str] = []
-            for i, (uid, xp, level) in enumerate(entries, 1):
-                member = interaction.guild.get_member(uid)
-                name = member.display_name if member else f"User#{uid}"
-                place = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"**#{i}**")
-                lines.append(f"{place} **{discord.utils.escape_markdown(name)}** · Level **{level}** · {format_number(xp)} XP")
-            em = info_embed("🏆 XP Leaderboard", "\n".join(lines) or "No data yet.")
+            from cogs.leveling import xp_leaderboard_embed
+            em = await xp_leaderboard_embed(interaction.guild)
         else:
             entries_eco = await eco.get_leaderboard(interaction.guild.id)
             lines = []
@@ -326,7 +319,7 @@ class EconomyCog(commands.Cog, name="Economy"):
                 place = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"**#{i}**")
                 lines.append(f"{place} **{discord.utils.escape_markdown(name)}** · {config.CURRENCY_SYMBOL} {format_number(bal)}")
             em = info_embed("🏆 Coin Leaderboard", "\n".join(lines) or "No data yet.")
-        await respond(interaction, embed=em)
+        await respond(interaction, embed=em, allowed_mentions=discord.AllowedMentions.none())
 
     # ── /shop ─────────────────────────────────────────────────────────────
     @app_commands.command(name="shop", description="Browse and purchase items from the server shop.")

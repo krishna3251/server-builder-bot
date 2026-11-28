@@ -6,7 +6,7 @@ A full-featured Discord bot built with **discord.py 2.x** featuring:
 - **Server Builder** — Generate server layouts from templates or AI-generated JSON schemas
 - **Ticket System** — Production-grade support ticket system with persistent buttons, blacklist, auto-delete, and staff notifications
 - **Economy** — Coin-based economy with daily rewards, work, shop, and leaderboards
-- **Leveling** — Message-based XP system with level-up notifications and role rewards
+- **Leveling** — Message XP, level-up notifications, `/rank` progress and the server's `/xp_leaderboard`
 - **Moderation** — Kick, ban, mute, warn, clear, lock/unlock, slowmode
 - **Analytics** — Track messages, commands, and member activity
 - **Utility** — Ping, server/user info, polls, reminders, and more
@@ -130,9 +130,9 @@ Butler allows one actual Discord mass-mention message per author and server ever
 - `/butler exception add channel` and `remove` manage channel exceptions. Categories extend to their channels and threads inherit their parent exceptions. Removed channels can be cleared by ID.
 - `/butler exception list` shows saved IDs. `clear` requires confirmation. Exempt messages do not use the allowance.
 - `/butler antiping mode` selects Delete, Warn only or Disabled. `/butler antiping cooldown` accepts 1–1,440 minutes. Administrator or owner access is required to change policy.
-- `/butler status` shows the active policy, permission checks and notification health. `/butler report [date]` privately exports the ledger for the application or configured report owner.
+- `/butler status` shows the active policy, permission checks and notification health. `/butler report [date]` privately exports the ledger for the server owner, application owner or configured report operator.
 
-The ledger contains join/leave, voice-presence and moderation metadata. Reports default to **00:05 Asia/Kolkata**, covering the preceding day. Set `MOD_LOG_CHANNEL_ID` to a private staff channel for action receipts and undelivered incident notices. See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) for retention and coverage and [.env.example](.env.example) for defaults.
+The ledger contains join/leave, voice-presence, audit and moderation metadata. The server owner and Discord application owner (team owner for team apps) each get a private summary and TXT attachment at **00:05 Asia/Kolkata** by default, covering the preceding day. When both roles belong to one account, the bot sends one copy. Delivery and retries are tracked per recipient. Optional `MOD_LOG_CHANNEL_ID` enables private in-server action receipts. See [BUTLER_UPDATE.md](BUTLER_UPDATE.md) for retention and coverage and [.env.example](.env.example) for defaults.
 
 ## Private security and quarantine
 
@@ -153,14 +153,14 @@ The bot uses Discord Components V2 for the command center, main builder panel, s
 | `/quarantine migrate` | Preview and confirm moving active records to a repaired marker. |
 | `/quarantine cleanup` | Preview verified obsolete resources, then explicitly confirm deletion. |
 | `/butler status` | Check private reporting and activity collection. |
-| `/butler report [date]` | Bot owner only, privately open the activity ledger. |
+| `/butler report [date]` | Privately open the activity ledger as a server owner, application owner or configured report operator. |
 | `/bot_profile` | Bot application owner only, refresh the dynamic public description and presence. |
 
 Quarantine setup requires Administrator on the caller. Apply/release requires Moderate Members and Manage Roles on the caller, plus the normal actor/target hierarchy checks. The bot needs View Channel, Send Messages, Read Message History, Manage Channels and Manage Roles and must outrank every role it suspends or restores. Existing role order is preserved. The owner is protected. Targets with privileged everyone/managed/uneditable roles are refused. The quarantine marker has zero guild permissions and is neither hoisted nor mentionable. Deleted resources can be replaced through setup or repair. Existing records migrate through the confirmed migration command.
 
 Per-member channel overwrites enforce quarantine even where other roles explicitly allow access. Channels created during quarantine and members who leave/rejoin are reconciled. Voice disconnection additionally needs Move Members. Failed restrictions produce a partial result, which can be retried. Roles that gained permissions during quarantine require staff review before restoration. Changes to overwrite fields made independently by staff are preserved on release when they differ from the bot's last applied values.
 
-Timeouts, automatic warning timeouts, kicks, bans, quarantines and releases generate private receipts to both the bot application owner and the server owner. Successful bot actions are recorded in the daily ledger. The original `/ban` remains available for an actual Discord ban. Use `/sudo_ban` for quarantine. Daily bot-owner reports run at **00:05 Asia/Kolkata** by default, with retryable delivery and the first available today's report on startup. Configure `BUTLER_OWNER_ID` for the report recipient and `BUTLER_REPORT_HOUR`/`BUTLER_REPORT_MINUTE` for another local time. DMs must be open.
+Timeouts, automatic warning timeouts, kicks, bans, quarantines and releases generate private receipts to both owners. Successful bot actions are recorded in the daily ledger. The original `/ban` remains available for an actual Discord ban. Use `/sudo_ban` for quarantine. The first available report for the current day is sent when tracking starts. Configure `BUTLER_OWNER_ID` to authorize an additional on-demand report operator and `BUTLER_REPORT_HOUR`/`BUTLER_REPORT_MINUTE` for another local time. Each recipient must accept DMs from the bot.
 
 Moderation command replies are ephemeral. The configured moderation log is skipped when ordinary members can view it. Quarantine spaces are hidden from ordinary members. Server owners and Administrators retain Discord's visibility bypass, and members can still observe role/profile changes. The bot cannot guarantee invisible moderation or stop an owner removing its permissions. New channels created by other clients are protected when Discord delivers their creation events.
 

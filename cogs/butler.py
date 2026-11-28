@@ -402,21 +402,22 @@ class ButlerCog(commands.Cog, name="Server Butler"):
             f"Manage Messages: {perms.manage_messages} · View Audit Log: {perms.view_audit_log}\n"
             f"Members intent: {self.bot.intents.members} · Voice states intent: {self.bot.intents.voice_states}\n"
             f"Last issue: {self.service.last_error or 'none recorded'}\n"
-            "Reports go privately to the bot owner. No normal message bodies or voice audio are collected."
+            "Reports go privately to the server owner and bot application owner. "
+            "No normal message bodies or voice audio are collected."
         )
         await respond(interaction, text, ephemeral=True)
 
     @butler.command(
         name="report",
-        description="Bot owner: privately export today or a retained date for this server",
+        description="Owners: privately export today or a retained date for this server",
     )
     @app_commands.guild_only()
     @acknowledged(ephemeral=True)
     async def report(self, interaction: discord.Interaction, date: str | None = None):
-        if not interaction.guild or not await self.service.is_owner(interaction.user):
+        if not interaction.guild or not await self.service.can_read_report(interaction.guild, interaction.user):
             return await respond(
                 interaction,
-                "Only the bot owner can open the private activity ledger.",
+                "This private activity report is available to the server owner, bot application owner or configured report operator.",
                 ephemeral=True,
             )
         if not self.service.enabled(interaction.guild_id):

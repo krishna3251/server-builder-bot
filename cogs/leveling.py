@@ -15,7 +15,7 @@ from discord.ext import commands
 
 import config
 from services import level_service, economy_service
-from services.embed_service import add_member_context, info_embed, success_embed, progress_bar
+from services.embed_service import add_member_context, add_usage_footer, info_embed, success_embed, progress_bar
 from utils.decorators import admin_only, guild_only
 from utils.helpers import format_number
 
@@ -23,6 +23,18 @@ log = logging.getLogger("cogs.leveling")
 
 # Per-user XP cooldown tracker: guild_user -> last_xp_time
 _xp_cooldowns: dict[str, float] = defaultdict(float)
+
+
+async def xp_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    entries = await level_service.get_leaderboard(guild.id)
+    lines = []
+    for place, (user_id, xp, level) in enumerate(entries, 1):
+        member = guild.get_member(user_id)
+        name = discord.utils.escape_markdown(member.display_name) if member else f"User {user_id}"
+        lines.append(f"**#{place} · {name}** — Lv. **{level:,}** · {format_number(xp)} XP")
+    embed = info_embed("Server XP leaderboard", "\n".join(lines) or "No XP recorded in this server yet.")
+    add_usage_footer(embed, "Use /rank for your level and progress")
+    return embed
 
 
 class LevelingCog(commands.Cog, name="Leveling"):
@@ -58,6 +70,7 @@ class LevelingCog(commands.Cog, name="Leveling"):
             em.set_thumbnail(url=message.author.display_avatar.url)
             em.add_field(name="NEW LEVEL", value=f"**{new_level:,}**", inline=True)
             em.add_field(name="TOTAL XP", value=f"**{format_number(new_xp)}**", inline=True)
+            add_usage_footer(em, "/rank for progress · /xp_leaderboard for server rankings")
             if isinstance(message.author, discord.Member):
                 add_member_context(em, message.author)
             try:
@@ -100,7 +113,17 @@ class LevelingCog(commands.Cog, name="Leveling"):
         em.add_field(name="TOTAL XP", value=f"**{format_number(xp)}**", inline=True)
         em.add_field(name="NEXT LEVEL", value=f"{format_number(max(0, next_lvl_xp - xp))} XP to go", inline=True)
         em.add_field(name="Progress to next level", value=progress_bar(progress, 1, width=18), inline=False)
+        add_usage_footer(em, "/xp_leaderboard for server rankings")
         await respond(interaction, embed=em)
+
+    @app_commands.command(name="xp_leaderboard", description="See the top 10 members by XP in this server.")
+    @guild_only()
+    @acknowledged(ephemeral=False)
+    @app_commands.guild_only()
+    async def xp_leaderboard(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None
+        await respond(interaction, embed=await xp_leaderboard_embed(interaction.guild),
+                      allowed_mentions=discord.AllowedMentions.none())
 
     # ── /setxp ────────────────────────────────────────────────────────────
     @app_commands.command(name="setxp", description="Set a user's XP (admin only).")

@@ -8,6 +8,7 @@ import time
 
 import discord
 import config
+from services.moderation_notices import record_action
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ def is_trusted_channel(channel, ids: frozenset[int]) -> bool:
 class ModerationCoordinator:
     """Coalesce message deletions across the bot's independent listeners."""
 
-    def __init__(self):
+    def __init__(self, bot=None):
+        self.bot = bot
         self.claimed = OrderedDict()
         self.native_timeouts = OrderedDict()
 
@@ -80,14 +82,14 @@ class ModerationCoordinator:
                 result = f"Discord deletion failed (HTTP {exc.status})"
             else:
                 result = "Deleted"
-        await log_automatic_removal(message, module, reason, result)
+        await log_automatic_removal(message, module, reason, result, bot=self.bot)
         return result
 
 
 def coordinator(bot):
     existing = getattr(bot, "moderation_coordinator", None)
     if not isinstance(existing, ModerationCoordinator):
-        existing = bot.moderation_coordinator = ModerationCoordinator()
+        existing = bot.moderation_coordinator = ModerationCoordinator(bot)
     return existing
 
 
@@ -146,7 +148,7 @@ async def private_mod_log(guild, embed):
         return False
 
 
-async def log_automatic_removal(message, module: str, reason: str, result: str):
+async def log_automatic_removal(message, module: str, reason: str, result: str, *, bot=None):
     guild = message.guild
     if guild is None:
         return
@@ -154,6 +156,10 @@ async def log_automatic_removal(message, module: str, reason: str, result: str):
     user_id = message.author.id
     log.info("Automatic moderation: module=%s guild=%s channel=%s user=%s message=%s result=%s",
              module, guild.id, channel_id, user_id, message.id, result)
+    if bot is not None and module != "Butler anti-ping":  # Repeat pings already have their own ledger section.
+        await record_action(bot, guild, getattr(getattr(guild, 'me', None), 'id', 0), user_id,
+                            module, f"{reason} | {result} | Channel {channel_id} | Message {message.id}",
+                            f"removal:{guild.id}:{message.id}:{module}")
     if not config.MOD_LOG_CHANNEL_ID:
         return
     embed = discord.Embed(title="Automatic message moderation",
