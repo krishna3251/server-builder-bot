@@ -18,6 +18,7 @@ from engines.guild.analyzer import ServerAnalyzer
 from engines.guild.channel_engine import ChannelEngine
 from engines.guild.role_engine import RoleEngine
 from services.ticket_permissions import ticket_log_is_private
+from services.access_explainer import explain_access
 
 
 def guild_fixture():
@@ -54,6 +55,45 @@ def channel_fixture(guild, name, identifier, kind=discord.TextChannel):
 
 
 class PermissionAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_member_overwrite_precedes_conflicting_role_overwrites(self):
+        guild, _ = guild_fixture()
+        member = MagicMock(spec=discord.Member, id=9, guild=guild)
+        member.is_timed_out.return_value = False
+        allowed = MagicMock(spec=discord.Role)
+        allowed.name = 'Members'
+        allowed.is_default.return_value = False
+        allowed.permissions = discord.Permissions.none()
+        denied = MagicMock(spec=discord.Role)
+        denied.name = 'Read only'
+        denied.is_default.return_value = False
+        denied.permissions = discord.Permissions.none()
+        member.roles = [guild.default_role, allowed, denied]
+        channel = channel_fixture(guild, 'general', 11)
+        overwrites = {allowed: discord.PermissionOverwrite(send_messages=True),
+                      denied: discord.PermissionOverwrite(send_messages=False)}
+        channel.overwrites_for.side_effect = lambda target: overwrites.get(target, discord.PermissionOverwrite())
+        channel.permissions_for.return_value = discord.Permissions(view_channel=True, send_messages=True)
+        status, explanation = await explain_access(channel, member, 'post')
+        self.assertEqual(status, 'Allowed')
+        self.assertIn('Members', explanation)
+        self.assertIn('Read only', explanation)
+        overwrites[member] = discord.PermissionOverwrite(send_messages=False)
+        channel.permissions_for.return_value = discord.Permissions(view_channel=True)
+        self.assertEqual(await explain_access(channel, member, 'post'),
+                         ('Denied', 'Member overwrite denies this permission.'))
+
+    async def test_private_thread_cannot_report_allowed_when_membership_is_unverifiable(self):
+        guild, _ = guild_fixture()
+        thread = MagicMock(spec=discord.Thread)
+        thread.parent = channel_fixture(guild, 'general', 11)
+        thread.is_private.return_value = True
+        thread.members = []
+        thread.permissions_for.return_value = discord.Permissions(view_channel=True)
+        thread.fetch_member = AsyncMock(side_effect=TimeoutError)
+        status, text = await explain_access(thread, guild.me, 'view')
+        self.assertEqual(status, 'Unknown')
+        self.assertIn('verify private-thread membership', text)
+
     async def test_audit_reports_elevated_grants_and_real_status_with_visibility_scope(self):
         guild, _ = guild_fixture()
         guild.default_role.permissions = discord.Permissions(mention_everyone=True, manage_messages=True)

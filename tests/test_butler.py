@@ -16,6 +16,7 @@ import discord
 
 from cogs.butler import ButlerCog
 from cogs.automod import AutoModCog
+from cogs.maintenance import MaintenanceCog
 from services.butler_service import ButlerService, ButlerSettings, day_bounds
 from services.butler_store import ButlerStore
 
@@ -583,6 +584,46 @@ class ButlerTests(unittest.IsolatedAsyncioTestCase):
         await self.service.deliver()
         self.assertIn("may be legitimate", self.owner.send.call_args.args[0])
         self.assertEqual(self.owner.send.call_args.args, self.guild_owner.send.call_args.args)
+        reference = jobs[0]['id']
+        self.assertIn(reference, self.owner.send.call_args.args[0])
+        rows = await self.store.inbox_entries(10)
+        self.assertEqual([(row['id'], row['state']) for row in rows], [(reference, 'needs_review')])
+        self.assertFalse(await self.store.set_inbox_state(11, reference, 'resolved', 2))
+        self.assertTrue(await self.store.set_inbox_state(10, reference, 'resolved', 2))
+        self.assertEqual(await self.store.inbox_entries(10), [])
+        reopened_store = ButlerStore(self.store.path, clock=lambda: self.now)
+        resolved, = await reopened_store.inbox_entries(10, state='resolved')
+        self.assertEqual((resolved['id'], resolved['actor']), (reference, 2))
+
+    async def test_maintenance_retries_only_the_requested_owners_failed_report(self):
+        self.bot.get_cog = Mock(return_value=NS(service=self.service))
+        day = str(self.service.today())
+        await self.store.enqueue_report(10, day, 'daily')
+        self.owner.send.side_effect = discord.Forbidden(NS(status=403, reason='Forbidden'), 'DM closed')
+        await self.service.deliver()
+        _, failures = await self.store.owner_report_deliveries(10, self.owner.id)
+        reference = failures[0]['id']
+        cog = MaintenanceCog(self.bot)
+        for uid, expected in ((8, 'Only the server owner'), (2, 'unavailable for retry'), (42, 'queued for retry')):
+            event = self.interaction(uid, admin=True)
+            await MaintenanceCog.delivery.callback(cog, event, 'retry', reference)
+            self.assertIn(expected, event.edit_original_response.call_args.kwargs['content'])
+            event.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        self.owner.send.side_effect = None
+        await self.service.deliver()
+        self.assertEqual(self.owner.send.await_count, 2)
+        self.guild_owner.send.assert_awaited_once()
+
+    async def test_maintenance_test_dm_only_sends_to_invoking_owner_and_is_throttled(self):
+        self.bot.get_cog = Mock(return_value=NS(service=self.service))
+        cog = MaintenanceCog(self.bot)
+        for uid in (8, 2, 2):
+            event = self.interaction(uid, admin=True)
+            event.user.send = self.guild_owner.send if uid == 2 else self.member_dm.send
+            await MaintenanceCog.delivery.callback(cog, event, 'test')
+        self.guild_owner.send.assert_awaited_once()
+        self.member_dm.send.assert_not_awaited()
+        self.owner.send.assert_not_awaited()
 
     async def test_no_message_contents_or_audit_reasons_are_stored(self):
         first = self.message(1)

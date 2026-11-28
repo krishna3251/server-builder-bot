@@ -26,7 +26,7 @@ class ButlerStore:
         try:
             if (
                 not self.initialized
-                or conn.execute("PRAGMA user_version").fetchone()[0] < 2
+                or conn.execute("PRAGMA user_version").fetchone()[0] < 3
             ):
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript("""
@@ -43,6 +43,8 @@ class ButlerStore:
                     CREATE TABLE IF NOT EXISTS windows(id INTEGER PRIMARY KEY,guild INTEGER,start REAL,end REAL,seen REAL);
                     CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,guild INTEGER,recipient INTEGER,kind TEXT,payload TEXT,status TEXT,attempts INTEGER,due REAL,created REAL,sent REAL);
                     CREATE INDEX IF NOT EXISTS delivery_due ON outbox(status,due);
+                    CREATE INDEX IF NOT EXISTS outbox_guild_kind ON outbox(guild,kind,created);
+                    CREATE TABLE IF NOT EXISTS owner_inbox(reference TEXT PRIMARY KEY,state TEXT NOT NULL,actor INTEGER NOT NULL,updated REAL NOT NULL);
                 """)
                 # Existing ledgers do not contain delivery reasons or distinguish
                 # accepted mentions from violations. Preserve their timestamps.
@@ -51,7 +53,7 @@ class ButlerStore:
                     if column.split()[0] not in fields:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
                 conn.execute("CREATE TABLE IF NOT EXISTS antiping_policy(guild INTEGER PRIMARY KEY, data TEXT NOT NULL)")
-                conn.execute("PRAGMA user_version=2")
+                conn.execute("PRAGMA user_version=3")
                 conn.commit()
                 self.initialized = True
         except BaseException:
@@ -84,6 +86,7 @@ class ButlerStore:
                             "DELETE FROM outbox WHERE created<? AND status IN ('sent','failed')",
                             (cutoff,),
                         )
+                        conn.execute("DELETE FROM owner_inbox WHERE reference NOT IN (SELECT id FROM outbox)")
                         self.last_prune = now
                     return operation(conn)
 
@@ -621,6 +624,65 @@ class ButlerStore:
                 (guild,),
             )
         ])
+
+    async def owner_report_deliveries(self, guild, recipient):
+        def work(conn):
+            last_sent = conn.execute(
+                "SELECT MAX(sent) FROM outbox WHERE guild=? AND recipient=? AND kind IN ('initial','daily') AND status='sent'",
+                (guild, recipient),
+            ).fetchone()[0]
+            failed = [dict(row) for row in conn.execute(
+                """SELECT id,payload,failure,created FROM outbox
+                   WHERE guild=? AND recipient=? AND kind IN ('initial','daily') AND status='failed'
+                   ORDER BY created DESC LIMIT 5""", (guild, recipient),
+            )]
+            return last_sent, failed
+
+        return await self.run(work)
+
+    async def retry_owner_report(self, guild, recipient, reference):
+        now = self.clock()
+
+        def work(conn):
+            changed = conn.execute(
+                """UPDATE outbox SET status='pending',attempts=0,due=?,failure=NULL WHERE id=?
+                   AND guild=? AND recipient=? AND kind IN ('initial','daily') AND status='failed'
+                   AND created>=? AND COALESCE(failure,'') NOT IN ('owner_changed','expired')
+                   AND (SELECT COUNT(*) FROM outbox WHERE status='pending') < 1000""",
+                (now, reference, guild, recipient, now - 172800),
+            ).rowcount
+            return bool(changed)
+
+        return await self.run(work)
+
+    async def allow_delivery_test(self, recipient):
+        now = self.clock()
+        return await self.run(lambda conn: self._cooldown(conn, f"owner-dm-test:{recipient}", now, 60))
+
+    async def inbox_entries(self, guild, *, reference=None, state=None):
+        now = self.clock()
+        return await self.run(lambda conn: [dict(row) for row in conn.execute(
+            """SELECT o.id,o.kind,o.created,o.payload,COALESCE(i.state,'needs_review') state,i.actor,i.updated
+               FROM outbox o LEFT JOIN owner_inbox i ON o.id=i.reference
+               WHERE o.guild=? AND o.created>=? AND o.kind IN ('audit_alert','incident')
+                 AND o.id NOT LIKE '%:guild-owner' AND (? IS NULL OR o.id=?)
+                 AND (? IS NULL OR COALESCE(i.state,'needs_review')=?)
+                 AND (? IS NOT NULL OR ? IS NOT NULL OR COALESCE(i.state,'needs_review')<>'resolved')
+               ORDER BY o.created DESC,o.id DESC LIMIT 8""",
+            (guild, now - self.retention, reference, reference, state, state, reference, state),
+        )])
+
+    async def set_inbox_state(self, guild, reference, state, actor):
+        if state not in {"needs_review", "acknowledged", "resolved"}:
+            raise ValueError("Unsupported inbox state")
+        now = self.clock()
+        return await self.run(lambda conn: bool(conn.execute(
+            """INSERT INTO owner_inbox(reference,state,actor,updated)
+               SELECT id,?,?,? FROM outbox WHERE guild=? AND id=? AND created>=?
+               AND kind IN ('audit_alert','incident') AND id NOT LIKE '%:guild-owner'
+               ON CONFLICT(reference) DO UPDATE SET state=excluded.state,actor=excluded.actor,updated=excluded.updated""",
+            (state, actor, now, guild, reference, now - self.retention),
+        ).rowcount))
 
     async def health(self):
         return await self.run(lambda conn: conn.execute("PRAGMA quick_check(1)").fetchone()[0])
